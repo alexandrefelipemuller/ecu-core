@@ -70,6 +70,12 @@ interface EcuTransport {
 
     fun isReadOnlySafeMode(): Boolean = false
 
+    fun getConnectionInfo(): String = ""
+
+    suspend fun getProductString(): String = ""
+
+    fun clearManualFirmwareProfile() {}
+
     fun applyIniDefinition(definition: IniDefinition): Boolean = false
 
     fun setManualFirmwareProfile(signature: String, readOnly: Boolean = true) {}
