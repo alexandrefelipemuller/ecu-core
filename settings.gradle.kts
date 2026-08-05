@@ -19,4 +19,7 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "ecu-core"
-include(":core-all")
+include(":core-model")
+include(":core-protocol")
+include(":core-runtime")
+include(":core-tuning")
