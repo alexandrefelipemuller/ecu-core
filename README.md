@@ -88,4 +88,4 @@ TopSpeed). Tag `pre-unification` em cada repo marca o estado anterior.
 
 ## Licença
 
-GPL v3 — ver [LICENSE](LICENSE).
+MIT — ver [LICENSE](LICENSE).
