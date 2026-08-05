@@ -74,6 +74,9 @@ kotlin {
 
         getByName("desktopMain") {
             dependsOn(jvmMain)
+            dependencies {
+                implementation("com.fazecast:jSerialComm:2.11.0")
+            }
         }
         getByName("desktopTest") {
             dependsOn(jvmTest)
