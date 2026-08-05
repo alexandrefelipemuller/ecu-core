@@ -85,3 +85,7 @@ cópia própria. Divergências conhecidas e como absorvê-las **sem fork**:
 Criado em 2026-08 unificando 5 cópias divergentes do módulo `shared`
 (SpeeduinoManagerAndroid — fonte da verdade do core —, Desktop, iOS e os dois
 TopSpeed). Tag `pre-unification` em cada repo marca o estado anterior.
+
+## Licença
+
+GPL v3 — ver [LICENSE](LICENSE).
