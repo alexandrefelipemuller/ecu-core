@@ -72,6 +72,19 @@ kotlin {
         }
     }
 
+    iosArm64()
+    iosSimulatorArm64()
+
+    targets.withType<org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget>().configureEach {
+        compilations.all {
+            compileTaskProvider.configure {
+                compilerOptions {
+                    freeCompilerArgs.add("-Xexpect-actual-classes")
+                }
+            }
+        }
+    }
+
     sourceSets {
         getByName("commonMain") {
             kotlin.srcDir(generatedSharedVersionDir)
@@ -102,6 +115,12 @@ kotlin {
         getByName("desktopTest") {
             dependsOn(jvmTest)
         }
+
+        val iosMain = create("iosMain") {
+            dependsOn(getByName("commonMain"))
+        }
+        getByName("iosArm64Main") { dependsOn(iosMain) }
+        getByName("iosSimulatorArm64Main") { dependsOn(iosMain) }
     }
 }
 

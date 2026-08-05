@@ -1,7 +1,7 @@
 package com.speeduino.manager.model
 
 import com.speeduino.manager.shared.Logger
-import java.util.Locale
+import com.speeduino.manager.shared.formatDecimal
 import kotlin.math.roundToInt
 
 /**
@@ -130,7 +130,7 @@ data class DwellTable(
         }
 
         fun formatValue(value: Int): String {
-            return String.format(Locale.US, "%.1f", value / VALUE_SCALE.toFloat())
+            return formatDecimal((value / VALUE_SCALE.toFloat()).toDouble(), 1)
         }
 
         fun parseValue(text: String): Int? {

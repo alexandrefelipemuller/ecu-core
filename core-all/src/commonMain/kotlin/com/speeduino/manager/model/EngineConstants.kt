@@ -392,7 +392,7 @@ data class EngineConstants(
         }
 
         private fun formatDecimal(value: Float, decimals: Int): String {
-            return "%.${decimals}f".format(value)
+            return com.speeduino.manager.shared.formatDecimal(value.toDouble(), decimals)
         }
 
         private fun engineTypeName(index: Int): String = when (index) {

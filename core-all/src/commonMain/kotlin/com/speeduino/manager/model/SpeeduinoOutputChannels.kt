@@ -624,9 +624,9 @@ data class OutputField(
     fun formatValue(data: ByteArray): String {
         val value = parse(data)
         return if (units.isNotEmpty()) {
-            "%.1f %s".format(value, units)
+            "${com.speeduino.manager.shared.formatDecimal(value, 1)} $units"
         } else {
-            "%.1f".format(value)
+            com.speeduino.manager.shared.formatDecimal(value, 1)
         }
     }
 }

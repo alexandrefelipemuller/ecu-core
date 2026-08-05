@@ -262,7 +262,7 @@ object RusefiIniUiParsers {
     }
 
     private fun formatDecimal(value: Double, decimals: Int): String {
-        return "%.${decimals}f".format(value)
+        return com.speeduino.manager.shared.formatDecimal(value, decimals)
     }
 
     private class Reader(

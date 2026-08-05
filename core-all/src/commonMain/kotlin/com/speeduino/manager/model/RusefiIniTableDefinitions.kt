@@ -181,9 +181,9 @@ object RusefiIniTableDefinitions {
                 units = channel.units ?: "",
                 byteOrder = EcuByteOrder.LITTLE_ENDIAN,
             )
-            byName.putIfAbsent(field.name, field)
+            if (field.name !in byName) byName[field.name] = field
             aliasesFor(channel).forEach { alias ->
-                byName.putIfAbsent(alias, field.copy(name = alias))
+                if (alias !in byName) byName[alias] = field.copy(name = alias)
             }
         }
         return byName.values.toList()

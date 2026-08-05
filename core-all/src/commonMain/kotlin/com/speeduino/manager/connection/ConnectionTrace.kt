@@ -1,5 +1,7 @@
 package com.speeduino.manager.connection
 
+import kotlin.concurrent.Volatile
+
 interface ConnectionTraceSink {
     fun onTx(transport: String, data: ByteArray)
     fun onRx(transport: String, data: ByteArray)

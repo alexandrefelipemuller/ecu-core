@@ -1,5 +1,7 @@
 package com.speeduino.manager.protocol
 
+import kotlin.concurrent.Volatile
+
 import com.speeduino.manager.connection.ConnectionTrace
 import com.speeduino.manager.formatPageId
 import com.speeduino.manager.ecu.FirmwareHandshakeDomain
@@ -7,12 +9,10 @@ import com.speeduino.manager.shared.Logger
 import com.speeduino.manager.connection.ISpeeduinoConnection
 import com.speeduino.manager.model.EcuFamily
 import kotlinx.coroutines.delay
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.Locale
-import java.util.zip.CRC32
-import kotlin.jvm.Synchronized
+import com.speeduino.manager.shared.Crc32Table
+import com.speeduino.manager.shared.MonotonicClock
+import com.speeduino.manager.shared.toHex02
+import com.speeduino.manager.shared.JvmSynchronized
 
 /**
  * Implementação do protocolo de comunicação Speeduino
@@ -247,10 +247,7 @@ class SpeeduinoProtocol(
                 responseSize = 4
             )
             return if (response.size == 4) {
-                ByteBuffer.wrap(response)
-                    .order(ByteOrder.BIG_ENDIAN)
-                    .int
-                    .toLong() and 0xFFFFFFFF
+                readU32BE(response, 0)
             } else {
                 0L
             }
@@ -259,11 +256,7 @@ class SpeeduinoProtocol(
         val response = sendModernCommand('d'.code.toByte(), byteArrayOf(pageNum))
 
         return if (response.size >= 5 && response[0] == SERIAL_RC_OK) {
-            val crc = ByteBuffer.wrap(response, 1, 4)
-                .order(ByteOrder.BIG_ENDIAN)
-                .int
-                .toLong() and 0xFFFFFFFF
-            crc
+            readU32BE(response, 1)
         } else {
             0L
         }
@@ -374,7 +367,7 @@ class SpeeduinoProtocol(
             payload[5] = (length and 0xFF).toByte()
 
             Logger.d("SpeeduinoProtocol", "readPage (TABLE): pageNum=$pageLabel, offset=$offset, length=$length, family=${ecuFamily.name}")
-            Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x%02X".format(it) }}")
+            Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x${it.toHex02()}" }}")
 
             sendModernCommand(
                 'r'.code.toByte(),
@@ -396,7 +389,7 @@ class SpeeduinoProtocol(
             payload[5] = ((length shr 8) and 0xFF).toByte()   // MSB second
 
             Logger.d("SpeeduinoProtocol", "readPage: pageNum=$pageLabel, offset=$offset, length=$length")
-            Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x%02X".format(it) }}")
+            Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x${it.toHex02()}" }}")
 
             sendModernCommand(
                 'p'.code.toByte(),
@@ -407,7 +400,7 @@ class SpeeduinoProtocol(
         }
 
         Logger.d("SpeeduinoProtocol", "Response size: ${response.size} bytes")
-        Logger.d("SpeeduinoProtocol", "Response first bytes: ${response.take(10).joinToString(" ") { "0x%02X".format(it) }}")
+        Logger.d("SpeeduinoProtocol", "Response first bytes: ${response.take(10).joinToString(" ") { "0x${it.toHex02()}" }}")
 
         if (response.isEmpty() || response[0] != SERIAL_RC_OK) {
             throw Exception("unexpected response code=${response.getOrNull(0)?.toUByte()?.toString(16) ?: "null"}")
@@ -608,7 +601,7 @@ class SpeeduinoProtocol(
      */
     // Base de conhecimento (USB serial/OTG): sem serialização global, chamadas paralelas
     // (ex.: stream + write/refresh) podem misturar TX/RX no mesmo canal e corromper frame.
-    @Synchronized
+    @JvmSynchronized
     private fun sendLegacyCommand(
         cmd: Byte,
         payload: ByteArray = byteArrayOf(),
@@ -646,7 +639,7 @@ class SpeeduinoProtocol(
 
         val cleaned = parseLegacyStringResponse(response, label)
 
-        Logger.w("SpeeduinoProtocol", "Legacy $label response: ${response.joinToString(" ") { "0x%02X".format(it) }}")
+        Logger.w("SpeeduinoProtocol", "Legacy $label response: ${response.joinToString(" ") { "0x${it.toHex02()}" }}")
         return cleaned.ifBlank { "Unknown" }
     }
 
@@ -692,10 +685,7 @@ class SpeeduinoProtocol(
 
         val payload = response.copyOfRange(2, 2 + length)
         val crcBytes = response.copyOfRange(2 + length, 2 + length + 4)
-        val receivedCrc = ByteBuffer.wrap(crcBytes)
-            .order(ByteOrder.BIG_ENDIAN)
-            .int
-            .toLong() and 0xFFFFFFFF
+        val receivedCrc = readU32BE(crcBytes, 0)
         val calculatedCrc = calculateCRC32(payload)
 
         if (receivedCrc != 0L && receivedCrc != calculatedCrc) {
@@ -723,7 +713,7 @@ class SpeeduinoProtocol(
 
         val zeroIndex = payloadText.indexOf(0)
         val lengthText = if (zeroIndex >= 0) zeroIndex else payloadText.size
-        return String(payloadText, 0, lengthText, Charsets.US_ASCII).trim()
+        return payloadText.decodeToString(0, lengthText).trim()
     }
 
     private fun safeLegacyString(cmd: Byte, label: String): String {
@@ -890,7 +880,7 @@ class SpeeduinoProtocol(
 
     private fun delayAfterLegacyAsciiModernResponse() {
         connection.clearInputBuffer()
-        Thread.sleep(30)
+        com.speeduino.manager.shared.sleepMillis(30)
         connection.clearInputBuffer()
     }
 
@@ -965,7 +955,7 @@ class SpeeduinoProtocol(
         parsed: String?,
     ) {
         val transport = inferTraceTransport()
-        val rawHex = response.joinToString(" ") { "%02X".format(it) }.ifBlank { "<empty>" }
+        val rawHex = response.joinToString(" ") { it.toHex02() }.ifBlank { "<empty>" }
         val sanitized = parsed?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
         ConnectionTrace.info(
             transport,
@@ -974,7 +964,7 @@ class SpeeduinoProtocol(
     }
 
     private fun inferTraceTransport(): String {
-        val info = connection.getConnectionInfo().lowercase(Locale.US)
+        val info = connection.getConnectionInfo().lowercase()
         return when {
             info.startsWith("bluetooth:") -> "bluetooth"
             info.startsWith("tcp:") -> "tcp"
@@ -986,7 +976,7 @@ class SpeeduinoProtocol(
     private fun extractAsciiPrefix(response: ByteArray): String {
         val zeroIndex = response.indexOf(0)
         val length = if (zeroIndex >= 0) zeroIndex else response.size
-        return String(response, 0, length, Charsets.US_ASCII).trim()
+        return response.decodeToString(0, length).trim()
     }
 
     private fun extractPrintableAsciiText(response: ByteArray): String {
@@ -1038,7 +1028,7 @@ class SpeeduinoProtocol(
      * Envia comando modern (CRC32-based)
      */
     // Mantém atomicidade send+receive também no caminho modern.
-    @Synchronized
+    @JvmSynchronized
     private fun sendModernCommand(
         cmd: Byte,
         extraPayload: ByteArray,
@@ -1062,16 +1052,10 @@ class SpeeduinoProtocol(
         val crc = calculateCRC32(payload)
 
         // Length (2 bytes, big-endian)
-        val lengthBytes = ByteBuffer.allocate(2)
-            .order(ByteOrder.BIG_ENDIAN)
-            .putShort(payload.size.toShort())
-            .array()
+        val lengthBytes = writeU16BE(payload.size)
 
         // CRC32 (4 bytes, big-endian)
-        val crcBytes = ByteBuffer.allocate(4)
-            .order(ByteOrder.BIG_ENDIAN)
-            .putInt(crc.toInt())
-            .array()
+        val crcBytes = writeU32BE(crc)
 
         // Send: length + payload + crc
         val packet = lengthBytes + payload + crcBytes
@@ -1094,13 +1078,10 @@ class SpeeduinoProtocol(
             throw IncompleteResponseException("length", 2, lengthBytes.size, cmd)
         }
         if (VERBOSE_MODERN_FRAME_LOGS) {
-            Logger.d("SpeeduinoProtocol", "Length bytes: ${lengthBytes.joinToString(" ") { "0x%02X".format(it) }}")
+            Logger.d("SpeeduinoProtocol", "Length bytes: ${lengthBytes.joinToString(" ") { "0x${it.toHex02()}" }}")
         }
 
-        val length = ByteBuffer.wrap(lengthBytes)
-            .order(ByteOrder.BIG_ENDIAN)
-            .short
-            .toInt() and 0xFFFF
+        val length = readU16BE(lengthBytes, 0)
 
         if (VERBOSE_MODERN_FRAME_LOGS) {
             Logger.d("SpeeduinoProtocol", "Payload length: $length bytes")
@@ -1125,7 +1106,7 @@ class SpeeduinoProtocol(
             throw IncompleteResponseException("payload", length, payload.size, cmd)
         }
         if (VERBOSE_MODERN_FRAME_LOGS) {
-            Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x%02X".format(it) }}")
+            Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x${it.toHex02()}" }}")
         }
 
         // Read CRC32 (4 bytes, big-endian)
@@ -1138,13 +1119,10 @@ class SpeeduinoProtocol(
             throw IncompleteResponseException("crc", 4, crcBytes.size, cmd)
         }
         if (VERBOSE_MODERN_FRAME_LOGS) {
-            Logger.d("SpeeduinoProtocol", "CRC bytes: ${crcBytes.joinToString(" ") { "0x%02X".format(it) }}")
+            Logger.d("SpeeduinoProtocol", "CRC bytes: ${crcBytes.joinToString(" ") { "0x${it.toHex02()}" }}")
         }
 
-        val receivedCrc = ByteBuffer.wrap(crcBytes)
-            .order(ByteOrder.BIG_ENDIAN)
-            .int
-            .toLong() and 0xFFFFFFFF
+        val receivedCrc = readU32BE(crcBytes, 0)
 
         val calculatedCrc = calculateCRC32(payload)
 
@@ -1168,11 +1146,11 @@ class SpeeduinoProtocol(
 
         val data = ByteArray(size)
         var copied = 0
-        val deadline = System.currentTimeMillis() + totalTimeoutMs.toLong()
+        val deadline = MonotonicClock.nowMillis() + totalTimeoutMs.toLong()
 
         while (copied < size) {
             val remaining = size - copied
-            val remainingMs = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+            val remainingMs = (deadline - MonotonicClock.nowMillis()).coerceAtLeast(1L)
             val chunk = connection.readAvailable(
                 maxBytes = remaining,
                 timeoutMs = minOf(remainingMs.toInt(), STREAM_READ_SLICE_MS),
@@ -1183,7 +1161,7 @@ class SpeeduinoProtocol(
                 copied += bytesToCopy
                 continue
             }
-            if (System.currentTimeMillis() >= deadline) {
+            if (MonotonicClock.nowMillis() >= deadline) {
                 throw Exception("Timeout: expected $size bytes, received $copied ($context)")
             }
         }
@@ -1197,13 +1175,13 @@ class SpeeduinoProtocol(
         idleTimeoutMs: Int = 150,
         idlePollLimit: Int = 3,
     ): ByteArray {
-        val buffer = ByteArrayOutputStream()
+        val chunks = mutableListOf<ByteArray>()
         var sawData = false
         var idlePolls = 0
-        val deadline = System.currentTimeMillis() + totalTimeoutMs.toLong()
+        val deadline = MonotonicClock.nowMillis() + totalTimeoutMs.toLong()
 
-        while (System.currentTimeMillis() < deadline) {
-            val remainingMs = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+        while (MonotonicClock.nowMillis() < deadline) {
+            val remainingMs = (deadline - MonotonicClock.nowMillis()).coerceAtLeast(1L)
             val pollTimeoutMs = if (sawData) {
                 minOf(idleTimeoutMs, remainingMs.toInt())
             } else {
@@ -1214,7 +1192,7 @@ class SpeeduinoProtocol(
                 timeoutMs = pollTimeoutMs,
             )
             if (chunk.isNotEmpty()) {
-                buffer.write(chunk)
+                chunks += chunk
                 sawData = true
                 idlePolls = 0
                 continue
@@ -1230,7 +1208,7 @@ class SpeeduinoProtocol(
             }
         }
 
-        val pageData = buffer.toByteArray()
+        val pageData = concatChunks(chunks)
         if (pageData.isEmpty()) {
             throw Exception("Timeout: no data received for legacy page $pageLabel")
         }
@@ -1306,7 +1284,7 @@ class SpeeduinoProtocol(
             "SpeeduinoProtocol",
             "writePage (${if (useTableEnvelope) "TABLE" else "MODERN"}): pageNum=${formatPageId(pageNum)}, offset=$offset, length=$length, family=${ecuFamily?.name ?: "unknown"}"
         )
-        Logger.d("SpeeduinoProtocol", "Payload bytes: ${extraPayload.take(10).joinToString(" ") { "0x%02X".format(it) }}... (${extraPayload.size} total)")
+        Logger.d("SpeeduinoProtocol", "Payload bytes: ${extraPayload.take(10).joinToString(" ") { "0x${it.toHex02()}" }}... (${extraPayload.size} total)")
 
         // Enviar via Modern Protocol (com CRC wrapper)
         val response = if (useTableEnvelope) {
@@ -1531,10 +1509,37 @@ class SpeeduinoProtocol(
     /**
      * Calcula CRC32 checksum
      */
-    private fun calculateCRC32(data: ByteArray): Long {
-        val crc32 = CRC32()
-        crc32.update(data)
-        return crc32.value
+    private fun calculateCRC32(data: ByteArray): Long = Crc32Table.compute(data)
+
+    private fun readU16BE(bytes: ByteArray, offset: Int): Int =
+        ((bytes[offset].toInt() and 0xFF) shl 8) or (bytes[offset + 1].toInt() and 0xFF)
+
+    private fun readU32BE(bytes: ByteArray, offset: Int): Long =
+        ((bytes[offset].toLong() and 0xFF) shl 24) or
+            ((bytes[offset + 1].toLong() and 0xFF) shl 16) or
+            ((bytes[offset + 2].toLong() and 0xFF) shl 8) or
+            (bytes[offset + 3].toLong() and 0xFF)
+
+    private fun writeU16BE(value: Int): ByteArray = byteArrayOf(
+        ((value ushr 8) and 0xFF).toByte(),
+        (value and 0xFF).toByte(),
+    )
+
+    private fun writeU32BE(value: Long): ByteArray = byteArrayOf(
+        ((value ushr 24) and 0xFF).toByte(),
+        ((value ushr 16) and 0xFF).toByte(),
+        ((value ushr 8) and 0xFF).toByte(),
+        (value and 0xFF).toByte(),
+    )
+
+    private fun concatChunks(chunks: List<ByteArray>): ByteArray {
+        val out = ByteArray(chunks.sumOf { it.size })
+        var pos = 0
+        for (c in chunks) {
+            c.copyInto(out, pos)
+            pos += c.size
+        }
+        return out
     }
 
     class LegacyAsciiModernResponseException(

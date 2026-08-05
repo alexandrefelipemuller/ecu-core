@@ -4,7 +4,6 @@ import com.speeduino.manager.model.EcuCapabilities
 import com.speeduino.manager.model.EcuFamily
 import com.speeduino.manager.model.FirmwareEra
 import com.speeduino.manager.model.UnsupportedFirmwareException
-import java.util.Locale
 
 data class FirmwareConsensus(
     val signature: String?,
@@ -48,11 +47,11 @@ object FirmwareHandshakeDomain {
 
         Regex("""(?i)^ms3\s*format\s*([0-9]{4}\.[0-9]{2}[a-z]?)$""")
             .find(sanitized)
-            ?.let { return "MS3 Format ${it.groupValues[1].uppercase(Locale.US)}" }
+            ?.let { return "MS3 Format ${it.groupValues[1].uppercase()}" }
 
         Regex("""(?i)^ms2extra\s+comms([0-9a-z]+)$""")
             .find(sanitized)
-            ?.let { return "MS2Extra comms${it.groupValues[1].lowercase(Locale.US)}" }
+            ?.let { return "MS2Extra comms${it.groupValues[1].lowercase()}" }
 
         Regex("""(?i)^ms2extra\s+megaspeed(?:\s+.*)?$""")
             .find(sanitized)
@@ -60,11 +59,11 @@ object FirmwareHandshakeDomain {
 
         Regex("""(?i)^ms\/extra\s+format\s+(hr_10|hr_11d)(?:\s+.*)?$""")
             .find(sanitized)
-            ?.let { return "MS/Extra format ${it.groupValues[1].lowercase(Locale.US)}" }
+            ?.let { return "MS/Extra format ${it.groupValues[1].lowercase()}" }
 
         Regex("""(?i)^ms1\/extra\s+format\s+([0-9a-z]+)(?:\s+.*)?$""")
             .find(sanitized)
-            ?.let { return "MS1/Extra format ${it.groupValues[1].lowercase(Locale.US)}" }
+            ?.let { return "MS1/Extra format ${it.groupValues[1].lowercase()}" }
 
         if (sanitized.startsWith("rusEFI", ignoreCase = true)) {
             return sanitized
@@ -141,7 +140,7 @@ object FirmwareHandshakeDomain {
     fun shouldUseLegacyHandshakeCore(supportsModernProtocol: Boolean): Boolean = !supportsModernProtocol
 
     private fun looksLikeFirmwareSample(signature: String): Boolean {
-        val lower = signature.lowercase(Locale.US)
+        val lower = signature.lowercase()
         val hasVersionDigits = signature.count(Char::isDigit) >= 4
         return (lower.contains("speeduino") && hasVersionDigits) ||
             lower.startsWith("ms2extra ") ||
@@ -182,7 +181,7 @@ object FirmwareHandshakeDomain {
     private fun containsApproximateToken(text: String, target: String, maxDistance: Int = 2): Boolean {
         return text.split(Regex("""[^A-Za-z0-9]+"""))
             .filter(String::isNotBlank)
-            .any { token -> levenshteinDistance(token.lowercase(Locale.US), target.lowercase(Locale.US)) <= maxDistance }
+            .any { token -> levenshteinDistance(token.lowercase(), target.lowercase()) <= maxDistance }
     }
 
     private fun levenshteinDistance(left: String, right: String): Int {

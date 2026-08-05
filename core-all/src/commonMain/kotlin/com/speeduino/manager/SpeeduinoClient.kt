@@ -1,5 +1,7 @@
 package com.speeduino.manager
 
+import kotlin.concurrent.Volatile
+
 import com.speeduino.manager.definition.IniDefinition
 import com.speeduino.manager.definition.IniFieldKind
 import com.speeduino.manager.ecu.FirmwareConsensus
@@ -61,8 +63,9 @@ import com.speeduino.manager.tables.TableDomainFacade
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
+import com.speeduino.manager.shared.MonotonicClock
+import com.speeduino.manager.shared.formatDecimal
+import com.speeduino.manager.shared.toHex02
 
 /**
  * Cliente principal para comunicação com Speeduino ECU
@@ -140,7 +143,7 @@ class SpeeduinoClient(
     private var rusefiIniCatalog: RusefiIniTableDefinitions.Catalog? = null
     private var pendingRusefiVeTableReadback: VeTable? = null
     private var pendingRusefiIgnitionTableReadback: IgnitionTable? = null
-    private val pendingSpeeduinoPageReadbacks = ConcurrentHashMap<Int, ByteArray>()
+    private val pendingSpeeduinoPageReadbacks = mutableMapOf<Int, ByteArray>()
     private var lastDisconnectWasRusefi: Boolean = false
     private var lastDisconnectAtMs: Long = 0L
     private var cachedEngineConstants: EngineConstants? = null
@@ -179,7 +182,7 @@ class SpeeduinoClient(
             connection.connect()
             val shouldSettleAfterRusefiDisconnect = lastDisconnectWasRusefi || lastGlobalDisconnectWasActive
             if (shouldSettleAfterRusefiDisconnect) {
-                val settleDelayMs = (System.currentTimeMillis() - maxOf(lastDisconnectAtMs, lastGlobalDisconnectAtMs)).let { elapsed ->
+                val settleDelayMs = (MonotonicClock.nowMillis() - maxOf(lastDisconnectAtMs, lastGlobalDisconnectAtMs)).let { elapsed ->
                     if (elapsed < RUSEFI_RECONNECT_SETTLE_DELAY_MS) {
                         RUSEFI_RECONNECT_SETTLE_DELAY_MS - elapsed
                     } else if (elapsed < GLOBAL_RECONNECT_SETTLE_DELAY_MS) {
@@ -340,7 +343,7 @@ class SpeeduinoClient(
                 readOnlySafeModeEnabled = false
 
                 val originalMessage = e.message.orEmpty()
-                val normalizedMessage = originalMessage.lowercase(Locale.US)
+                val normalizedMessage = originalMessage.lowercase()
                 val isChannelQualityError =
                     "assinatura de firmware" in normalizedMessage ||
                     "no readable legacy candidates" in normalizedMessage ||
@@ -489,7 +492,7 @@ class SpeeduinoClient(
     }
 
     private fun inferHandshakeTraceTransport(): String {
-        val info = connection.getConnectionInfo().lowercase(Locale.US)
+        val info = connection.getConnectionInfo().lowercase()
         return when {
             info.startsWith("bluetooth:") -> "bluetooth"
             info.startsWith("tcp:") -> "tcp"
@@ -711,7 +714,7 @@ class SpeeduinoClient(
      */
     fun disconnect() {
         lastDisconnectWasRusefi = firmwareInfo?.family == EcuFamily.RUSEFI
-        lastDisconnectAtMs = System.currentTimeMillis()
+        lastDisconnectAtMs = MonotonicClock.nowMillis()
         lastGlobalDisconnectWasActive = true
         lastGlobalDisconnectAtMs = lastDisconnectAtMs
         stopLiveDataStream()
@@ -835,7 +838,7 @@ class SpeeduinoClient(
         // Cache-through persistente: serve páginas frescas do disco sem tocar na ECU.
         val cacheIdentity = cacheIdentity()
         if (cacheIdentity != null) {
-            pageCache.read(cacheIdentity, pageNum, offset, length, System.currentTimeMillis(), pageCacheTtlMs)
+            pageCache.read(cacheIdentity, pageNum, offset, length, MonotonicClock.nowMillis(), pageCacheTtlMs)
                 ?.let { cached ->
                     Logger.d(TAG, "Cache hit página ${formatPageId(pageNum)} offset=$offset length=$length")
                     return cached
@@ -855,7 +858,7 @@ class SpeeduinoClient(
         }
 
         if (cacheIdentity != null && result.size == length) {
-            pageCache.store(cacheIdentity, pageNum, offset, length, result, System.currentTimeMillis())
+            pageCache.store(cacheIdentity, pageNum, offset, length, result, MonotonicClock.nowMillis())
         }
         return result
     }
@@ -2020,7 +2023,7 @@ class SpeeduinoClient(
         val layout = Ms3TableDefinitions.VE_TABLE_1
         Logger.d(
             TAG,
-            "Lendo MS3 VE Table 1 (table 0x${layout.metadata.page.toString(16).uppercase(Locale.US)}, ${layout.metadata.totalSize} bytes)..."
+            "Lendo MS3 VE Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
         )
         val valuesData = readConfigChunk(
             pageId = layout.metadata.page.toByte(),
@@ -2059,7 +2062,7 @@ class SpeeduinoClient(
         val layout = Ms2TableDefinitions.VE_TABLE_1
         Logger.d(
             TAG,
-            "Lendo MS2 VE Table 1 (table 0x${layout.metadata.page.toString(16).uppercase(Locale.US)}, ${layout.metadata.totalSize} bytes)..."
+            "Lendo MS2 VE Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
         )
         val valuesData = readConfigChunk(
             pageId = layout.metadata.page.toByte(),
@@ -2089,7 +2092,7 @@ class SpeeduinoClient(
         val layout = Ms3TableDefinitions.IGNITION_TABLE_1
         Logger.d(
             TAG,
-            "Lendo MS3 Ignition Table 1 (table 0x${layout.metadata.page.toString(16).uppercase(Locale.US)}, ${layout.metadata.totalSize} bytes)..."
+            "Lendo MS3 Ignition Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
         )
         val valuesData = readConfigChunk(
             pageId = layout.metadata.page.toByte(),
@@ -2128,7 +2131,7 @@ class SpeeduinoClient(
         val layout = Ms2TableDefinitions.IGNITION_TABLE_1
         Logger.d(
             TAG,
-            "Lendo MS2 Ignition Table 1 (table 0x${layout.metadata.page.toString(16).uppercase(Locale.US)}, ${layout.metadata.totalSize} bytes)..."
+            "Lendo MS2 Ignition Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
         )
         val valuesData = readConfigChunk(
             pageId = layout.metadata.page.toByte(),
@@ -2158,7 +2161,7 @@ class SpeeduinoClient(
         val layout = Ms3TableDefinitions.AFR_TABLE_1
         Logger.d(
             TAG,
-            "Lendo MS3 AFR Table 1 (table 0x${layout.metadata.page.toString(16).uppercase(Locale.US)}, ${layout.metadata.totalSize} bytes)..."
+            "Lendo MS3 AFR Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
         )
         val valuesData = readConfigChunk(
             pageId = layout.metadata.page.toByte(),
@@ -2197,7 +2200,7 @@ class SpeeduinoClient(
         val layout = Ms2TableDefinitions.AFR_TABLE_1
         Logger.d(
             TAG,
-            "Lendo MS2 AFR Table 1 (table 0x${layout.metadata.page.toString(16).uppercase(Locale.US)}, ${layout.metadata.totalSize} bytes)..."
+            "Lendo MS2 AFR Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
         )
         val valuesData = readConfigChunk(
             pageId = layout.metadata.page.toByte(),
@@ -2778,13 +2781,13 @@ class SpeeduinoClient(
         streamJob?.cancel()
         _isStreaming = true
         liveDataStreamStopRequested = false
-        lastLiveDataStreamStartedAtMs = System.currentTimeMillis()
+        lastLiveDataStreamStartedAtMs = MonotonicClock.nowMillis()
         consecutiveFaultyLiveDataSamples = 0
         pendingLiveDataRecoveryReason = null
 
         streamJob = scope.launch {
             val intervalNs = intervalMs.coerceAtLeast(1L) * 1_000_000L
-            var nextTickNs = System.nanoTime()
+            var nextTickNs = MonotonicClock.nowNanos()
             var packetCount = 0
             var recoverableReadTimeouts = 0
             var restartReason: String? = null
@@ -2809,7 +2812,7 @@ class SpeeduinoClient(
                     }
 
                     nextTickNs += intervalNs
-                    val remainingNs = nextTickNs - System.nanoTime()
+                    val remainingNs = nextTickNs - MonotonicClock.nowNanos()
                     if (remainingNs > 0L) {
                         delay(remainingNs / 1_000_000L)
                     } else {
@@ -2818,7 +2821,7 @@ class SpeeduinoClient(
                         // colados uns nos outros num transporte lento.
                         val gapMs = LIVE_STREAM_MIN_COMMAND_GAP_MS.coerceAtMost(intervalMs)
                         delay(gapMs)
-                        nextTickNs = System.nanoTime()
+                        nextTickNs = MonotonicClock.nowNanos()
                     }
                 } catch (_: CancellationException) {
                     // Stream cancelado por troca de fluxo (pause/restart/disconnect).
@@ -3016,14 +3019,14 @@ class SpeeduinoClient(
         val field = findIniFieldByName(name) ?: return null
         val pageId = field.page ?: return null
         val offset = field.offset ?: return null
-        val length = when (field.dataType.trim().uppercase(Locale.US)) {
+        val length = when (field.dataType.trim().uppercase()) {
             "U16", "S16" -> 2
             else -> 1
         }
         val data = readConfigChunk(pageId, offset, length)
         if (data.size < length) return null
 
-        val rawValue = when (field.dataType.trim().uppercase(Locale.US)) {
+        val rawValue = when (field.dataType.trim().uppercase()) {
             "U16", "S16" -> (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8)
             else -> data[0].toInt() and 0xFF
         }
@@ -3257,7 +3260,7 @@ class SpeeduinoClient(
         if (!com.speeduino.manager.connection.ConnectionTrace.enabled) {
             return
         }
-        val now = System.currentTimeMillis()
+        val now = MonotonicClock.nowMillis()
         val (shouldReport, score) = shouldReportLiveDataIssue(liveData)
         if (!shouldReport || isWithinLiveDataWarmupWindow(now)) {
             consecutiveFaultyLiveDataSamples = 0
@@ -3280,7 +3283,7 @@ class SpeeduinoClient(
         }
         lastFaultSampleAtMs = now
 
-        val hex = data.joinToString(" ") { "%02X".format(it) }
+        val hex = data.joinToString(" ") { it.toHex02() }
         val message = buildLiveDataFaultMessage(
             data = data,
             liveData = liveData,
@@ -3292,7 +3295,7 @@ class SpeeduinoClient(
         com.speeduino.manager.connection.ConnectionTrace.info("live_data", message)
     }
 
-    private fun isWithinLiveDataWarmupWindow(now: Long = System.currentTimeMillis()): Boolean {
+    private fun isWithinLiveDataWarmupWindow(now: Long = MonotonicClock.nowMillis()): Boolean {
         val startedAt = lastLiveDataStreamStartedAtMs
         return startedAt <= 0L || now - startedAt < LIVE_DATA_STREAM_WARMUP_MS
     }
@@ -3331,7 +3334,7 @@ class SpeeduinoClient(
         hexPayload: String,
         faultCount: Int
     ): String {
-        val batteryStr = String.format(Locale.US, "%.1f", liveData.batteryVoltage)
+        val batteryStr = formatDecimal(liveData.batteryVoltage, 1)
         return buildString {
             append("faulty sample score=$score")
             append(" count=$faultCount")

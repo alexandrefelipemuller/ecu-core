@@ -12,7 +12,6 @@ import com.speeduino.manager.model.VeTable
 import com.speeduino.manager.model.afrTableLoadType
 import com.speeduino.manager.model.fuelTableLoadType
 import com.speeduino.manager.model.ignitionTableLoadType
-import java.util.Locale
 
 data class TableWritePayload(
     val metadata: TableMetadata,
@@ -67,7 +66,7 @@ object TableDomainFacade {
     ): TableMetadata {
         val rows = fieldRows ?: fallback.valuesShape.first
         val cols = fieldColumns ?: fallback.valuesShape.second
-        val valueSize = when (fieldDataType.trim().uppercase(Locale.US)) {
+        val valueSize = when (fieldDataType.trim().uppercase()) {
             "U16", "S16" -> 2
             else -> 1
         }
@@ -82,7 +81,7 @@ object TableDomainFacade {
             valuesOffset = 0,
             rpmBinsOffset = valuesBytes,
             loadBinsOffset = valuesBytes + (cols * valueSize),
-            valueType = when (fieldDataType.trim().uppercase(Locale.US)) {
+            valueType = when (fieldDataType.trim().uppercase()) {
                 "S08" -> DataType.S08
                 "U16" -> DataType.U16
                 "S16" -> DataType.S16
