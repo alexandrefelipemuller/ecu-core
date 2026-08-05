@@ -21,14 +21,14 @@ abstract class GenerateSharedVersionTask : org.gradle.api.DefaultTask() {
         file.parentFile.mkdirs()
         file.writeText(
             """
-            package com.speeduino.manager.shared
+            package io.ecucore.shared
 
             /**
              * Metadata da versão do módulo shared.
              */
             object SharedModuleVersion {
                 const val VERSION_NAME: String = "${sharedVersion.get()}"
-                const val GROUP: String = "com.speeduino.manager"
+                const val GROUP: String = "io.ecucore"
                 const val MODULE_NAME: String = "shared"
             }
             """.trimIndent() + "\n"
@@ -46,12 +46,12 @@ val sharedVersion = providers.gradleProperty("sharedVersion").orElse("0.0.0-dev"
 val sharedVersionName = sharedVersion.get()
 val generatedSharedVersionDir = layout.buildDirectory.dir("generated/sharedVersion/commonMain")
 
-group = "com.speeduino.manager"
+group = "io.ecucore"
 version = sharedVersionName
 
 kotlin {
     android {
-        namespace = "com.speeduino.manager.shared"
+        namespace = "io.ecucore.shared"
         compileSdk = 36
         minSdk = 24
         compilerOptions {
@@ -128,7 +128,7 @@ val generateSharedVersion = tasks.register<GenerateSharedVersionTask>("generateS
     sharedVersion.set(sharedVersionName)
     outputFile.set(
         generatedSharedVersionDir.map {
-            it.file("com/speeduino/manager/shared/SharedModuleVersion.kt")
+            it.file("io/ecucore/shared/SharedModuleVersion.kt")
         }
     )
 }
