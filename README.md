@@ -1,7 +1,7 @@
 # ecu-core
 
 Núcleo multiplataforma (Kotlin Multiplatform) compartilhado pelos apps
-**SpeeduinoManager** (Android / Desktop / iOS) e **TopSpeed** (Android / iOS).
+**SpeeduinoManager** (Android / Desktop / iOS)
 Pacote raiz: `io.ecucore`. Targets: `android`, `jvm("desktop")`, `iosArm64`,
 `iosSimulatorArm64`.
 
@@ -56,11 +56,6 @@ Use os substitutos em `io.ecucore.shared`: `formatDecimal`, `toHex02`, `Monotoni
 `Crc32Table`, `sleepMillis`, `@JvmSynchronized`. O compilador dos targets ios
 acusa qualquer vazamento no build — não desative esses targets.
 
-## Guia de extensão para o TopSpeed (migração futura)
-
-O TopSpeed (fork rebrand) deve migrar para consumir este repo em vez de manter
-cópia própria. Divergências conhecidas e como absorvê-las **sem fork**:
-
 1. **`RestoreTablePageValidator`** — já incorporado em `:core-model` (aditivo).
 2. **Valet mode (`EngineProtectionConfig`)** — o TopSpeed adiciona
    `isValetMode()/asValetMode()/hardRevLimit*` e usa um mapeamento de páginas
@@ -83,8 +78,7 @@ cópia própria. Divergências conhecidas e como absorvê-las **sem fork**:
 ## Histórico
 
 Criado em 2026-08 unificando 5 cópias divergentes do módulo `shared`
-(SpeeduinoManagerAndroid — fonte da verdade do core —, Desktop, iOS e os dois
-TopSpeed). Tag `pre-unification` em cada repo marca o estado anterior.
+(SpeeduinoManagerAndroid — fonte da verdade do core —, Desktop, iOS ). Tag `pre-unification` em cada repo marca o estado anterior.
 
 ## Licença
 
