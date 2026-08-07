@@ -3,6 +3,7 @@ package io.ecucore.sync
 import io.ecucore.ConfigDownloadResult
 import io.ecucore.ConfigManager
 import io.ecucore.model.AfrTable
+import io.ecucore.model.EcuFamily
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.IgnitionTable
 import io.ecucore.model.Page6Validator
@@ -13,6 +14,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.zip.CRC32
 
 data class SessionTablesSnapshot(
@@ -44,6 +48,17 @@ data class RestoreOutcome(
 class ConfigSyncService(
     private val configManager: ConfigManager,
 ) {
+    /**
+     * Downloads the current ECU config and resolves which session should be treated as the
+     * active one locally.
+     *
+     * The ECU is always the source of truth: [SyncDecision.sessionDir] is the freshly
+     * downloaded ECU session whenever the download succeeds, regardless of whether a local
+     * session exists or differs from it. When a local session does differ, [SyncDecision.prompt]
+     * is still populated so a caller can offer "restore my local backup over the ECU" as an
+     * option - but that offer is informational, never a precondition for loading the ECU data
+     * that was just downloaded.
+     */
     suspend fun downloadAndResolveSync(
         client: EcuTransport,
         localSessionDir: File?,
@@ -61,14 +76,27 @@ class ConfigSyncService(
 
         val ecuSignature = sessionSignature(ecuSessionDir)
         val localSignature = sessionSignature(localSessionDir)
-        if (ecuSignature != localSignature) {
-            result to SyncDecision(
-                sessionDir = null,
-                prompt = SessionSyncPrompt(localSessionDir, ecuSessionDir),
-            )
+        val prompt = if (ecuSignature != localSignature) {
+            SessionSyncPrompt(localSessionDir, ecuSessionDir)
         } else {
-            result to SyncDecision(sessionDir = ecuSessionDir, prompt = null)
+            null
         }
+        result to SyncDecision(sessionDir = ecuSessionDir, prompt = prompt)
+    }
+
+    /**
+     * Backs up [sessionDir] before a write to an MS3 ECU, since MS3 firmware has historically
+     * been more sensitive to partial/rejected page writes than Speeduino. Ported from the
+     * Android app's `ensureMs3WriteSafetyBackup`. No-op (returns null) for any other ECU family.
+     */
+    suspend fun ensureMs3WriteSafetyBackup(sessionDir: File, ecuFamily: EcuFamily): File? = withContext(Dispatchers.IO) {
+        if (ecuFamily != EcuFamily.MS3 || !sessionDir.isDirectory) {
+            return@withContext null
+        }
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val backupDir = File(sessionDir.parentFile, "${sessionDir.name}_ms3_backup_$timestamp")
+        sessionDir.copyRecursively(backupDir, overwrite = true)
+        backupDir
     }
 
     suspend fun loadTablesFromSession(sessionDir: File): SessionTablesSnapshot = withContext(Dispatchers.IO) {
