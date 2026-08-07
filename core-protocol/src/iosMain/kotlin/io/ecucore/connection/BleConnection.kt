@@ -259,6 +259,13 @@ class BleConnection(
         return result
     }
 
+    override fun readAvailable(maxBytes: Int, timeoutMs: Int?): ByteArray {
+        if (!connected) return ByteArray(0)
+        val result = inbound.read(length = maxBytes, timeoutMs = (timeoutMs ?: this.timeoutMs).toLong())
+        ConnectionTrace.rx("ble", result)
+        return result
+    }
+
     override fun isConnected(): Boolean = connected
 
     override fun getConnectionInfo(): String {

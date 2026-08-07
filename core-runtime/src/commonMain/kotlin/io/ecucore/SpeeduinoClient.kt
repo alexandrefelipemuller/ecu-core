@@ -333,7 +333,12 @@ class SpeeduinoClient(
                 }
 
                 // Limpa qualquer byte tardio de consultas de firmware antes de iniciar downloads/stream.
-                runCatching { connection.clearInputBuffer() }
+                // Um único clear() aqui pode rodar antes que a última resposta do handshake (ex.: a
+                // 2ª amostra de consenso da assinatura legacy) termine de chegar pela rede — os bytes
+                // dela pousam no buffer LOGO DEPOIS do clear e se misturam com a 1ª leitura de página
+                // (MS1 'V' não tem framing/length, então não há como distinguir depois). drainInputBufferQuietly
+                // dá um respiro de 50ms entre dois clears para cobrir essa janela.
+                drainInputBufferQuietly()
 
                 connection.markHandshakeSuccess()
 
@@ -907,9 +912,18 @@ class SpeeduinoClient(
             drainInputBufferQuietly()
         }
 
+        // MS1/Extra's legacy 'V' page response has no framing/length header — it's just raw bytes
+        // read until an idle gap. On this family the retry attempt always succeeds where the first
+        // attempt fails, which points at a stray leftover byte from the (multi-round) firmware
+        // handshake still landing in the socket buffer right as the first page request goes out.
+        // Force the same pre-attempt drain used for noisy BLE links here too, on every attempt —
+        // not just connection.shouldDrainBeforeLegacyConfigRead()'s default (false for TCP).
+        val shouldDrainBeforeAttempt = readMode == EcuConfigReadMode.LEGACY_PAGE &&
+            (connection.shouldDrainBeforeLegacyConfigRead() || ecuDefinition?.runtime?.schemaId == "msextra-hr10")
+
         repeat(CONFIG_CHUNK_READ_MAX_ATTEMPTS) { attempt ->
             try {
-                if (readMode == EcuConfigReadMode.LEGACY_PAGE && connection.shouldDrainBeforeLegacyConfigRead()) {
+                if (shouldDrainBeforeAttempt) {
                     runCatching { connection.clearInputBuffer() }
                     delay(20)
                     runCatching { connection.clearInputBuffer() }
@@ -1129,15 +1143,23 @@ class SpeeduinoClient(
      */
     override suspend fun readEngineConstants(): EngineConstants {
         val rusefiSchemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
-        val constants = when (firmwareInfo?.family) {
-            EcuFamily.MS2, EcuFamily.MEGASPEED -> {
-                Logger.d(TAG, "Lendo Engine Constants MS2 (Page 0x04)...")
+        val constants = when {
+            // MS1/Extra is classified as EcuFamily.MS2 (era MS2) but its legacy page 4 is a small,
+            // whole-page-only read (~189 bytes on real hardware/the fake ECU) — not the 1024-byte,
+            // 4x256-chunk page real MS2/MS3 expose. Requesting the MS2 chunk size against it throws
+            // ("MS1 page response too short") on the very first chunk and kills the connection.
+            // MS1 engine-constants parsing isn't implemented yet, so bail out cleanly instead.
+            ecuDefinition?.runtime?.schemaId == "msextra-hr10" ->
+                throw UnsupportedOperationException("Engine Constants MS1/Extra ainda não mapeados nesta versão")
+
+            firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED || firmwareInfo?.family == EcuFamily.MS3 -> {
+                Logger.d(TAG, "Lendo Engine Constants MS2/MS3 (Page 0x04)...")
                 val pageData = readFullPage(pageNum = 0x04, pageSize = 1024, blockSize = 256)
                 Logger.d(TAG, "Page 0x04 recebida: ${pageData.size} bytes")
                 EngineConstants.fromMs2Page1(pageData)
             }
 
-            EcuFamily.RUSEFI -> {
+            firmwareInfo?.family == EcuFamily.RUSEFI -> {
                 activeIniDefinition?.let { definition ->
                     val length = RusefiIniUiParsers.requiredBytesForEngine(definition)
                     Logger.d(TAG, "Lendo Engine Constants rusEFI via .ini (Page 0x0000 chunk 0..${length - 1})...")
@@ -1525,6 +1547,9 @@ class SpeeduinoClient(
      * @throws IllegalStateException if not connected
      */
     override suspend fun readVeTable(mapIndex: Int): VeTable {
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            throw UnsupportedOperationException("VE Table MS1/Extra ainda não mapeada nesta versão")
+        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             return readMs2VeTable()
         }
@@ -1578,6 +1603,9 @@ class SpeeduinoClient(
      * @throws IllegalStateException if not connected
      */
     override suspend fun readIgnitionTable(mapIndex: Int): IgnitionTable {
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            throw UnsupportedOperationException("Ignition Table MS1/Extra ainda não mapeada nesta versão")
+        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             return readMs2IgnitionTable()
         }
@@ -1646,8 +1674,11 @@ class SpeeduinoClient(
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("Engine Constants rusEFI ainda não mapeados nesta versão")
         }
-        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
-            Logger.d(TAG, "Gravando Engine Constants MS2 (Page 0x04)...")
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            throw UnsupportedOperationException("Engine Constants MS1/Extra ainda não mapeados nesta versão")
+        }
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED || firmwareInfo?.family == EcuFamily.MS3) {
+            Logger.d(TAG, "Gravando Engine Constants MS2/MS3 (Page 0x04)...")
             val basePage = readFullPage(pageNum = 0x04, pageSize = 1024, blockSize = 256)
             val pageData = engineConstants.applyToMs2Page1(basePage)
             protocol.writeTable(tableId = 0x04, offset = 0, data = pageData)
@@ -1990,6 +2021,9 @@ class SpeeduinoClient(
      * @throws IllegalStateException if not connected
      */
     override suspend fun readAfrTable(): AfrTable {
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            throw UnsupportedOperationException("AFR Table MS1/Extra ainda não mapeada nesta versão")
+        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             return readMs2AfrTable()
         }
