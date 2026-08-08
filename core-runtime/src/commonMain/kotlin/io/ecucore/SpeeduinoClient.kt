@@ -178,6 +178,21 @@ class SpeeduinoClient(
                 return
             }
 
+            // Uma stream de live data de uma conexão anterior pode ainda estar em uma
+            // leitura/escrita USB bloqueante (I/O síncrono nativo, ex: usb-serial-for-android)
+            // quando o usuário desconecta e reconecta rápido. streamJob?.cancel() sozinho
+            // (usado em stopLiveDataStream/disconnect) só marca a coroutine como cancelada -
+            // isso não interrompe a chamada bloqueante em andamento, que só "percebe" o
+            // cancelamento no próximo ponto de suspensão, e I/O bloqueante não tem um.
+            // Resultado observado em bench (2026-08-08): a escrita antiga completa (ou falha)
+            // bem no meio do handshake da conexão nova, ambas mexendo no mesmo objeto de
+            // conexão compartilhado - corrompendo a escrita nova e derrubando a conexão nova no
+            // meio do handshake. cancelAndJoin() aqui garante que essa I/O antiga realmente
+            // terminou (com sucesso ou erro) antes de abrirmos a porta de novo.
+            streamJob?.cancelAndJoin()
+            streamJob = null
+            _isStreaming = false
+
             // 1. Estabelecer conexão física
             connection.connect()
             val shouldSettleAfterRusefiDisconnect = lastDisconnectWasRusefi || lastGlobalDisconnectWasActive

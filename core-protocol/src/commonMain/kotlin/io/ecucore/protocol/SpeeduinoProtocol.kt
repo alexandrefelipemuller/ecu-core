@@ -106,9 +106,40 @@ class SpeeduinoProtocol(
         sessionSchemaId = schemaId
     }
 
+    /**
+     * Misturar legacy e moderno na mesma sessão trava a ECU real. Achado em bench (2026-08-08),
+     * confirmado lendo o firmware fonte (speeduino/comms/comms.cpp, função serialReceive):
+     *
+     *   if (incomingCrc == CRC32_serial.crc32(serialPayload, serialPayloadLength)) {
+     *     processSerialCommand();
+     *     currentStatus.allowLegacyComms = false; //Lock out legacy commands until next power cycle
+     *   }
+     *
+     * Ou seja: assim que UM comando moderno (envelope [length][payload][CRC32]) é processado com
+     * CRC válido, o firmware desliga `allowLegacyComms` até a ECU ser desligada e religada. A
+     * partir daí, o dispatcher de `serialReceive` para de tratar bytes 'A'-'z' como comando
+     * legacy — qualquer 'p' cru que o app mande depois vira, na visão do firmware, os 2 primeiros
+     * bytes do campo de tamanho de um frame moderno. A ECU calcula um tamanho de payload absurdo
+     * a partir disso e fica esperando bytes que nunca chegam: silêncio total pelo resto da sessão
+     * (sintoma observado: todo `readPage`/`getSerialCapability` retornando "expected 2 bytes,
+     * received 0", em qualquer perfil USB, mesmo com CRC do app matematicamente correto).
+     *
+     * IMPORTANTE: essa restrição vale só pra leitura de PÁGINA DE CONFIG (o fluxo onde
+     * confirmamos em bench que legacy funciona e moderno não). Live data é o oposto nesse mesmo
+     * firmware: o comando legacy 'A' é mal-interpretado como prefixo de tamanho e trava a ECU
+     * (ver comentário em [canAttemptModernLiveData]), então moderno é obrigatório ali mesmo em
+     * USB/BT - por isso só [isModernEnabled] e [canAttemptModernConfigRead] usam esse override
+     * restrito; [canAttemptModernFallback] e [canAttemptModernLiveData] continuam deixando
+     * `sessionModernEnvelope` vencer os flags do transporte normalmente.
+     */
+    private fun sessionModernEnvelopeOverrideForConfigRead(): Boolean? {
+        if (connection.prefersLegacyProtocol()) return null
+        return sessionModernEnvelope
+    }
+
     private fun isModernEnabled(ignoreSessionLegacyPreferred: Boolean = false): Boolean {
         if (FORCE_LEGACY_PROTOCOL) return false
-        sessionModernEnvelope?.let { return it }
+        sessionModernEnvelopeOverrideForConfigRead()?.let { return it }
         return (ignoreSessionLegacyPreferred || !sessionLegacyPreferred) &&
             connection.supportsModernProtocol()
     }
@@ -141,7 +172,7 @@ class SpeeduinoProtocol(
 
     private fun canAttemptModernConfigRead(ignoreSessionLegacyPreferred: Boolean = false): Boolean {
         if (FORCE_LEGACY_PROTOCOL) return false
-        sessionModernEnvelope?.let { return it }
+        sessionModernEnvelopeOverrideForConfigRead()?.let { return it }
         return (ignoreSessionLegacyPreferred || !sessionLegacyPreferred) &&
             connection.supportsModernConfigReads()
     }
@@ -296,7 +327,13 @@ class SpeeduinoProtocol(
                     payload[4] = (length and 0xFF).toByte()
                     payload[5] = ((length shr 8) and 0xFF).toByte()
                     sendLegacyCommand('p'.code.toByte(), payload = payload, expectResponse = false)
-                    readLegacyPageData(pageLabel)
+                    // 'p' legacy sempre devolve exatamente `length` bytes (não é um dump de
+                    // tamanho variável como o 'V' do MS1) - leitura bloqueante e precisa, igual
+                    // ao comportamento validado em bench real. O polling com heurística de
+                    // "silêncio" em readLegacyPageData() existe pro dump MS1 (tamanho
+                    // desconhecido) e não deveria ser usado aqui: introduz timeouts/lentidão
+                    // desnecessários quando já sabemos o tamanho exato esperado.
+                    connection.receive(length)
                 }.let { fullOrRequested ->
                     if (sessionSchemaId == MSEXTRA_HR10_SCHEMA_ID) {
                         if (offset + length > fullOrRequested.size) {
@@ -325,7 +362,11 @@ class SpeeduinoProtocol(
                 readPageModern(pageNum, offset, length, allowConfigReadFallback = allowModernTransportFallback)
             }
         } catch (e: Exception) {
-            if (!isModernEnabled() && connection.supportsModernProtocolFallback()) {
+            // Não tentar fallback moderno em transportes legacy-first (USB/BT): um comando
+            // moderno bem-sucedido trava o firmware em "só moderno" pelo resto do power cycle da
+            // ECU (ver comentário em sessionModernEnvelopeOverrideForConfigRead), e todas as
+            // leituras legacy seguintes nesta mesma sessão passariam a travar em silêncio.
+            if (!isModernEnabled() && connection.supportsModernProtocolFallback() && !connection.prefersLegacyProtocol()) {
                 Logger.w(
                     "SpeeduinoProtocol",
                     "Legacy page read failed, trying modern fallback page=$pageLabel offset=$offset length=$length: ${e.message}"
