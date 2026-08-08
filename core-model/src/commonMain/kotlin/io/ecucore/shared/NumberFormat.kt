@@ -7,6 +7,9 @@ import kotlin.math.round
 fun Byte.toHex02(): String =
     (toInt() and 0xFF).toString(16).uppercase().padStart(2, '0')
 
+fun Int.toHex02(): String =
+    (this and 0xFF).toString(16).uppercase().padStart(2, '0')
+
 fun formatDecimal(value: Double, decimals: Int): String {
     if (decimals <= 0) return round(value).toLong().toString()
     val factor = 10.0.pow(decimals)
