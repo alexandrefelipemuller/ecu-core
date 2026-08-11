@@ -515,8 +515,8 @@ class PsaTransport(
     override suspend fun writeRawPage(pageNum: Int, data: ByteArray) = obd2Delegate.writeRawPage(pageNum, data)
     override suspend fun writeRawPageWithoutBurn(pageNum: Int, data: ByteArray) =
         obd2Delegate.writeRawPageWithoutBurn(pageNum, data)
-    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int) =
-        obd2Delegate.writeRawPageChunkedWithoutBurn(pageNum, data, chunkSize)
+    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) =
+        obd2Delegate.writeRawPageChunkedWithoutBurn(pageNum, data, chunkSize, startOffset)
     override suspend fun burnConfigs() = obd2Delegate.burnConfigs()
     override suspend fun burnLastWrittenLegacyPage() = obd2Delegate.burnLastWrittenLegacyPage()
     override suspend fun writeVeTable(veTable: VeTable, mapIndex: Int) =

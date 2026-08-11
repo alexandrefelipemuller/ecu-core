@@ -198,8 +198,8 @@ class PromotingObd2Transport(
     override suspend fun writeRawPageWithoutBurn(pageNum: Int, data: ByteArray) =
         selected().writeRawPageWithoutBurn(pageNum, data)
 
-    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int) =
-        selected().writeRawPageChunkedWithoutBurn(pageNum, data, chunkSize)
+    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) =
+        selected().writeRawPageChunkedWithoutBurn(pageNum, data, chunkSize, startOffset)
 
     override suspend fun burnConfigs() = selected().burnConfigs()
 

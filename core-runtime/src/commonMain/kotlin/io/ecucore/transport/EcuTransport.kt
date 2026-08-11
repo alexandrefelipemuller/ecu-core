@@ -163,8 +163,12 @@ interface EcuTransport {
     suspend fun writeRawPageWithoutBurn(pageNum: Int, data: ByteArray): Unit =
         throw UnsupportedOperationException("Raw page write not supported by this transport")
 
-    suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int = 64): Unit =
-        throw UnsupportedOperationException("Chunked raw page write not supported by this transport")
+    suspend fun writeRawPageChunkedWithoutBurn(
+        pageNum: Int,
+        data: ByteArray,
+        chunkSize: Int = 64,
+        startOffset: Int = 0,
+    ): Unit = throw UnsupportedOperationException("Chunked raw page write not supported by this transport")
 
     suspend fun burnConfigs(): Unit =
         throw UnsupportedOperationException("Burn not supported by this transport")

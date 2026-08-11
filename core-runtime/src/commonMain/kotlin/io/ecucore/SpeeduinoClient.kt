@@ -1813,7 +1813,7 @@ class SpeeduinoClient(
      * Grava uma pagina em blocos menores para contornar timeouts de recepcao
      * em firmwares que nao conseguem consumir um pacote legado inteiro a tempo.
      */
-    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int) {
+    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) {
         ensureWritable("writeRawPageChunkedWithoutBurn")
         if (chunkSize <= 0) {
             throw IllegalArgumentException("chunkSize must be > 0")
@@ -1823,11 +1823,12 @@ class SpeeduinoClient(
             return
         }
 
-        var offset = 0
+        var offset = startOffset
+        val end0 = startOffset + data.size
         var chunkIndex = 0
-        while (offset < data.size) {
-            val end = minOf(offset + chunkSize, data.size)
-            val chunk = data.copyOfRange(offset, end)
+        while (offset < end0) {
+            val end = minOf(offset + chunkSize, end0)
+            val chunk = data.copyOfRange(offset - startOffset, end - startOffset)
             chunkIndex++
             Logger.d(TAG, "Gravando pagina ${formatPageId(pageNum)} em chunk #$chunkIndex offset=$offset size=${chunk.size}")
             var attempt = 0
@@ -1845,7 +1846,7 @@ class SpeeduinoClient(
                 }
             }
             offset = end
-            if (offset < data.size) {
+            if (offset < end0) {
                 delay(60)
             }
         }
@@ -1855,8 +1856,8 @@ class SpeeduinoClient(
         Logger.d(TAG, "Pagina ${formatPageId(pageNum)} gravada em chunks sem burn")
     }
 
-    suspend fun writeRawPageChunkedWithoutBurn(pageNum: Byte, data: ByteArray, chunkSize: Int = 64) {
-        writeRawPageChunkedWithoutBurn(pageNum.toInt() and 0xFF, data, chunkSize)
+    suspend fun writeRawPageChunkedWithoutBurn(pageNum: Byte, data: ByteArray, chunkSize: Int = 64, startOffset: Int = 0) {
+        writeRawPageChunkedWithoutBurn(pageNum.toInt() and 0xFF, data, chunkSize, startOffset)
     }
 
     /**
