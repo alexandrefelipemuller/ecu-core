@@ -63,4 +63,38 @@ class Obd2DomainTest {
         assertEquals(0.5f, status.progressFraction)
         assertFalse(status.fallbackOccurred)
     }
+
+    @Test
+    fun decodesDtcBytesToStandardCodeFormat() {
+        assertEquals("P0133", decodeDtc(0x01, 0x33))
+        assertEquals("P0301", decodeDtc(0x03, 0x01))
+        assertEquals("C0300", decodeDtc(0x43, 0x00))
+        assertEquals("U0100", decodeDtc(0xC1, 0x00))
+    }
+
+    @Test
+    fun parsesMode03ResponseSkippingEmptySlots() {
+        val codes = parseDtcResponse("43 01 33 00 00", DtcStatus.ACTIVE)
+        assertEquals(listOf(DtcCode(code = "P0133", status = DtcStatus.ACTIVE)), codes)
+    }
+
+    @Test
+    fun parsesMode03ResponseWithNoDtcs() {
+        assertTrue(parseDtcResponse("43 00 00", DtcStatus.ACTIVE).isEmpty())
+        assertTrue(parseDtcResponse("NO DATA", DtcStatus.ACTIVE).isEmpty())
+    }
+
+    @Test
+    fun parsesMode07PendingResponse() {
+        val codes = parseDtcResponse("47 03 01", DtcStatus.PENDING)
+        assertEquals(listOf(DtcCode(code = "P0301", status = DtcStatus.PENDING)), codes)
+    }
+
+    @Test
+    fun recognizesClearDtcAcknowledgement() {
+        assertTrue(isDtcClearAcknowledged("44"))
+        assertTrue(isDtcClearAcknowledged("44\r\r"))
+        assertFalse(isDtcClearAcknowledged("7F 04 12"))
+        assertFalse(isDtcClearAcknowledged("NO DATA"))
+    }
 }

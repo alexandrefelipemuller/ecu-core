@@ -50,7 +50,7 @@ class Obd2Transport(
     private val enableFeatureOptimization: Boolean = true,
     private val investigationRecorder: Obd2InvestigationSink? = null,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
-) : EcuTransport {
+) : EcuTransport, Obd2DiagnosticsCapable {
 
     companion object {
         private const val TAG = "Obd2Transport"
@@ -1123,6 +1123,27 @@ class Obd2Transport(
 
     suspend fun sendRawElmCommand(command: String, timeoutMs: Long = 1200L): String {
         return ioMutex.withLock { sendCommand(command, timeoutMs = timeoutMs) }
+    }
+
+    override suspend fun readDtcCodes(): List<DtcCode> {
+        val response = runCatching {
+            ioMutex.withLock { sendCommand("03", timeoutMs = currentFlags.preflightTimeoutMs + 1200L) }
+        }.getOrNull() ?: return emptyList()
+        return parseDtcResponse(response, DtcStatus.ACTIVE)
+    }
+
+    override suspend fun readPendingDtcCodes(): List<DtcCode> {
+        val response = runCatching {
+            ioMutex.withLock { sendCommand("07", timeoutMs = currentFlags.preflightTimeoutMs + 1200L) }
+        }.getOrNull() ?: return emptyList()
+        return parseDtcResponse(response, DtcStatus.PENDING)
+    }
+
+    override suspend fun clearDtcCodes(): Boolean {
+        val response = runCatching {
+            ioMutex.withLock { sendCommand("04", timeoutMs = currentFlags.preflightTimeoutMs + 1200L) }
+        }.getOrNull() ?: return false
+        return isDtcClearAcknowledged(response)
     }
 
     private suspend fun readResponse(timeoutMs: Long): String {

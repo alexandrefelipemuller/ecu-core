@@ -144,3 +144,85 @@ fun classifyVehicleBrandHint(vin: String?, calibrationId: String?): VehicleBrand
 }
 
 fun shouldPromoteToPsa(vehicleBrandHint: VehicleBrandHint): Boolean = vehicleBrandHint == VehicleBrandHint.PSA
+
+enum class DtcStatus {
+    ACTIVE,
+    PENDING,
+}
+
+data class DtcCode(
+    val code: String,
+    val description: String? = null,
+    val status: DtcStatus,
+)
+
+/**
+ * Decodifica um par de bytes de DTC (SAE J2012 / OBD2 Mode 03/07/0A) no formato textual padrão
+ * (ex.: "P0133"). byte0 carrega a letra (bits 7-6) e o primeiro dígito (bits 5-4) mais o segundo
+ * dígito (bits 3-0); byte1 carrega o terceiro e quarto dígitos (nibble alto/baixo).
+ */
+fun decodeDtc(byte0: Int, byte1: Int): String {
+    val letter = when ((byte0 shr 6) and 0x3) {
+        0 -> 'P'
+        1 -> 'C'
+        2 -> 'B'
+        else -> 'U'
+    }
+    val digit0 = (byte0 shr 4) and 0x3
+    val digit1 = byte0 and 0xF
+    val digit2 = (byte1 shr 4) and 0xF
+    val digit3 = byte1 and 0xF
+    return buildString {
+        append(letter)
+        append(digit0.toString(16).uppercase())
+        append(digit1.toString(16).uppercase())
+        append(digit2.toString(16).uppercase())
+        append(digit3.toString(16).uppercase())
+    }
+}
+
+/**
+ * Extrai os DTCs de uma resposta ELM327 a Mode 03 (ativos, header 0x43) ou Mode 07 (pendentes,
+ * header 0x47). Cada par de bytes após o header vira um código; pares "00 00" são ignorados
+ * (slots vazios/terminador, comportamento típico de adaptadores ELM327).
+ */
+fun parseDtcResponse(response: String, status: DtcStatus): List<DtcCode> {
+    val normalized = response.uppercase()
+    if ("NO DATA" in normalized) return emptyList()
+    val headerByte = if (status == DtcStatus.ACTIVE) 0x43 else 0x47
+    val bytes = Regex("[0-9A-F]{2}")
+        .findAll(normalized)
+        .map { it.value.toInt(16) }
+        .toList()
+    val headerIndex = bytes.indexOf(headerByte)
+    if (headerIndex < 0) return emptyList()
+    val dataBytes = bytes.subList(headerIndex + 1, bytes.size)
+    val codes = mutableListOf<DtcCode>()
+    var index = 0
+    while (index + 1 < dataBytes.size) {
+        val byte0 = dataBytes[index]
+        val byte1 = dataBytes[index + 1]
+        if (byte0 != 0 || byte1 != 0) {
+            codes.add(DtcCode(code = decodeDtc(byte0, byte1), status = status))
+        }
+        index += 2
+    }
+    return codes
+}
+
+/**
+ * Verifica se a resposta a um comando Mode 04 (clear DTCs) indica sucesso. A ECU confirma com
+ * "44" (positive response, sem dados extras); uma resposta negativa vem como "7F 04 xx".
+ */
+fun isDtcClearAcknowledged(response: String): Boolean {
+    val normalized = response.uppercase()
+    if ("NO DATA" in normalized || "ERROR" in normalized) return false
+    val bytes = Regex("[0-9A-F]{2}")
+        .findAll(normalized)
+        .map { it.value.toInt(16) }
+        .toList()
+    if (bytes.isEmpty()) return false
+    val negativeResponse = bytes.windowed(2, 1).any { it[0] == 0x7F && it[1] == 0x04 }
+    if (negativeResponse) return false
+    return bytes.contains(0x44)
+}

@@ -53,7 +53,7 @@ class RenaultTransport(
     private val obd2ProfileStore: Obd2ProfileStore? = null,
     private val investigationRecorder: Obd2InvestigationSink? = null,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
-) : EcuTransport {
+) : EcuTransport, Obd2DiagnosticsCapable {
     companion object {
         private const val TAG = "RenaultTransport"
         private const val OEM_POLL_INTERVAL_MS = 1600L
@@ -326,6 +326,10 @@ class RenaultTransport(
 
     override suspend fun writeEngineConstants(engineConstants: EngineConstants) =
         obd2Delegate.writeEngineConstants(engineConstants)
+
+    override suspend fun readDtcCodes(): List<DtcCode> = obd2Delegate.readDtcCodes()
+    override suspend fun readPendingDtcCodes(): List<DtcCode> = obd2Delegate.readPendingDtcCodes()
+    override suspend fun clearDtcCodes(): Boolean = obd2Delegate.clearDtcCodes()
 
     private fun onDelegateData(sample: SpeeduinoLiveData) {
         lastSaeSample = sample

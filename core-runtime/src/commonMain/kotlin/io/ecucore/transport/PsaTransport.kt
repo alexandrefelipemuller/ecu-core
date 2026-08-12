@@ -61,7 +61,7 @@ class PsaTransport(
     private val investigationRecorder: Obd2InvestigationSink? = null,
     private val enableInvestigationCampaign: Boolean = false,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
-) : EcuTransport {
+) : EcuTransport, Obd2DiagnosticsCapable {
     companion object {
         private const val TAG = "PsaTransport"
         private const val DEFAULT_LIVE_POLL_INTERVAL_MS = 150L
@@ -528,6 +528,10 @@ class PsaTransport(
     override suspend fun writeDwellTable(dwellTable: DwellTable) = obd2Delegate.writeDwellTable(dwellTable)
     override suspend fun writeEngineConstants(engineConstants: EngineConstants) =
         obd2Delegate.writeEngineConstants(engineConstants)
+
+    override suspend fun readDtcCodes(): List<DtcCode> = obd2Delegate.readDtcCodes()
+    override suspend fun readPendingDtcCodes(): List<DtcCode> = obd2Delegate.readPendingDtcCodes()
+    override suspend fun clearDtcCodes(): Boolean = obd2Delegate.clearDtcCodes()
 
     private fun onDelegateData(sample: SpeeduinoLiveData) {
         lastSaeSample = sample
