@@ -89,6 +89,23 @@ class RenaultTransport(
                 coolantCommands = listOf("22F40D", "210D")
             )
         )
+
+        /**
+         * Siemens Sirius 32 (Renault Clio K4M) não fala SAE J1979 - o dispatcher KWP2000
+         * "cru" do firmware só expõe 4 SIDs proprietários (0x27/0x23/0x14/0x2A). O único
+         * grupo de leitura por local ID (0x2A) que expõe status de DTC é o 0x0893, e só
+         * cobre a "palavra 0" da tabela real de 60 índices (word_index=0): IAT, MAP e CKP.
+         * Os demais ~57 códigos existem no binário mas não têm um grupo KWP conhecido que
+         * os exponha - ver ecu-core/core-runtime notas de RE / simulador (SIRIUS32_DTC_TABLE
+         * em obd2_tcp_simulator.py) para o levantamento completo.
+         */
+        private data class Sirius32DtcBit(val mask: Int, val code: String, val description: String)
+
+        private val SIRIUS32_WORD0_DTCS = listOf(
+            Sirius32DtcBit(0x0400, "DF003", "Circuito do sensor de temperatura do ar (IAT)"),
+            Sirius32DtcBit(0x0040, "DF045", "Circuito do sensor de pressão do coletor (MAP)"),
+            Sirius32DtcBit(0x0002, "DF025", "Circuito do sensor de rotação/virabrequim (CKP)"),
+        )
     }
 
     private data class RenaultCanCandidate(
@@ -327,9 +344,14 @@ class RenaultTransport(
     override suspend fun writeEngineConstants(engineConstants: EngineConstants) =
         obd2Delegate.writeEngineConstants(engineConstants)
 
-    override suspend fun readDtcCodes(): List<DtcCode> = obd2Delegate.readDtcCodes()
-    override suspend fun readPendingDtcCodes(): List<DtcCode> = obd2Delegate.readPendingDtcCodes()
-    override suspend fun clearDtcCodes(): Boolean = obd2Delegate.clearDtcCodes()
+    override suspend fun readDtcCodes(): List<DtcCode> =
+        if (isSirius32()) sirius32ReadDtcCodes(DtcStatus.ACTIVE) else obd2Delegate.readDtcCodes()
+
+    override suspend fun readPendingDtcCodes(): List<DtcCode> =
+        if (isSirius32()) sirius32ReadDtcCodes(DtcStatus.PENDING) else obd2Delegate.readPendingDtcCodes()
+
+    override suspend fun clearDtcCodes(): Boolean =
+        if (isSirius32()) sirius32ClearDtcCodes() else obd2Delegate.clearDtcCodes()
 
     private fun onDelegateData(sample: SpeeduinoLiveData) {
         lastSaeSample = sample
@@ -787,5 +809,66 @@ class RenaultTransport(
                 "cmd=$command reason=${error.message ?: error::class.simpleName}"
             )
         }.getOrDefault("")
+    }
+
+    /**
+     * O Sirius 32 só fala esse dialeto proprietário via K-line ISO 14230 fast-init - a
+     * variante CAN (protocolo "6"/"8") não tem esse dispatcher. O simulador reflete isso
+     * (`_handle_sirius32_proprietary` devolve "CAN ERROR" quando `self.protocol == "6"`).
+     */
+    private fun isSirius32(): Boolean =
+        oemProfile.id == "sirius_32" && detectedSession?.protocol == "iso"
+
+    /**
+     * SID 0x10: StartDiagnosticSession, parâmetro 0x29 ("sessão estendida"). Sem essa
+     * sessão aberta, os SIDs 0x14/0x23/0x2A/0x27 respondem NRC 0x22 (conditionsNotCorrect)
+     * no firmware real - por isso todo acesso a DTC no Sirius 32 abre sessão primeiro.
+     */
+    private suspend fun sirius32StartSession(): Boolean {
+        val response = obd2Delegate.sendRawElmCommand("1029", timeoutMs = 900L).uppercase()
+        return response.replace(" ", "").contains("5029")
+    }
+
+    /**
+     * SID 0x2A, local ID 0x0893: única leitura de grupo confirmada que expõe os
+     * registradores de status de DTC (0xFDD8=confirmado / 0xFD36=pendente), mas só a
+     * palavra 0 (word_index=0). Resposta esperada: "6A 08 93 <confHi> <confLo> <pendHi>
+     * <pendLo> ...". Retorna null se a sessão não abriu ou a resposta não bateu.
+     */
+    private suspend fun sirius32ReadStatusWords(): Pair<Int, Int>? {
+        if (!sirius32StartSession()) return null
+        val response = obd2Delegate.sendRawElmCommand("2A0893", timeoutMs = 900L).uppercase()
+        val bytes = Regex("[0-9A-F]{2}")
+            .findAll(response)
+            .map { it.value.toInt(16) }
+            .toList()
+        val headerIndex = bytes.windowed(3, 1).indexOfFirst { it[0] == 0x6A && it[1] == 0x08 && it[2] == 0x93 }
+        if (headerIndex < 0) return null
+        val payload = bytes.drop(headerIndex + 3)
+        if (payload.size < 4) return null
+        val confirmedWord = (payload[0] shl 8) or payload[1]
+        val pendingWord = (payload[2] shl 8) or payload[3]
+        return confirmedWord to pendingWord
+    }
+
+    private suspend fun sirius32ReadDtcCodes(status: DtcStatus): List<DtcCode> {
+        val words = sirius32ReadStatusWords() ?: return emptyList()
+        val word = if (status == DtcStatus.ACTIVE) words.first else words.second
+        return SIRIUS32_WORD0_DTCS
+            .filter { (word and it.mask) != 0 }
+            .map { DtcCode(code = it.code, description = it.description, status = status) }
+    }
+
+    /**
+     * SID 0x14: ClearDiagnosticInformation, handshake real de 2 passos - 0x20 "arma" a
+     * limpeza, só depois 0x6F executa (proteção contra apagar DTC por ruído na linha).
+     * Sucesso confirma com "54" (0x6F) / "54 20" (arme); qualquer "7F 14 xx" é negativa.
+     */
+    private suspend fun sirius32ClearDtcCodes(): Boolean {
+        if (!sirius32StartSession()) return false
+        val armed = obd2Delegate.sendRawElmCommand("1420", timeoutMs = 900L).uppercase().replace(" ", "")
+        if (!armed.contains("5420")) return false
+        val executed = obd2Delegate.sendRawElmCommand("146F", timeoutMs = 900L).uppercase().replace(" ", "")
+        return executed.contains("54") && !executed.contains("7F14")
     }
 }
