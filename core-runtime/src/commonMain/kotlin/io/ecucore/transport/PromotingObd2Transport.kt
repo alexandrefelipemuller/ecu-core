@@ -36,7 +36,7 @@ class PromotingObd2Transport(
     private val genericTransport: Obd2Transport,
     private val psaTransport: EcuTransport,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
-) : EcuTransport {
+) : EcuTransport, Obd2DiagnosticsCapable {
     private val connectMutex = Mutex()
     private var activeTransport: EcuTransport? = null
 
@@ -217,4 +217,16 @@ class PromotingObd2Transport(
 
     override suspend fun writeEngineConstants(engineConstants: EngineConstants) =
         selected().writeEngineConstants(engineConstants)
+
+    override suspend fun readDtcCodes(): List<DtcCode> =
+        (selected() as? Obd2DiagnosticsCapable)?.readDtcCodes() ?: emptyList()
+
+    override suspend fun readPendingDtcCodes(): List<DtcCode> =
+        (selected() as? Obd2DiagnosticsCapable)?.readPendingDtcCodes() ?: emptyList()
+
+    override suspend fun clearDtcCodes(): Boolean =
+        (selected() as? Obd2DiagnosticsCapable)?.clearDtcCodes() ?: false
+
+    override fun isDiagnosticsAvailable(): Boolean =
+        (selected() as? Obd2DiagnosticsCapable)?.isDiagnosticsAvailable() ?: false
 }

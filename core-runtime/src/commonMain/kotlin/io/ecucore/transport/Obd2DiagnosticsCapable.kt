@@ -14,4 +14,14 @@ interface Obd2DiagnosticsCapable {
 
     /** Mode 04 - limpa DTCs e a MIL. Retorna true se a ECU confirmou (ack "44"). */
     suspend fun clearDtcCodes(): Boolean
+
+    /**
+     * Indica se a leitura/limpeza de DTC está de fato disponível agora. Implementações
+     * diretas (que falam OBD2/KWP nativamente) sempre retornam true; wrappers que
+     * delegam para um transporte selecionado em runtime (ex.: [AutoDetectEcuTransport],
+     * [PromotingObd2Transport]) sobrescrevem para refletir se o transporte ativo no
+     * momento implementa esta interface - evita reportar "suportado" quando o transporte
+     * escolhido (ex.: VagTransport) ainda não tem DTC implementado.
+     */
+    fun isDiagnosticsAvailable(): Boolean = true
 }

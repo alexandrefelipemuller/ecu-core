@@ -32,7 +32,7 @@ class AutoDetectEcuTransport(
     private val primaryTransport: EcuTransport,
     private val obd2FallbackTransport: EcuTransport,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
-) : EcuTransport {
+) : EcuTransport, Obd2DiagnosticsCapable {
     private val connectMutex = Mutex()
     private var activeTransport: EcuTransport? = null
 
@@ -226,4 +226,16 @@ class AutoDetectEcuTransport(
 
     override suspend fun writeEngineConstants(engineConstants: EngineConstants) =
         selected().writeEngineConstants(engineConstants)
+
+    override suspend fun readDtcCodes(): List<DtcCode> =
+        (selected() as? Obd2DiagnosticsCapable)?.readDtcCodes() ?: emptyList()
+
+    override suspend fun readPendingDtcCodes(): List<DtcCode> =
+        (selected() as? Obd2DiagnosticsCapable)?.readPendingDtcCodes() ?: emptyList()
+
+    override suspend fun clearDtcCodes(): Boolean =
+        (selected() as? Obd2DiagnosticsCapable)?.clearDtcCodes() ?: false
+
+    override fun isDiagnosticsAvailable(): Boolean =
+        (selected() as? Obd2DiagnosticsCapable)?.isDiagnosticsAvailable() ?: false
 }

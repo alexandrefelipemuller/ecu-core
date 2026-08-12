@@ -45,15 +45,31 @@ class Sirius32Transport(
     private val onError: (String) -> Unit,
     private val investigationRecorder: Obd2InvestigationSink? = null,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
-) : EcuTransport {
+) : EcuTransport, Obd2DiagnosticsCapable {
     companion object {
         private const val TAG = "Sirius32Transport"
         private const val COMMAND_TIMEOUT_MS = 1200L
         private const val DEFAULT_BATTERY_VOLTAGE = 12.0
         private const val LIVE_DATA_TABLE_ID = "0FAA"
+        private const val DTC_STATUS_TABLE_ID = "0893"
 
         private val INIT_SEQUENCE = listOf(
             "ATZ", "ATE0", "ATL0", "ATH0", "ATSP5",
+        )
+
+        /**
+         * SID 0x2A, local ID 0x0893: única leitura de grupo confirmada por engenharia
+         * reversa que expõe os registradores de status de DTC (0xFDD8=confirmado /
+         * 0xFD36=pendente) - mas só a palavra 0 dos 5 pares de 16 bits reais. Ver
+         * SIRIUS32_DTC_TABLE em simulator/obd2_tcp_simulator.py para a tabela completa
+         * de 60 índices e o porquê só estes 3 têm grupo de leitura conhecido.
+         */
+        private data class DtcBit(val mask: Int, val code: String, val description: String)
+
+        private val WORD0_DTCS = listOf(
+            DtcBit(0x0400, "DF003", "Circuito do sensor de temperatura do ar (IAT)"),
+            DtcBit(0x0040, "DF045", "Circuito do sensor de pressão do coletor (MAP)"),
+            DtcBit(0x0002, "DF025", "Circuito do sensor de rotação/virabrequim (CKP)"),
         )
     }
 
@@ -166,6 +182,41 @@ class Sirius32Transport(
     override fun getEcuCapabilities(): EcuCapabilities? = cachedFirmwareInfo?.capabilities
 
     override fun getTableDefinitions(): TableDefinitions? = null
+
+    override fun isDiagnosticsAvailable(): Boolean = isConnected()
+
+    override suspend fun readDtcCodes(): List<DtcCode> = readDtcCodesForStatus(DtcStatus.ACTIVE)
+
+    override suspend fun readPendingDtcCodes(): List<DtcCode> = readDtcCodesForStatus(DtcStatus.PENDING)
+
+    /**
+     * SID 0x14: ClearDiagnosticInformation, handshake de 2 passos - 0x20 "arma" a
+     * limpeza, só depois 0x6F executa (proteção contra apagar DTC por ruído na linha).
+     * Sucesso confirma com "54" (0x6F) / "54 20" (arme); "7F 14 xx" é resposta negativa.
+     */
+    override suspend fun clearDtcCodes(): Boolean {
+        val armed = sendRaw("1420").uppercase().replace(" ", "")
+        if (!armed.contains("5420")) return false
+        val executed = sendRaw("146F").uppercase().replace(" ", "")
+        return executed.contains("54") && !executed.contains("7F14")
+    }
+
+    private suspend fun readDtcCodesForStatus(status: DtcStatus): List<DtcCode> {
+        val words = readDtcStatusWords() ?: return emptyList()
+        val word = if (status == DtcStatus.ACTIVE) words.first else words.second
+        return WORD0_DTCS
+            .filter { (word and it.mask) != 0 }
+            .map { DtcCode(code = it.code, description = it.description, status = status) }
+    }
+
+    private suspend fun readDtcStatusWords(): Pair<Int, Int>? {
+        val response = sendRaw("2A$DTC_STATUS_TABLE_ID")
+        val payload = parseGroupResponse(DTC_STATUS_TABLE_ID, response) ?: return null
+        if (payload.size < 4) return null
+        val confirmedWord = (payload[0] shl 8) or payload[1]
+        val pendingWord = (payload[2] shl 8) or payload[3]
+        return confirmedWord to pendingWord
+    }
 
     private suspend fun pollLiveDataOnce() {
         val response = sendRaw("2A$LIVE_DATA_TABLE_ID")
