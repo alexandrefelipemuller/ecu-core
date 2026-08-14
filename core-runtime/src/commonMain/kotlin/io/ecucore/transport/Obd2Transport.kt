@@ -335,15 +335,30 @@ class Obd2Transport(
         if (vehicleBrandHint == VehicleBrandHint.PSA || psaLikeKwpFastProfile) {
             return true
         }
-        val bypassLooksPsaLike = preflightBypassReason == "SERVICE_NOT_SUPPORTED_7F0111" ||
-            preflightBypassReason == "NO DATA" ||
-            preflightBypassReason == "CAN ERROR"
-        val noIdentity = detectedVin.isNullOrBlank() &&
-            (detectedCalibrationId.isNullOrBlank() || observedMode09Unsupported)
+        return hasWeakIdentitySignal()
+    }
+
+    /**
+     * Sinal marca-agnóstico de que a ECU respondeu ao handshake ELM327 mas não expôs
+     * identidade OBD2 utilizável (sem VIN, sem calibration ID, bitmap Mode 01 vazio/mínimo).
+     * Usado por [PromotingObd2Transport] para decidir se vale a pena tentar sondar fluxos
+     * proprietários (PSA, Renault) mesmo sem um [VehicleBrandHint] explícito - ver
+     * discussão sobre o Clio 1.0 16V (IAW 5NR) não caindo no fluxo Renault.
+     */
+    fun hasWeakIdentitySignal(): Boolean {
+        // Sem VIN e sem calibration ID (ambos ausentes, nao so um) + Mode 01 nao
+        // devolveu nada aproveitavel (bitmap vazio/nao descoberto, ou so o
+        // fallback generico CORE_PIDS) ja e evidencia suficiente por si so de
+        // que a ECU nao fala SAE J1979 "de verdade". Antes disso exigia um
+        // terceiro sinal (motivo de bypass especifico ou 7F0911 exato em Mode 09)
+        // que nao bate com respostas negativas comuns como "7F 09 12" (visto no
+        // Clio 1.0 16v IAW 5NR real) - deixava passar batido justo o caso que
+        // esse sinal deveria pegar.
+        val noIdentity = detectedVin.isNullOrBlank() && detectedCalibrationId.isNullOrBlank()
         val weakGenericProfile = !discoveredMode1Bitmap ||
+            supportedMode1Pids.isEmpty() ||
             (supportedMode1Pids == CORE_PIDS && preferredO2PidHex == null)
-        val psaLikeUnsupportedIdentity = observedMode09Unsupported && weakGenericProfile && noIdentity
-        return (bypassLooksPsaLike && noIdentity && weakGenericProfile) || psaLikeUnsupportedIdentity
+        return noIdentity && weakGenericProfile
     }
 
     override fun getTableDefinitions(): TableDefinitions? = null

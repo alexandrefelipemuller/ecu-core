@@ -31,10 +31,18 @@ import io.ecucore.transport.shouldPromoteToPsa
 /**
  * Usa o fluxo OBD2 genérico como entrada rápida e promove para um fluxo proprietário
  * quando o fingerprint básico do veículo indicar uma família suportada.
+ *
+ * A promoção nunca é decidida só por heurística: cada candidato (PSA, Renault) é
+ * conectado de verdade e só "vence" se seu próprio `connect()` confirmar a detecção
+ * (ex.: [RenaultTransport] lança exceção se a sondagem KWP proprietária não achar
+ * nenhum hint positivo). O [VehicleBrandHint]/[Obd2Transport.hasWeakIdentitySignal]
+ * só decidem SE vale tentar promoção e EM QUE ORDEM tentar - nunca decidem sozinhos
+ * que o veículo "é" de uma marca.
  */
 class PromotingObd2Transport(
     private val genericTransport: Obd2Transport,
     private val psaTransport: EcuTransport,
+    private val renaultTransport: EcuTransport,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
 ) : EcuTransport, Obd2DiagnosticsCapable {
     private val connectMutex = Mutex()
@@ -52,40 +60,67 @@ class PromotingObd2Transport(
 
             val brandHint = genericTransport.getVehicleBrandHint()
             val vin = genericTransport.getDetectedVin().orEmpty()
-            val shouldPromoteToPsa = genericTransport.shouldPromoteToPsa()
+            val weakIdentity = genericTransport.hasWeakIdentitySignal()
+            val candidates = buildPromotionCandidates(brandHint, weakIdentity)
             diagnosticsSink.log(
                 "autodetect",
                 "brand_hint",
-                "primary=obd2 brand=$brandHint vin=${vin.ifBlank { "-" }} promote_psa=$shouldPromoteToPsa"
+                "primary=obd2 brand=$brandHint vin=${vin.ifBlank { "-" }} " +
+                    "weak_identity=$weakIdentity candidates=${candidates.joinToString(",") { it.first }}"
             )
 
-            if (!shouldPromoteToPsa) {
+            if (candidates.isEmpty()) {
                 return
             }
 
             runCatching { genericTransport.disconnect() }
 
-            val promotionError = runCatching {
-                psaTransport.connect()
-                activeTransport = psaTransport
-                diagnosticsSink.log("autodetect", "protocol", "selected=psa_promoted")
-            }.exceptionOrNull()
+            for ((label, transport) in candidates) {
+                val promotionError = runCatching {
+                    transport.connect()
+                    activeTransport = transport
+                    diagnosticsSink.log("autodetect", "protocol", "selected=${label}_promoted")
+                }.exceptionOrNull()
 
-            if (promotionError == null) {
-                return
-            }
-            if (promotionError is CancellationException) {
-                activeTransport = null
-                throw promotionError
+                if (promotionError == null) {
+                    return
+                }
+                if (promotionError is CancellationException) {
+                    activeTransport = null
+                    throw promotionError
+                }
+                diagnosticsSink.log(
+                    "autodetect",
+                    "promotion",
+                    "target=$label failed=${promotionError.message ?: promotionError::class.simpleName}"
+                )
             }
 
-            diagnosticsSink.log(
-                "autodetect",
-                "promotion",
-                "target=psa failed=${promotionError.message ?: promotionError::class.simpleName}"
-            )
             genericTransport.connect()
             activeTransport = genericTransport
+        }
+    }
+
+    /**
+     * Só sonda candidatos proprietários quando há um motivo concreto: hint de marca
+     * explícito (VIN/calibration ID) ou identidade OBD2 fraca (sem VIN, bitmap Mode 01
+     * vazio). Um carro genérico com VIN e PIDs completos não paga custo nenhum de sondagem.
+     * A ordem prioriza o candidato sugerido pelo hint; o outro ainda é tentado em seguida
+     * porque quem confirma de fato é o `connect()` de cada transporte, não o hint.
+     */
+    private fun buildPromotionCandidates(
+        brandHint: VehicleBrandHint,
+        weakIdentity: Boolean,
+    ): List<Pair<String, EcuTransport>> {
+        if (brandHint == VehicleBrandHint.UNKNOWN && !weakIdentity) {
+            return emptyList()
+        }
+        val renaultCandidate = "renault" to renaultTransport
+        val psaCandidate = "psa" to psaTransport
+        return if (brandHint == VehicleBrandHint.RENAULT) {
+            listOf(renaultCandidate, psaCandidate)
+        } else {
+            listOf(psaCandidate, renaultCandidate)
         }
     }
 

@@ -57,6 +57,7 @@ class RenaultTransport(
     companion object {
         private const val TAG = "RenaultTransport"
         private const val OEM_POLL_INTERVAL_MS = 1600L
+        private const val KWP81_KEEPALIVE_INTERVAL_MS = 1000L
         private const val CONFIDENCE_MIN = 3
         private const val CONFIDENCE_MAX = 8
         private const val SCAN_BUDGET_MS = 35_000L
@@ -132,6 +133,7 @@ class RenaultTransport(
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var oemPollingJob: Job? = null
+    private var kwp81KeepaliveJob: Job? = null
     @Volatile
     private var lastSaeSample: SpeeduinoLiveData? = null
     @Volatile
@@ -165,7 +167,7 @@ class RenaultTransport(
             )
             investigationRecorder?.info("campaign", "starting renault exploratory scan")
 
-            val detection = scanRenaultSession()
+            val detection = probeKwp81Session() ?: scanRenaultSession()
             if (detection == null || detection.hints.isEmpty()) {
                 investigationRecorder?.info("campaign", "renault scan finished without positive hints")
                 runCatching { connection.disconnect() }
@@ -175,6 +177,19 @@ class RenaultTransport(
             detectedSession = detection
 
             obd2Delegate.connect()
+
+            // obd2Delegate.connect() roda ATZ/ATE0/... por conta propria (init
+            // generico do ELM327), o que derruba a sessao KWP '81' aberta durante
+            // a sondagem acima. Reabre aqui, ja usando o canal do obd2Delegate
+            // (respeita o mesmo mutex de I/O que o polling de live data usa),
+            // e mantem viva com TesterPresent - e o que faz Mode 03/07/0A/04
+            // (leitura/limpeza de DTC) funcionarem nessa familia de ECU.
+            if (detection.hints.contains("kwp81_session")) {
+                val reopen = obd2Delegate.sendRawElmCommand("81", timeoutMs = 1200L).uppercase().replace(" ", "")
+                diagnosticsSink.log("renault", "probe", "kwp81 session reopened resp=$reopen")
+                startKwp81Keepalive()
+            }
+
             oemProfile = detectOemProfile()
             val delegateInfo = obd2Delegate.getFirmwareInfoCached()
             val detail = buildString {
@@ -217,8 +232,24 @@ class RenaultTransport(
         }
     }
 
+    private fun startKwp81Keepalive() {
+        if (kwp81KeepaliveJob?.isActive == true) return
+        kwp81KeepaliveJob = scope.launch {
+            while (isActive && obd2Delegate.isConnected()) {
+                runCatching { obd2Delegate.sendRawElmCommand("3E", timeoutMs = 900L) }
+                delay(KWP81_KEEPALIVE_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopKwp81Keepalive() {
+        kwp81KeepaliveJob?.cancel()
+        kwp81KeepaliveJob = null
+    }
+
     override fun disconnect() {
         val profileAtDisconnect = oemProfile.id
+        stopKwp81Keepalive()
         stopOemPolling()
         detectedSession = null
         cachedFirmwareInfo = null
@@ -537,6 +568,32 @@ class RenaultTransport(
                 if (ch in ' '..'~') ch else null
             }
             .joinToString("")
+    }
+
+    /**
+     * Sondagem barata confirmada em campo (Clio 1.0 16v, Marelli IAW 5NR, ago/2026):
+     * ao contrario do dialeto Sirius32 (SID 0x10 + subfuncao), essa familia de ECU
+     * abre sessao de diagnostico KWP2000 com o SID cru '81' (sem ATSH, sem forcar
+     * protocolo) e responde positivo com 'C1 81'. Depois disso, Mode 03/07/0A/04
+     * (leitura/limpeza de DTC padrao SAE) passam a funcionar - o app comercial
+     * "EOBD Facile" usa exatamente esse fluxo e foi validado ao vivo contra o
+     * simulador (ver simulator/obd2_tcp_simulator.py, perfil clio_1_0_16v_iaw5nr).
+     * Tentar isso primeiro evita gastar o orcamento de scan em CAN/ISO quando a
+     * ECU nem fala esses dialetos.
+     */
+    private fun probeKwp81Session(): RenaultDetection? {
+        sendRawElmCommand("ATZ")
+        sendRawElmCommand("ATE0")
+        val response = sendRawElmCommand("81").uppercase().replace(" ", "")
+        if (!response.contains("C181")) {
+            return null
+        }
+        investigationRecorder?.info("campaign", "renault kwp81 session opened resp=$response")
+        diagnosticsSink.log("renault", "probe", "kwp81 session opened resp=$response")
+        return RenaultDetection(
+            protocol = "kwp81",
+            hints = setOf("kwp81_session")
+        )
     }
 
     private fun scanRenaultSession(): RenaultDetection? {
