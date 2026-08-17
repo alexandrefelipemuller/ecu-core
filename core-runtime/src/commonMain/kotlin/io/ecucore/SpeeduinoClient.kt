@@ -2954,6 +2954,14 @@ class SpeeduinoClient(
         if (INCOMPLETE_LIVE_DATA_REGEX.containsMatchIn(message)) {
             return true
         }
+        // response code 0x80 = SERIAL_RC_TIMEOUT: a ECU não conseguiu montar a resposta a
+        // tempo (ocupada processando outro pedido). Os caminhos de write/burn já tratam 0x80
+        // como "sem ACK explícito"/sucesso (ver SpeeduinoProtocol writeConfigPage/burnConfig);
+        // o read de live data devia ter a mesma leniência em vez de escalar como erro de
+        // protocolo (era a causa dos non-fatals repetidos "response code = 0x80" no Crashlytics).
+        if (message.contains("response code = 0x80", ignoreCase = true)) {
+            return true
+        }
         val match = PARTIAL_TIMEOUT_REGEX.find(message) ?: return false
         val received = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return false
         return received >= 0

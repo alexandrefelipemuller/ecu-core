@@ -37,6 +37,18 @@ class SpeeduinoClientLiveDataErrorClassificationTest {
     }
 
     @Test
+    fun `SERIAL_RC_TIMEOUT response code 0x80 on live data read is recoverable`() {
+        // 0x80 significa que a ECU não montou a resposta a tempo (ocupada), não um erro de
+        // protocolo. Os caminhos de write/burn já toleram 0x80; o read de live data deve seguir
+        // o mesmo padrão em vez de escalar como falha não-fatal (ver crashes/usb_get_status/001-002).
+        assertTrue(
+            client.isRecoverableLiveDataTimeout(
+                Exception("Erro ao ler live data modern: response code = 0x80")
+            )
+        )
+    }
+
+    @Test
     fun `unrelated errors are not recoverable`() {
         assertFalse(client.isRecoverableLiveDataTimeout(Exception("Broken pipe")))
         assertFalse(client.isRecoverableLiveDataTimeout(Exception("Não conectado")))
