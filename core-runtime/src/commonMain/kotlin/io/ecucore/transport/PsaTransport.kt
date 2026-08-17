@@ -340,6 +340,22 @@ class PsaTransport(
             if (tryRestorePersistedSession()) {
                 diagnosticsSink.log("psa", "probe", "restored persisted session")
             }
+            // A sessão restaurada (acima) não é amarrada a nenhuma identidade de
+            // carro - é só "a última sessão PSA que funcionou", possivelmente de
+            // um veículo/simulador DIFERENTE testado numa conexão anterior. Sem
+            // essa reverificação ao vivo, um txId/rxId de outro carro era aceito
+            // sem nunca falar de verdade com a ECU atualmente conectada (ver
+            // investigação 2026-08-17: Citroën C4 VTR pinado não entrava no
+            // fluxo PSA depois de várias trocas de perfil no simulador na mesma
+            // instalação do app).
+            if (restoredPersistedSession) {
+                val restored = detected
+                if (restored == null || !verifyRestoredSession(restored)) {
+                    diagnosticsSink.log("psa", "probe", "restored session stale, forcing rescan")
+                    detected = null
+                    restoredPersistedSession = false
+                }
+            }
             val detection = detected ?: scanPsaCan()
             if (detection == null || detection.hints.isEmpty()) {
                 runCatching { connection.disconnect() }
@@ -1605,6 +1621,18 @@ class PsaTransport(
             .filter { it.isNotBlank() }
             .toSet()
 
+        // A sessão persistida não é amarrada a nenhuma identidade de carro (sem
+        // VIN, sem nada) - é só "a última sessão PSA que funcionou". Se ficou com
+        // hints vazios (sessão parcial/abortada de um carro DIFERENTE, salva em
+        // outra tentativa de conexão), restaurá-la aqui faz connect() jogar
+        // `detected` direto no `if (detection.hints.isEmpty()) throw ...` logo
+        // abaixo - SEM NUNCA chamar scanPsaCan() de verdade. Isso derruba
+        // qualquer detecção PSA legítima do carro atual (ex.: Citroën C4 VTR
+        // pinado, investigação 2026-08-17, depois de testar vários outros
+        // perfis na mesma instalação do app). Melhor ignorar a restauração e
+        // deixar cair no scan real do que confiar numa sessão sem hint nenhum.
+        if (hints.isEmpty()) return false
+
         detected = PsaDetection(
             protocol = stored.protocol,
             txId = stored.txId,
@@ -1654,6 +1682,26 @@ class PsaTransport(
             "restored session protocol=${stored.protocol} tx=${stored.txId} rx=${stored.rxId} functional=${stored.isFunctional} c4_mode=$c4LiveModeEnabled"
         )
         return true
+    }
+
+    /**
+     * Confirma ao vivo, com um único comando barato (21FE), que a sessão
+     * restaurada do [sessionStore] ainda faz sentido pro carro/simulador
+     * REALMENTE conectado agora - a sessão persistida não carrega nenhuma
+     * identidade de veículo (sem VIN), então sem essa checagem ela é aceita
+     * cegamente mesmo vindo de uma conexão anterior a um carro diferente.
+     */
+    private fun verifyRestoredSession(detection: PsaDetection): Boolean {
+        if (detection.txId != "default" && detection.rxId != "*" && detection.rxId.isNotBlank()) {
+            configureCanAddress(detection.txId, detection.rxId)
+        } else {
+            val header = sanitizeElmHeader(detection.txId)
+            if (header != null) {
+                sendRaw("ATSH $header", timeoutMs = 400L)
+            }
+        }
+        val response = sendRaw("21FE", timeoutMs = SCAN_PROBE_TIMEOUT_MS)
+        return looksLikePositivePsaReply(response)
     }
 
     private fun persistDetectedSession(detection: PsaDetection) {

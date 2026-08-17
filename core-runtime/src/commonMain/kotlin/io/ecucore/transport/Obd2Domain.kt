@@ -203,7 +203,8 @@ fun parseDtcResponse(response: String, status: DtcStatus): List<DtcCode> {
         val byte0 = dataBytes[index]
         val byte1 = dataBytes[index + 1]
         if (byte0 != 0 || byte1 != 0) {
-            codes.add(DtcCode(code = decodeDtc(byte0, byte1), status = status))
+            val code = decodeDtc(byte0, byte1)
+            codes.add(DtcCode(code = code, description = DtcDescriptions.lookup(code), status = status))
         }
         index += 2
     }

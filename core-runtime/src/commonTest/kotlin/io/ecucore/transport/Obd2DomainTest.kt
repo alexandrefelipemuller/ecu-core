@@ -75,7 +75,10 @@ class Obd2DomainTest {
     @Test
     fun parsesMode03ResponseSkippingEmptySlots() {
         val codes = parseDtcResponse("43 01 33 00 00", DtcStatus.ACTIVE)
-        assertEquals(listOf(DtcCode(code = "P0133", status = DtcStatus.ACTIVE)), codes)
+        assertEquals(
+            listOf(DtcCode(code = "P0133", description = DtcDescriptions.lookup("P0133"), status = DtcStatus.ACTIVE)),
+            codes,
+        )
     }
 
     @Test
@@ -87,7 +90,10 @@ class Obd2DomainTest {
     @Test
     fun parsesMode07PendingResponse() {
         val codes = parseDtcResponse("47 03 01", DtcStatus.PENDING)
-        assertEquals(listOf(DtcCode(code = "P0301", status = DtcStatus.PENDING)), codes)
+        assertEquals(
+            listOf(DtcCode(code = "P0301", description = DtcDescriptions.lookup("P0301"), status = DtcStatus.PENDING)),
+            codes,
+        )
     }
 
     @Test

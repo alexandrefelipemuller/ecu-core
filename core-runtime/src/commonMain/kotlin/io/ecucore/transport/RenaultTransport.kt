@@ -60,7 +60,19 @@ class RenaultTransport(
         private const val KWP81_KEEPALIVE_INTERVAL_MS = 1000L
         private const val CONFIDENCE_MIN = 3
         private const val CONFIDENCE_MAX = 8
-        private const val SCAN_BUDGET_MS = 35_000L
+        // Antes 35_000L: adequado quando esse transporte era só o ÚLTIMO elo de
+        // uma cascata de auto-detecção (nunca era o primeiro a rodar). Agora que
+        // o app pode PINAR Renault como primeira tentativa (seleção manual de
+        // veículo, ver VehicleProtocolMapping/MainActivity), um carro Renault
+        // real que não fala o dialeto KWP proprietário (ex.: "Clio 1.0 16v
+        // Latino / Continental EMS3120", que só fala Mode 01 SAE J1979 normal)
+        // varria as 12 endereços x 2 modos de início (~24 combinações, ~15
+        // comandos cada) e só caía no fallback OBD2 genérico depois de quase
+        // 35s por tentativa de conexão - percebido pelo usuário como "fica
+        // desconectando o tempo todo" (investigação 2026-08-17). Orçamento bem
+        // mais curto aqui garante que o bail-out pro fallback aconteça rápido
+        // o bastante pra não estourar a paciência do usuário/retry loop do app.
+        private const val SCAN_BUDGET_MS = 9_000L
         private const val MAX_NO_DATA_STREAK = 3
 
         private data class OemCommandProfile(
