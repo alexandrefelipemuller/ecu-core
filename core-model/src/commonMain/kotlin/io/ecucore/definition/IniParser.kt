@@ -151,11 +151,36 @@ object IniParser {
         val kind = parseKind(tokens[0].trim())
         val dataType = tokens[1].trim()
         val offset = tokens.getOrNull(2)?.trim()?.toIntOrNull()
-        val shape = tokens.firstOrNull { it.contains("[") && it.contains("]") }?.let(::parseShape)
+
+        if (kind == IniFieldKind.BITS) {
+            val bitRange = tokens.getOrNull(3)?.let(::parseBitRange)
+            val labelTokens = tokens.drop(4)
+            val labels = if (labelTokens.size == 1 && labelTokens[0].trim().startsWith("$")) {
+                null
+            } else {
+                labelTokens.map(::cleanValueToken).ifEmpty { null }
+            }
+            return IniFieldDefinition(
+                name = name.trim(),
+                kind = kind,
+                dataType = dataType,
+                offset = offset,
+                bitLow = bitRange?.first,
+                bitHigh = bitRange?.second,
+                enumLabels = labels,
+                section = section,
+                page = page,
+                rawDefinition = rawDefinition.trim(),
+            )
+        }
+
+        val shapeIndex = tokens.indexOfFirst { it.contains("[") && it.contains("]") }
+        val shape = if (shapeIndex >= 0) parseShape(tokens[shapeIndex]) else null
 
         val unitsIndex = if (shape != null) 4 else 3
         val scaleIndex = if (shape != null) 5 else 4
         val translateIndex = if (shape != null) 6 else 5
+        val digitsIndex = if (shape != null) 9 else 8
 
         return IniFieldDefinition(
             name = name.trim(),
@@ -166,10 +191,19 @@ object IniParser {
             units = tokens.getOrNull(unitsIndex)?.let(::cleanValueToken),
             scale = tokens.getOrNull(scaleIndex)?.trim()?.toDoubleOrNull(),
             translate = tokens.getOrNull(translateIndex)?.trim()?.toDoubleOrNull(),
+            digits = tokens.getOrNull(digitsIndex)?.trim()?.toIntOrNull(),
             section = section,
             page = page,
             rawDefinition = rawDefinition.trim(),
         )
+    }
+
+    private fun parseBitRange(token: String): Pair<Int, Int>? {
+        val raw = token.trim().removePrefix("[").removeSuffix("]")
+        val pieces = raw.split(":")
+        val lo = pieces.getOrNull(0)?.trim()?.toIntOrNull() ?: return null
+        val hi = pieces.getOrNull(1)?.trim()?.toIntOrNull() ?: lo
+        return lo to hi
     }
 
     private fun parseAssignment(line: String): Pair<String, String>? {

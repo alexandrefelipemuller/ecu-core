@@ -80,4 +80,39 @@ class IniParserTest {
         assertEquals(16, veTable.shape.columns)
         assertTrue(parsed.outputChannels.any { it.name == "rpm" && it.offset == 14 })
     }
+
+    @Test
+    fun parsesDigitsAndBitFields() {
+        val ini = """
+            [MegaTune]
+            signature = "speeduino 202501"
+
+            [Constants]
+            nPages = 1
+            pageSize = 128
+            page = 0
+            aseTaperTime = scalar, U08, 0, "S", 0.1, 0.0, 0.0, 25.5, 1
+            aeMode = bits, U08, 3, [0:1], "TPS", "MAP", "INVALID", "INVALID"
+            multiplyMAP = bits, U08, 3, [6:7], "Off", "Baro", "Fixed", "INVALID"
+            pinLayout = bits, U08, 15, [0:7], ${'$'}pinLayouts
+        """.trimIndent()
+
+        val parsed = IniParser.parse("speeduino.ini", ini)
+
+        val scalar = parsed.fields.first { it.name == "aseTaperTime" }
+        assertEquals(1, scalar.digits)
+        assertEquals(0.1, scalar.scale)
+
+        val aeMode = parsed.fields.first { it.name == "aeMode" }
+        assertEquals(0, aeMode.bitLow)
+        assertEquals(1, aeMode.bitHigh)
+        assertEquals(listOf("TPS", "MAP", "INVALID", "INVALID"), aeMode.enumLabels)
+
+        val multiplyMap = parsed.fields.first { it.name == "multiplyMAP" }
+        assertEquals(6, multiplyMap.bitLow)
+        assertEquals(7, multiplyMap.bitHigh)
+
+        val pinLayout = parsed.fields.first { it.name == "pinLayout" }
+        assertEquals(null, pinLayout.enumLabels)
+    }
 }
