@@ -224,6 +224,14 @@ class SpeeduinoClient(
             val detectedFirmwareSignature = if (useLegacyHandshakeCore) {
                 firmwareSamples = try {
                     readLegacyFirmwareSignatureSamples()
+                } catch (legacyError: CancellationException) {
+                    // Nunca tratar cancelamento como "handshake falhou, tenta modern fallback":
+                    // isso deixava a coroutine seguir mandando comandos USB (protocol.getFirmwareInfo())
+                    // depois que o chamador já tinha pedido pra parar (ex.: usuário tocou em
+                    // "Cancelar conexão"), correndo em paralelo com o disconnect() síncrono do
+                    // cancelamento na mesma porta - o resultado observado era "Connection closed"
+                    // (incidente relatado em 2026-08-18). CancellationException sempre propaga.
+                    throw legacyError
                 } catch (legacyError: Exception) {
                     if (connection.supportsModernProtocolFallback()) {
                         Logger.w(TAG, "Legacy handshake falhou, tentando modern fallback: ${legacyError.message}")
@@ -420,6 +428,8 @@ class SpeeduinoClient(
                 if (consensus.signature != null && consensus.consensusHits >= 2) {
                     return samples
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 lastError = e
                 Logger.w(TAG, "Falha ao ler assinatura de firmware (tentativa ${attempt + 1}/$maxAttempts): ${e.message}")
@@ -499,6 +509,8 @@ class SpeeduinoClient(
                     lastError = UnsupportedFirmwareException(detail)
                     Logger.w(TAG, "Discarding legacy firmware sample (${attempt + 1}/$maxAttempts): $detail")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 lastError = e
             }
