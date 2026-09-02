@@ -1048,8 +1048,18 @@ class SpeeduinoClient(
 
     private fun resolveConfigReadMode(family: EcuFamily): EcuConfigReadMode {
         val baseMode = ecuDefinition?.runtime?.configReadMode ?: EcuConfigReadMode.MODERN_TABLE
+        // MS2/MEGASPEED/MS3 sempre reportam usesModernEnvelope()=false (só Speeduino
+        // 202201+/rusEFI usam envelope moderno de verdade - ver FirmwareEra.usesModernEnvelope()),
+        // então esta mesma guarda vale pra elas sem o risco documentado abaixo pro Speeduino:
+        // nenhuma dessas famílias tem um firmware que trate o envelope [length][payload][CRC32]
+        // como obrigatório. Sem isso, Ms2DefinitionProvider/MegaSpeedDefinitionProvider (que não
+        // fixam configReadMode, herdando o default MODERN_TABLE) mandam protocol.readTable() com
+        // CRC32 em transportes legacy-first (USB/BT) pra firmwares MS2/Extra clássicos que nunca
+        // respondem a esse envelope - visto em bench: readTable trava em silêncio total (nenhum
+        // rx) enquanto o handshake legacy 'Q'/'S' funciona normal, e o download de config nunca
+        // libera a leitura pra iniciar o live data (watchdog live_data_never_started).
         if (
-            family == EcuFamily.SPEEDUINO &&
+            family in setOf(EcuFamily.SPEEDUINO, EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3) &&
             baseMode == EcuConfigReadMode.MODERN_TABLE &&
             !connection.supportsModernConfigReads() &&
             // Rebaixar para legacy por causa do transporte quebra firmware 202201+: a ECU lê os
