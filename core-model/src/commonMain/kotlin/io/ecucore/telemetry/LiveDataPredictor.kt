@@ -73,6 +73,69 @@ object DefaultPredictionConfigs {
         PredictedField.SPEED_KPH to SPEED_KPH,
         PredictedField.COOLANT_TEMP to COOLANT_TEMP
     )
+
+    /**
+     * Aplica [aggressiveness] aos defaults e retorna o mapa de configs pronto para
+     * [LiveDataPredictor]. Cada app decide seu próprio nível — por exemplo um app focado em OBD2
+     * lento pode preferir [PredictionAggressiveness.AGGRESSIVE] para mascarar mais a cadência baixa,
+     * enquanto um app de bancada/tuning que prioriza fidelidade ao dado real pode preferir
+     * [PredictionAggressiveness.LIGHT] ou até [PredictionAggressiveness.OFF].
+     */
+    fun forAggressiveness(aggressiveness: PredictionAggressiveness): Map<PredictedField, FieldPredictionConfig> =
+        defaults().mapValues { (_, config) -> aggressiveness.scale(config) }
+}
+
+/**
+ * Fator de escala aplicado sobre [DefaultPredictionConfigs] para tornar a extrapolação mais ou
+ * menos "ousada", sem precisar redefinir os limites de cada campo manualmente.
+ *
+ * - Escalas de velocidade/aceleração maiores = a extrapolação confia mais na tendência observada e
+ *   se move mais rápido para acompanhar mudanças bruscas (bom para mascarar cadência muito baixa,
+ *   como OBD2 a 1-2Hz), ao custo de mais chance de overshoot em ruído.
+ * - `lookaheadScale` maior = continua extrapolando por mais tempo antes de decair para o último
+ *   valor real quando a próxima amostra atrasa.
+ * - `correctionHalfLifeScale` maior = a reconciliação com a amostra real recém-chegada é mais lenta
+ *   (mais suave, mas o valor exibido fica mais tempo "atrás" do real após uma correção grande).
+ */
+data class PredictionAggressiveness(
+    val velocityScale: Double,
+    val accelerationScale: Double,
+    val lookaheadScale: Double,
+    val correctionHalfLifeScale: Double
+) {
+    internal fun scale(config: FieldPredictionConfig): FieldPredictionConfig = config.copy(
+        maxVelocityPerSecond = config.maxVelocityPerSecond * velocityScale,
+        maxAccelerationPerSecondSq = config.maxAccelerationPerSecondSq * accelerationScale,
+        maxLookaheadNs = (config.maxLookaheadNs * lookaheadScale).toLong().coerceAtLeast(1L),
+        correctionHalfLifeMs = (config.correctionHalfLifeMs * correctionHalfLifeScale).toLong().coerceAtLeast(1L)
+    )
+
+    companion object {
+        /** Conservador: extrapola pouco e converge rápido - prioriza fidelidade ao dado real. */
+        val LIGHT = PredictionAggressiveness(
+            velocityScale = 0.5,
+            accelerationScale = 0.5,
+            lookaheadScale = 0.6,
+            correctionHalfLifeScale = 0.6
+        )
+
+        /** Os defaults de [DefaultPredictionConfigs], sem escala. */
+        val MODERATE = PredictionAggressiveness(
+            velocityScale = 1.0,
+            accelerationScale = 1.0,
+            lookaheadScale = 1.0,
+            correctionHalfLifeScale = 1.0
+        )
+
+        /** Ousado: extrapola mais rápido e por mais tempo - mascara melhor cadências muito baixas
+         * (ex.: OBD2 a 1-2Hz), aceitando mais risco de overshoot em ruído. */
+        val AGGRESSIVE = PredictionAggressiveness(
+            velocityScale = 1.6,
+            accelerationScale = 1.8,
+            lookaheadScale = 1.6,
+            correctionHalfLifeScale = 1.4
+        )
+    }
 }
 
 /**
@@ -92,6 +155,10 @@ object DefaultPredictionConfigs {
 class LiveDataPredictor(
     private val configs: Map<PredictedField, FieldPredictionConfig> = DefaultPredictionConfigs.defaults()
 ) {
+    /** Atalho para configurar por [PredictionAggressiveness] em vez de montar o mapa manualmente. */
+    constructor(aggressiveness: PredictionAggressiveness) : this(DefaultPredictionConfigs.forAggressiveness(aggressiveness))
+
+
     private class FieldTracker {
         var lastRealValue: Double = 0.0
         var lastRealAtNs: Long = 0L

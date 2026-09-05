@@ -98,4 +98,24 @@ class LiveDataPredictorTest {
         // Immediately after reset + first sample there is no velocity yet, so it must hold flat.
         assertEquals(800, predictor.estimateRpmAt(nowNs = 300_000_000L))
     }
+
+    @Test
+    fun aggressiveness_scalesExtrapolationRelativeToLightAndModerate() {
+        fun predictorFor(aggressiveness: PredictionAggressiveness) = LiveDataPredictor(aggressiveness).apply {
+            onSample(liveData(rpm = 1000), timestampNs = 0L)
+            onSample(liveData(rpm = 2000), timestampNs = 100_000_000L)
+        }
+
+        val nowNs = 100_000_000L + 200_000_000L // 200ms past the last real sample
+
+        val light = predictorFor(PredictionAggressiveness.LIGHT).estimateRpmAt(nowNs)
+        val moderate = predictorFor(PredictionAggressiveness.MODERATE).estimateRpmAt(nowNs)
+        val aggressive = predictorFor(PredictionAggressiveness.AGGRESSIVE).estimateRpmAt(nowNs)
+
+        assertTrue(
+            light <= moderate && moderate <= aggressive,
+            "expected light <= moderate <= aggressive extrapolation, got light=$light moderate=$moderate aggressive=$aggressive"
+        )
+        assertTrue(aggressive > light, "expected AGGRESSIVE to extrapolate visibly further than LIGHT")
+    }
 }

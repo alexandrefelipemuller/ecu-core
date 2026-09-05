@@ -31,6 +31,13 @@ class LiveDataUpsampler(
     private val predictor: LiveDataPredictor = LiveDataPredictor(),
     private val tickIntervalMs: Long = DEFAULT_TICK_INTERVAL_MS
 ) {
+    /** Atalho para configurar o nível de extrapolação por [PredictionAggressiveness] por app. */
+    constructor(
+        aggressiveness: PredictionAggressiveness,
+        tickIntervalMs: Long = DEFAULT_TICK_INTERVAL_MS
+    ) : this(LiveDataPredictor(aggressiveness), tickIntervalMs)
+
+
     private val _samples = MutableSharedFlow<SpeeduinoLiveData>(extraBufferCapacity = SAMPLE_BUFFER_CAPACITY)
 
     /** Amostras reais (imediatas) intercaladas com amostras extrapoladas emitidas a cada [tickIntervalMs]. */
