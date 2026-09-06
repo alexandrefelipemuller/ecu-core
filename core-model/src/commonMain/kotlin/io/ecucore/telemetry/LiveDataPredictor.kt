@@ -1,6 +1,7 @@
 package io.ecucore.telemetry
 
 import io.ecucore.SpeeduinoLiveData
+import io.ecucore.shared.JvmSynchronized
 import io.ecucore.shared.MonotonicClock
 import kotlin.math.exp
 import kotlin.math.pow
@@ -150,6 +151,11 @@ data class PredictionAggressiveness(
  * value" por PID entre ciclos de poll, um campo pode chegar sem mudança real numa nova amostra —
  * tratar isso como velocidade zero resetaria a extrapolação incorretamente, então só recalculamos
  * velocidade quando o valor de fato mudou.
+ *
+ * Thread-safe em JVM/Android via [JvmSynchronized] (necessário: [onSample] é chamado pela thread
+ * de streaming do transporte, enquanto [estimateAt]/[estimateRpmAt] tipicamente rodam num ticker ou
+ * loop de frame de UI em outra thread - sem isso, [FieldTracker] podia ser lido com uma combinação
+ * inconsistente de campos, ex. `lastRealValue` novo com `lastRealAtNs` antigo).
  */
 class LiveDataPredictor(
     private val configs: Map<PredictedField, FieldPredictionConfig> = DefaultPredictionConfigs.defaults()
@@ -167,6 +173,7 @@ class LiveDataPredictor(
     private var lastRealSample: SpeeduinoLiveData? = null
     private val trackers: Map<PredictedField, FieldTracker> = configs.keys.associateWith { FieldTracker() }
 
+    @JvmSynchronized
     fun onSample(data: SpeeduinoLiveData, timestampNs: Long = MonotonicClock.nowNanos()) {
         lastRealSample = data
         for ((field, config) in configs) {
@@ -207,6 +214,7 @@ class LiveDataPredictor(
         tracker.lastRealAtNs = nowNs
     }
 
+    @JvmSynchronized
     fun estimateAt(nowNs: Long = MonotonicClock.nowNanos()): SpeeduinoLiveData? {
         val base = lastRealSample ?: return null
         var result = base
@@ -219,6 +227,7 @@ class LiveDataPredictor(
         return result
     }
 
+    @JvmSynchronized
     fun estimateRpmAt(nowNs: Long = MonotonicClock.nowNanos()): Int {
         val tracker = trackers[PredictedField.RPM] ?: return lastRealSample?.rpm ?: 0
         val config = configs[PredictedField.RPM] ?: return lastRealSample?.rpm ?: 0
@@ -226,6 +235,7 @@ class LiveDataPredictor(
         return extrapolate(tracker, config, nowNs).toInt()
     }
 
+    @JvmSynchronized
     fun reset() {
         lastRealSample = null
         for (tracker in trackers.values) {

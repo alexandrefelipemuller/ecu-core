@@ -1,6 +1,7 @@
 package io.ecucore.telemetry
 
 import io.ecucore.SpeeduinoLiveData
+import io.ecucore.shared.JvmSynchronized
 import io.ecucore.shared.MonotonicClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -26,6 +27,11 @@ import kotlinx.coroutines.launch
  *   chamar [estimateAt]/[estimateRpmAt] diretamente a cada frame em vez de coletar [samples] — evita
  *   o overhead do Flow e desacopla a cadência visual (60-120Hz) da cadência de log.
  * - Chame [reset] ao desconectar/reconectar para não herdar tendência de uma sessão anterior.
+ *
+ * [ingestRealSample] roda tipicamente na thread de streaming do transporte, enquanto
+ * [estimateAt]/[estimateRpmAt]/[samples] são lidos de um ticker ou loop de frame de UI em outra
+ * thread; [LiveDataPredictor] já é thread-safe em JVM/Android (via `@JvmSynchronized`), e [start]/
+ * [stop] também são sincronizados aqui para proteger [tickerJob] de chamadas concorrentes.
  */
 class LiveDataUpsampler(
     private val predictor: LiveDataPredictor = LiveDataPredictor(),
@@ -52,8 +58,9 @@ class LiveDataUpsampler(
     }
 
     /** Inicia o ticker de baixa cadência que emite amostras extrapoladas para consumidores como logs. */
+    @JvmSynchronized
     fun start(scope: CoroutineScope) {
-        stop()
+        stopLocked()
         tickerJob = scope.launch {
             while (isActive) {
                 delay(tickIntervalMs)
@@ -62,7 +69,12 @@ class LiveDataUpsampler(
         }
     }
 
+    @JvmSynchronized
     fun stop() {
+        stopLocked()
+    }
+
+    private fun stopLocked() {
         tickerJob?.cancel()
         tickerJob = null
     }
