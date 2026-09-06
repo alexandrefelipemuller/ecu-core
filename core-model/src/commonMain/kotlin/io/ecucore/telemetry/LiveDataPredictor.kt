@@ -20,50 +20,46 @@ enum class PredictedField {
  * Limites de segurança por campo para a extrapolação.
  *
  * @param maxVelocityPerSecond taxa máxima plausível de variação do campo (unidade do campo / s).
- * @param maxAccelerationPerSecondSq quanto a velocidade estimada pode mudar por segundo — protege
- *   contra uma leitura ruidosa isolada distorcendo a extrapolação.
+ * @param velocitySmoothingHalfLifeMs meia-vida (ms) do filtro passa-baixa (EMA) aplicado sobre a
+ *   velocidade estimada: em vez de recalcular a inclinação "crua" entre as duas últimas amostras
+ *   reais a cada atualização (sensível a ruído/quantização, produz rampas "em degrau/onda
+ *   quadrada"), a nova inclinação instantânea é misturada com a anterior usando essa meia-vida —
+ *   dt pequeno entre amostras pesa pouco a inclinação nova (suaviza ruído de leituras próximas),
+ *   dt grande pesa quase tudo nela (não trava atrás de uma tendência antiga).
  * @param maxLookaheadNs além desse tempo sem uma atualização real do campo, a extrapolação passa a
  *   decair exponencialmente em vez de continuar linear, evitando que o valor "fuja" se o link travar.
- * @param correctionHalfLifeMs meia-vida (ms) do erro residual entre o valor extrapolado e o valor
- *   real recém-chegado, usada para reconciliar suavemente sem nunca atrasar a publicação do real.
  */
 data class FieldPredictionConfig(
     val maxVelocityPerSecond: Double,
-    val maxAccelerationPerSecondSq: Double,
-    val maxLookaheadNs: Long,
-    val correctionHalfLifeMs: Long
+    val velocitySmoothingHalfLifeMs: Long,
+    val maxLookaheadNs: Long
 )
 
 object DefaultPredictionConfigs {
     val RPM = FieldPredictionConfig(
         maxVelocityPerSecond = 8000.0,
-        maxAccelerationPerSecondSq = 40_000.0,
-        maxLookaheadNs = 350_000_000L,
-        correctionHalfLifeMs = 80L
+        velocitySmoothingHalfLifeMs = 180L,
+        maxLookaheadNs = 350_000_000L
     )
     val MAP_PRESSURE = FieldPredictionConfig(
         maxVelocityPerSecond = 120.0,
-        maxAccelerationPerSecondSq = 800.0,
-        maxLookaheadNs = 350_000_000L,
-        correctionHalfLifeMs = 100L
+        velocitySmoothingHalfLifeMs = 200L,
+        maxLookaheadNs = 350_000_000L
     )
     val TPS = FieldPredictionConfig(
         maxVelocityPerSecond = 400.0,
-        maxAccelerationPerSecondSq = 4_000.0,
-        maxLookaheadNs = 350_000_000L,
-        correctionHalfLifeMs = 60L
+        velocitySmoothingHalfLifeMs = 120L,
+        maxLookaheadNs = 350_000_000L
     )
     val SPEED_KPH = FieldPredictionConfig(
         maxVelocityPerSecond = 40.0,
-        maxAccelerationPerSecondSq = 200.0,
-        maxLookaheadNs = 500_000_000L,
-        correctionHalfLifeMs = 150L
+        velocitySmoothingHalfLifeMs = 300L,
+        maxLookaheadNs = 500_000_000L
     )
     val COOLANT_TEMP = FieldPredictionConfig(
         maxVelocityPerSecond = 2.0,
-        maxAccelerationPerSecondSq = 5.0,
-        maxLookaheadNs = 2_000_000_000L,
-        correctionHalfLifeMs = 500L
+        velocitySmoothingHalfLifeMs = 1_000L,
+        maxLookaheadNs = 2_000_000_000L
     )
 
     fun defaults(): Map<PredictedField, FieldPredictionConfig> = mapOf(
@@ -79,7 +75,7 @@ object DefaultPredictionConfigs {
      * [LiveDataPredictor]. Cada app decide seu próprio nível — por exemplo um app focado em OBD2
      * lento pode preferir [PredictionAggressiveness.AGGRESSIVE] para mascarar mais a cadência baixa,
      * enquanto um app de bancada/tuning que prioriza fidelidade ao dado real pode preferir
-     * [PredictionAggressiveness.LIGHT] ou até [PredictionAggressiveness.OFF].
+     * [PredictionAggressiveness.LIGHT].
      */
     fun forAggressiveness(aggressiveness: PredictionAggressiveness): Map<PredictedField, FieldPredictionConfig> =
         defaults().mapValues { (_, config) -> aggressiveness.scale(config) }
@@ -89,51 +85,50 @@ object DefaultPredictionConfigs {
  * Fator de escala aplicado sobre [DefaultPredictionConfigs] para tornar a extrapolação mais ou
  * menos "ousada", sem precisar redefinir os limites de cada campo manualmente.
  *
- * - Escalas de velocidade/aceleração maiores = a extrapolação confia mais na tendência observada e
- *   se move mais rápido para acompanhar mudanças bruscas (bom para mascarar cadência muito baixa,
- *   como OBD2 a 1-2Hz), ao custo de mais chance de overshoot em ruído.
+ * - `velocityScale` maior = a extrapolação confia mais na tendência observada e se move mais rápido
+ *   para acompanhar mudanças bruscas (bom para mascarar cadência muito baixa, como OBD2 a 1-2Hz).
+ * - `velocitySmoothingScale` maior = a inclinação estimada reage mais devagar a leituras novas
+ *   (mais filtrada/estável, menos "onda quadrada" em dado ruidoso); menor = reage mais rápido a
+ *   mudanças de tendência, ao custo de mais sensibilidade a ruído.
  * - `lookaheadScale` maior = continua extrapolando por mais tempo antes de decair para o último
  *   valor real quando a próxima amostra atrasa.
- * - `correctionHalfLifeScale` maior = a reconciliação com a amostra real recém-chegada é mais lenta
- *   (mais suave, mas o valor exibido fica mais tempo "atrás" do real após uma correção grande).
  */
 data class PredictionAggressiveness(
     val velocityScale: Double,
-    val accelerationScale: Double,
-    val lookaheadScale: Double,
-    val correctionHalfLifeScale: Double
+    val velocitySmoothingScale: Double,
+    val lookaheadScale: Double
 ) {
     internal fun scale(config: FieldPredictionConfig): FieldPredictionConfig = config.copy(
         maxVelocityPerSecond = config.maxVelocityPerSecond * velocityScale,
-        maxAccelerationPerSecondSq = config.maxAccelerationPerSecondSq * accelerationScale,
-        maxLookaheadNs = (config.maxLookaheadNs * lookaheadScale).toLong().coerceAtLeast(1L),
-        correctionHalfLifeMs = (config.correctionHalfLifeMs * correctionHalfLifeScale).toLong().coerceAtLeast(1L)
+        velocitySmoothingHalfLifeMs = (config.velocitySmoothingHalfLifeMs * velocitySmoothingScale).toLong().coerceAtLeast(1L),
+        maxLookaheadNs = (config.maxLookaheadNs * lookaheadScale).toLong().coerceAtLeast(1L)
     )
 
     companion object {
-        /** Conservador: extrapola pouco e converge rápido - prioriza fidelidade ao dado real. */
+        /** Conservador: extrapola pouco e suaviza mais a inclinação - prioriza fidelidade ao dado
+         * real. */
         val LIGHT = PredictionAggressiveness(
             velocityScale = 0.5,
-            accelerationScale = 0.5,
-            lookaheadScale = 0.6,
-            correctionHalfLifeScale = 0.6
+            velocitySmoothingScale = 1.3,
+            lookaheadScale = 0.6
         )
 
         /** Os defaults de [DefaultPredictionConfigs], sem escala. */
         val MODERATE = PredictionAggressiveness(
             velocityScale = 1.0,
-            accelerationScale = 1.0,
-            lookaheadScale = 1.0,
-            correctionHalfLifeScale = 1.0
+            velocitySmoothingScale = 1.0,
+            lookaheadScale = 1.0
         )
 
         /** Ousado: extrapola mais rápido e por mais tempo - mascara melhor cadências muito baixas
-         * (ex.: OBD2 a 1-2Hz), aceitando mais risco de overshoot em ruído. */
+         * (ex.: OBD2 a 1-2Hz). A suavização da inclinação NÃO é reduzida aqui (permanece igual ao
+         * MODERATE): "agressivo" é sobre até onde/quão rápido extrapolar, não sobre tolerar mais
+         * ruído na inclinação estimada - reduzir a suavização é o que produz rampas em "onda
+         * quadrada" em vez de rampas suaves. */
         val AGGRESSIVE = PredictionAggressiveness(
             velocityScale = 1.6,
-            accelerationScale = 1.8,
-            lookaheadScale = 1.6,
-            correctionHalfLifeScale = 1.4
+            velocitySmoothingScale = 1.0,
+            lookaheadScale = 1.6
         )
     }
 }
@@ -144,8 +139,12 @@ data class PredictionAggressiveness(
  * Nunca atrasa a publicação de uma amostra real: [onSample] deve ser chamado imediatamente ao
  * receber cada amostra do transporte, e o valor real deve ser exibido/gravado sem esperar por esta
  * classe. [estimateAt] apenas responde "qual é a melhor estimativa agora", extrapolando a partir da
- * última amostra real conhecida e da velocidade observada — pensado para ser chamado a qualquer
- * cadência (por frame de UI, ou por um ticker de log) sem custo relevante.
+ * última amostra real conhecida e da velocidade (suavizada) observada — pensado para ser chamado a
+ * qualquer cadência (por frame de UI, ou por um ticker de log) sem custo relevante.
+ *
+ * A extrapolação sempre reancora exatamente no último valor real (em dt=0, [estimateAt] retorna
+ * esse valor sem nenhum ajuste) - não há descontinuidade a corrigir entre amostras, só a inclinação
+ * (velocidade) usada para projetar adiante precisa ser estável, daí a suavização em [onSample].
  *
  * Especialmente importante para OBD2: como [io.ecucore.transport.Obd2Transport] já faz "hold last
  * value" por PID entre ciclos de poll, um campo pode chegar sem mudança real numa nova amostra —
@@ -158,13 +157,10 @@ class LiveDataPredictor(
     /** Atalho para configurar por [PredictionAggressiveness] em vez de montar o mapa manualmente. */
     constructor(aggressiveness: PredictionAggressiveness) : this(DefaultPredictionConfigs.forAggressiveness(aggressiveness))
 
-
     private class FieldTracker {
         var lastRealValue: Double = 0.0
         var lastRealAtNs: Long = 0L
         var velocityPerNs: Double = 0.0
-        var correctionOffset: Double = 0.0
-        var correctionStartedAtNs: Long = 0L
         var initialized: Boolean = false
     }
 
@@ -180,13 +176,11 @@ class LiveDataPredictor(
         }
     }
 
-    private fun updateTracker(tracker: LiveDataPredictor.FieldTracker, config: FieldPredictionConfig, newValue: Double, nowNs: Long) {
+    private fun updateTracker(tracker: FieldTracker, config: FieldPredictionConfig, newValue: Double, nowNs: Long) {
         if (!tracker.initialized) {
             tracker.lastRealValue = newValue
             tracker.lastRealAtNs = nowNs
             tracker.velocityPerNs = 0.0
-            tracker.correctionOffset = 0.0
-            tracker.correctionStartedAtNs = nowNs
             tracker.initialized = true
             return
         }
@@ -197,23 +191,20 @@ class LiveDataPredictor(
             return
         }
 
-        val estimateBeforeUpdate = extrapolate(tracker, config, nowNs)
-
         val dtNs = (nowNs - tracker.lastRealAtNs).coerceAtLeast(1L)
         val maxVelocityPerNs = config.maxVelocityPerSecond / 1_000_000_000.0
         val instantVelocityPerNs = ((newValue - tracker.lastRealValue) / dtNs)
             .coerceIn(-maxVelocityPerNs, maxVelocityPerNs)
 
-        val maxVelocityDeltaPerNs = config.maxAccelerationPerSecondSq / 1_000_000_000.0 / 1_000_000_000.0 * dtNs
-        val velocityDelta = (instantVelocityPerNs - tracker.velocityPerNs)
-            .coerceIn(-maxVelocityDeltaPerNs, maxVelocityDeltaPerNs)
-
-        tracker.velocityPerNs = tracker.velocityPerNs + velocityDelta
+        // Filtro passa-baixa (EMA) sobre a velocidade, não sobre o valor: em vez de substituir a
+        // inclinação pela última medida "crua" (sensível a ruído/quantização da leitura, produz
+        // rampas em degrau), mistura com a inclinação anterior usando meia-vida - dt pequeno entre
+        // amostras próximas pesa pouco a leitura nova (suaviza), dt grande confia quase só nela.
+        val dtMs = dtNs / 1_000_000.0
+        val smoothingAlpha = 1.0 - 0.5.pow(dtMs / config.velocitySmoothingHalfLifeMs.toDouble())
+        tracker.velocityPerNs += smoothingAlpha * (instantVelocityPerNs - tracker.velocityPerNs)
         tracker.lastRealValue = newValue
         tracker.lastRealAtNs = nowNs
-
-        tracker.correctionOffset = newValue - estimateBeforeUpdate
-        tracker.correctionStartedAtNs = nowNs
     }
 
     fun estimateAt(nowNs: Long = MonotonicClock.nowNanos()): SpeeduinoLiveData? {
@@ -242,24 +233,18 @@ class LiveDataPredictor(
             tracker.lastRealValue = 0.0
             tracker.lastRealAtNs = 0L
             tracker.velocityPerNs = 0.0
-            tracker.correctionOffset = 0.0
-            tracker.correctionStartedAtNs = 0L
         }
     }
 
     private fun extrapolate(tracker: FieldTracker, config: FieldPredictionConfig, nowNs: Long): Double {
         val dtNs = (nowNs - tracker.lastRealAtNs).coerceAtLeast(0L)
-        val predicted = if (dtNs <= config.maxLookaheadNs) {
+        return if (dtNs <= config.maxLookaheadNs) {
             tracker.lastRealValue + tracker.velocityPerNs * dtNs
         } else {
             val overshootNs = dtNs - config.maxLookaheadNs
             val decayFactor = exp(-overshootNs.toDouble() / config.maxLookaheadNs.toDouble())
             tracker.lastRealValue + tracker.velocityPerNs * config.maxLookaheadNs * decayFactor
         }
-
-        val correctionAgeMs = (nowNs - tracker.correctionStartedAtNs).coerceAtLeast(0L) / 1_000_000.0
-        val correctionDecay = 0.5.pow(correctionAgeMs / config.correctionHalfLifeMs.toDouble())
-        return predicted + tracker.correctionOffset * correctionDecay
     }
 
     private fun fieldValue(data: SpeeduinoLiveData, field: PredictedField): Double? = when (field) {

@@ -46,9 +46,8 @@ class LiveDataPredictorTest {
     fun estimateAt_neverExceedsAbsoluteClampBeyondMaxLookahead() {
         val config = FieldPredictionConfig(
             maxVelocityPerSecond = 8000.0,
-            maxAccelerationPerSecondSq = 40_000.0,
-            maxLookaheadNs = 350_000_000L,
-            correctionHalfLifeMs = 80L
+            velocitySmoothingHalfLifeMs = 180L,
+            maxLookaheadNs = 350_000_000L
         )
         val predictor = LiveDataPredictor(mapOf(PredictedField.RPM to config))
         predictor.onSample(liveData(rpm = 1000), timestampNs = 0L)
@@ -117,5 +116,24 @@ class LiveDataPredictorTest {
             "expected light <= moderate <= aggressive extrapolation, got light=$light moderate=$moderate aggressive=$aggressive"
         )
         assertTrue(aggressive > light, "expected AGGRESSIVE to extrapolate visibly further than LIGHT")
+    }
+
+    @Test
+    fun velocitySmoothing_absorbsASingleNoisySampleWithoutReversingTheRamp() {
+        val predictor = LiveDataPredictor()
+        // Amostras subindo, mas com uma leitura ruidosa/quantizada (queda momentânea de 20rpm em
+        // 50ms) no meio - típico de resolução/jitter de OBD2, não uma mudança real de tendência.
+        predictor.onSample(liveData(rpm = 1000), timestampNs = 0L)
+        predictor.onSample(liveData(rpm = 1300), timestampNs = 100_000_000L)
+        predictor.onSample(liveData(rpm = 1280), timestampNs = 150_000_000L) // blip ruidoso
+
+        // Sem suavização, a inclinação seria substituída pela do blip (negativa) e a curva
+        // reverteria/"achataria" na hora - exatamente a "onda quadrada" reportada em vez de rampa.
+        // Com EMA, a tendência de subida (ponderada pelas amostras anteriores) ainda domina.
+        val shortlyAfter = predictor.estimateRpmAt(nowNs = 170_000_000L)
+        assertTrue(
+            shortlyAfter >= 1280,
+            "expected smoothed trend to keep climbing (or hold) despite one noisy dip, got $shortlyAfter"
+        )
     }
 }
