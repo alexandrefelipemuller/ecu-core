@@ -154,6 +154,10 @@ class Obd2Transport(
     private var currentFlags: ProfileFlags = flagsForFeatures(currentFeatures)
     private var supportedMode1Pids: Set<Int> = CORE_PIDS
     private var preferredO2PidHex: String? = null
+    // Evita que probePreferredO2Pid() re-tente os mesmos 3 candidatos (0144/0134/0114) em todo
+    // ciclo de poll para sempre quando nenhum é suportado (ex.: veículos sem O2/AFR exposto) -
+    // sem isso, essa sonda nunca desiste e fica gerando tráfego/contenção de ioMutex sem fim.
+    private var o2ProbeExhausted: Boolean = false
     private var profileKey: String? = null
     private var lastDataFingerprint: String = ""
     private var lastDataChangeAtMs: Long = 0L
@@ -377,6 +381,8 @@ class Obd2Transport(
             currentFlags = flagsForFeatures(currentFeatures)
             supportedMode1Pids = CORE_PIDS
             preferredO2PidHex = null
+            o2ProbeExhausted = false
+            pidFailureStreak.clear()
             profileKey = null
             detectedVin = null
             detectedCalibrationId = null
@@ -501,7 +507,10 @@ class Obd2Transport(
             readPidAdaptiveDoubleValue("0109") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
         }
 
-        if (preferredO2PidHex == null && supportedMode1Pids.none { it in WIDEBAND_O2_PIDS || it in NARROWBAND_O2_PIDS }) {
+        if (!o2ProbeExhausted &&
+            preferredO2PidHex == null &&
+            supportedMode1Pids.none { it in WIDEBAND_O2_PIDS || it in NARROWBAND_O2_PIDS }
+        ) {
             probePreferredO2Pid()
         }
 
@@ -1046,6 +1055,7 @@ class Obd2Transport(
                 return preferredO2PidHex ?: command
             }
         }
+        o2ProbeExhausted = true
         return preferredO2PidHex
     }
 
@@ -1084,6 +1094,13 @@ class Obd2Transport(
     private fun maybeDisableUnstablePid(command: String, streak: Int) {
         if (streak < PID_DISABLE_FAILURE_THRESHOLD) return
         val pid = command.removePrefix("01").toIntOrNull(16) ?: return
+        // CORE_PIDS (RPM, coolant, MAP, TPS, ...) são a base que praticamente todo ECU OBD2
+        // suporta - uma sequência de timeouts nelas é sinal de link lento/contenção transitória
+        // (ex.: sweep de protocolo/campanha de investigação disputando o ioMutex, ou um perfil de
+        // timeout agressivo sendo testado em runFeatureHealthCheck), não de "PID não suportado".
+        // Desabilitar permanentemente aqui já travou o live data (RPM nunca mais lido na sessão)
+        // sem nenhum caminho de reabilitação até reconectar - nunca desabilitar essas.
+        if (pid in CORE_PIDS) return
         if (pid !in supportedMode1Pids) return
 
         supportedMode1Pids = supportedMode1Pids - pid
@@ -1282,6 +1299,7 @@ class Obd2Transport(
         currentFlags = flagsForFeatures(currentFeatures)
         supportedMode1Pids = CORE_PIDS
         preferredO2PidHex = null
+        o2ProbeExhausted = false
         profileKey = null
         detectedAdapterProtocol = null
         detectedAdapterProtocolCode = null

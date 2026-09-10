@@ -109,7 +109,10 @@ object MsqCodec {
         val firmwareInfo = attr("firmwareInfo", xml)
 
         val pages = mutableListOf<MsqPage>()
-        val openPageRegex = Regex("<page\\s+([^>]*?)/?>", RegexOption.DOT_MATCHES_ALL)
+        // Sem `.` no padrão, então DOTALL não tem efeito aqui - usar sem a option evita depender
+        // de RegexOption.DOT_MATCHES_ALL, que é uma extensão JVM/Native e não existe no expect
+        // comum do Kotlin Multiplatform (quebra compileCommonMainKotlinMetadata/iOS).
+        val openPageRegex = Regex("<page\\s+([^>]*?)/?>")
         var searchFrom = 0
         while (true) {
             val openMatch = openPageRegex.find(xml, searchFrom) ?: break
@@ -139,7 +142,10 @@ object MsqCodec {
     }
 
     private fun parseConstants(body: String): List<MsqConstant> {
-        val regex = Regex("<constant([^>]*)>(.*?)</constant>", RegexOption.DOT_MATCHES_ALL)
+        // Flag inline (?s) em vez de RegexOption.DOT_MATCHES_ALL (extensão JVM/Native ausente do
+        // expect comum do Kotlin Multiplatform) - portável, faz `.` casar quebras de linha dentro
+        // de valores de tabela multilinha.
+        val regex = Regex("(?s)<constant([^>]*)>(.*?)</constant>")
         return regex.findAll(body).map { match ->
             val attrsRaw = match.groupValues[1]
             MsqConstant(
