@@ -137,6 +137,39 @@ class SpeeduinoProtocol(
         return sessionModernEnvelope
     }
 
+    /*
+     * ⚠️ PROBLEMA ABERTO (2026-08-18): Sync (download de páginas de config) via USB não funciona
+     * em firmware Speeduino 202501+, e ainda não sabemos consertar sem quebrar outra coisa.
+     *
+     * Contexto: firmware 202501+ REMOVEU o comando legacy 'p' (leitura de página) do código-fonte
+     * por completo (ver CLAUDE.md, seção "BREAKING CHANGE 2025-11-24"). Como `prefersLegacyProtocol()`
+     * é hardcoded `true` pra USB (ver SpeeduinoUsbSerialConnection.kt), toda leitura de página nesse
+     * transporte cai em `sessionModernEnvelopeOverrideForConfigRead() == null` -> legacy sempre,
+     * mesmo com era do firmware confirmada como moderna. Na prática: a ECU não reconhece o 'p' cru,
+     * ecoa/ignora, e cada página trava em timeout de 15s (2x por página, 15 páginas = ~7min de sync
+     * que nunca termina) - ver incidente completo 2026-08-18.
+     *
+     * TENTATIVA JÁ FEITA e REVERTIDA: fazer `sessionModernEnvelope == true` vencer
+     * `connection.prefersLegacyProtocol()` aqui (deixar firmware confirmada como moderna forçar
+     * leitura de página em Modern Protocol mesmo no USB). Compilou, passou nos testes automatizados,
+     * e resolveu o Sync - só que quebrou a conexão inicial rápida que funcionava bem (usuário
+     * reportou "agora tudo ta com problema" depois de instalar). A causa mais provável: o comentário
+     * grande logo acima desta função já documenta, com bench de 2026-08-08, que leitura de página em
+     * Modern Protocol sobre USB falha ("expected 2 bytes, received 0") mesmo com CRC matematicamente
+     * correto, por um motivo que nunca foi totalmente entendido - só que "nunca foi entendido" era
+     * sobre firmware ANTES da 202501. Não sabemos se é o mesmo bug misterioso se manifestando nesse
+     * firmware novo, ou algo diferente. A tentativa foi revertida sem investigar a fundo (sem
+     * hardware 202501 real disponível pra bench no momento).
+     *
+     * PRA QUEM PEGAR ISSO DEPOIS: antes de tentar de novo, é preciso reproduzir em bancada com uma
+     * ECU real rodando 202501 via USB e capturar o tráfego bruto (nível de bytes, não só logs do
+     * app) de uma leitura de página em Modern Protocol que falhe, pra descobrir se é bug de framing
+     * nosso, interação ruim do adaptador CH34x com o buffer da ECU, ou outra coisa. Só depois disso
+     * dá pra tentar religar o Modern Protocol pra leitura de config no USB com segurança. Até lá, o
+     * Sync via USB em firmware 202501+ está com defeito conhecido e sem solução aplicada - o botão
+     * continua visível no app por decisão explícita (ver conversa 2026-08-18), não foi escondido.
+     */
+
     private fun isModernEnabled(ignoreSessionLegacyPreferred: Boolean = false): Boolean {
         if (FORCE_LEGACY_PROTOCOL) return false
         sessionModernEnvelopeOverrideForConfigRead()?.let { return it }
