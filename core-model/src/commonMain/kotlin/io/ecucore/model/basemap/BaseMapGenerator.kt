@@ -4,6 +4,7 @@ import io.ecucore.model.AfrTable
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.EngineStroke
 import io.ecucore.model.IgnitionTable
+import io.ecucore.model.InjectorLayout
 import io.ecucore.model.InjectorPortType
 import io.ecucore.model.InjectorStaging
 import io.ecucore.model.MapSampleMethod
@@ -24,7 +25,13 @@ data class EngineProfile(
     val compressionRatio: Double,
     val fuelType: FuelType,
     val injectorFlowLbsPerHour: Double,
-    val mapMaxKpa: Int
+    val mapMaxKpa: Int,
+    val algorithm: Algorithm = Algorithm.SPEED_DENSITY,
+    val injectorLayout: InjectorLayout = InjectorLayout.SEQUENTIAL,
+    val injectorStaging: InjectorStaging = InjectorStaging.ALTERNATING,
+    val injectorPortType: InjectorPortType = InjectorPortType.PORT,
+    val squirtsPerCycle: Int = 2,
+    val engineStroke: EngineStroke = EngineStroke.FOUR_STROKE
 ) {
     val idleRpm: Int = when (fuelType) {
         FuelType.GASOLINE -> 850
@@ -101,7 +108,7 @@ class BaseMapGenerator(
         adjustments: BaseMapAdjustments = BaseMapAdjustments()
     ): GeneratedBaseMap {
         val stoichAfr = profile.fuelType.stoichAfr
-        val algorithm = existingConstants?.algorithm ?: Algorithm.SPEED_DENSITY
+        val algorithm = profile.algorithm
         val isAlphaN = algorithm == Algorithm.ALPHA_N
         val rpmBins = axisGenerator.generateRpmAxis(profile.idleRpm, profile.maxRpm)
         val loadBins = if (isAlphaN) {
@@ -365,12 +372,13 @@ class BaseMapGenerator(
             numberOfCylinders = cleanedCylinders,
             numberOfInjectors = cleanedInjectors,
             stoichiometricRatio = stoichAfr.toFloat(),
-            injectorPortType = base.injectorPortType,
+            injectorPortType = profile.injectorPortType,
+            injectorLayout = profile.injectorLayout,
             mapSampleMethod = base.mapSampleMethod,
-            squirtsPerCycle = base.squirtsPerCycle.coerceIn(1, 4),
-            injectorStaging = base.injectorStaging,
+            squirtsPerCycle = profile.squirtsPerCycle.coerceIn(1, 4),
+            injectorStaging = profile.injectorStaging,
             algorithm = algorithm,
-            engineStroke = base.engineStroke
+            engineStroke = profile.engineStroke
         )
     }
 
