@@ -324,6 +324,7 @@ class SpeeduinoClient(
                         null
                     }
                 )
+                protocol.setSessionFirmwareEra(era)
                 protocol.setSessionEcuFamily(resolvedDefinition.family)
                 protocol.setSessionSchemaId(resolvedDefinition.runtime.schemaId)
 
@@ -753,6 +754,7 @@ class SpeeduinoClient(
         connection.disconnect()
         protocol.setSessionLegacyPreferred(false)
         protocol.setSessionModernEnvelope(null)
+        protocol.setSessionFirmwareEra(null)
         protocol.setSessionEcuFamily(null)
         protocol.setSessionSchemaId(null)
         forceLegacyFirmwareHandshakeAfterModernDisconnect = false

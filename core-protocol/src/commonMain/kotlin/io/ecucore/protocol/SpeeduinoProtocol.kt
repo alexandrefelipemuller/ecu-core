@@ -8,6 +8,7 @@ import io.ecucore.ecu.FirmwareHandshakeDomain
 import io.ecucore.shared.Logger
 import io.ecucore.connection.ISpeeduinoConnection
 import io.ecucore.model.EcuFamily
+import io.ecucore.model.FirmwareEra
 import kotlinx.coroutines.delay
 import io.ecucore.shared.Crc32Table
 import io.ecucore.shared.MonotonicClock
@@ -88,6 +89,14 @@ class SpeeduinoProtocol(
     @Volatile
     private var sessionModernEnvelope: Boolean? = null
 
+    /**
+     * Era do firmware confirmada no handshake (`null` = ainda desconhecida). Usada só para
+     * restringir [sessionModernEnvelopeOverrideForConfigRead] a firmwares onde sabemos que o
+     * legacy 'p' não existe mais (MODERN_2025/202501+) - ver comentário lá.
+     */
+    @Volatile
+    private var sessionFirmwareEra: FirmwareEra? = null
+
     fun setSessionLegacyPreferred(preferLegacy: Boolean) {
         sessionLegacyPreferred = preferLegacy
         legacyPageReadUnsupported = false
@@ -96,6 +105,10 @@ class SpeeduinoProtocol(
 
     fun setSessionModernEnvelope(usesModernEnvelope: Boolean?) {
         sessionModernEnvelope = usesModernEnvelope
+    }
+
+    fun setSessionFirmwareEra(era: FirmwareEra?) {
+        sessionFirmwareEra = era
     }
 
     fun setSessionEcuFamily(family: EcuFamily?) {
@@ -133,7 +146,22 @@ class SpeeduinoProtocol(
      * `sessionModernEnvelope` vencer os flags do transporte normalmente.
      */
     private fun sessionModernEnvelopeOverrideForConfigRead(): Boolean? {
-        if (connection.prefersLegacyProtocol()) return null
+        if (connection.prefersLegacyProtocol()) {
+            // EXCEÇÃO 202501+: esse firmware REMOVEU o comando legacy 'p' do código-fonte por
+            // completo (ver CLAUDE.md "BREAKING CHANGE 2025-11-24"). Achado de campo via
+            // Bluetooth em 2026-09-09: handshake moderno confirma era=MODERN_2025 (firmware
+            // "Speeduino 2025.01.7" respondendo 'Q'/'S' com CRC32 normalmente), mas a leitura de
+            // página cai no `null` de baixo e manda 'p' cru mesmo assim - a ECU não reconhece,
+            // fica esperando o resto de um frame moderno que nunca chega, e cada página trava em
+            // timeout (`download_failed`). Diferente do caso documentado no comentário grande
+            // acima (bench 2026-08-08, firmwares < 202501): ali legacy funcionava e só o modern
+            // quebrava a ECU. Em MODERN_2025 não existe mais opção legacy que funcione, então
+            // aqui não estamos escolhendo "modern melhor que legacy" - estamos parando de tentar
+            // um comando que o firmware já removeu. Restrito a essa era exata para não repetir a
+            // regressão de 2026-08-18 (USB) em eras 202201-202412, onde o legacy 'p' ainda existe
+            // e funciona, e o modern trava a ECU.
+            return if (sessionFirmwareEra == FirmwareEra.MODERN_2025) sessionModernEnvelope else null
+        }
         return sessionModernEnvelope
     }
 
