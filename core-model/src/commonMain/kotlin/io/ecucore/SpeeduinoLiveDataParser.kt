@@ -33,7 +33,9 @@ object SpeeduinoLiveDataParser {
         val tps = fieldInt(data, blockSize, "tps")
         val battery = fieldDouble(data, blockSize, "batteryVoltage")
         val advance = fieldInt(data, blockSize, "advance")
-        val o2 = fieldInt(data, blockSize, "afr")
+        // "afr" fields are scaled to the real AFR value (e.g. 14.7); o2 must stay in the
+        // legacy raw-tenths convention (AFR*10, e.g. 147) that downstream UI code divides by 10.
+        val o2 = kotlin.math.round(fieldDouble(data, blockSize, "afr") * 10.0).toInt()
         val engineStatus = fieldInt(data, blockSize, "engine")
         val sparkStatus = fieldInt(data, blockSize, "spark")
 
