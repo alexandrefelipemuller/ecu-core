@@ -28,6 +28,7 @@ import io.ecucore.model.EngineProtectionMapper
 import io.ecucore.model.ClosedLoopCorrectionConfig
 import io.ecucore.model.ClosedLoopCorrectionMapper
 import io.ecucore.model.MegaSpeedIniTableDefinitions
+import io.ecucore.model.MsExtraIniTableDefinitions
 import io.ecucore.model.Ms2TableDefinitions
 import io.ecucore.model.PinLayoutDetector
 import io.ecucore.model.PinLayoutInfo
@@ -140,6 +141,7 @@ class SpeeduinoClient(
     private var activeIniDefinition: IniDefinition? = null
     private var speeduinoIniCatalog: SpeeduinoIniDefinitions.Catalog? = null
     private var megaSpeedIniCatalog: MegaSpeedIniTableDefinitions.Catalog? = null
+    private var msExtraIniCatalog: MsExtraIniTableDefinitions.Catalog? = null
     private var rusefiIniCatalog: RusefiIniTableDefinitions.Catalog? = null
     private var pendingRusefiVeTableReadback: VeTable? = null
     private var pendingRusefiIgnitionTableReadback: IgnitionTable? = null
@@ -673,6 +675,17 @@ class SpeeduinoClient(
             return true
         }
 
+        if (firmwareInfo?.family == EcuFamily.MS2 && ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            val catalog = MsExtraIniTableDefinitions.fromIni(definition) ?: return false
+            msExtraIniCatalog = catalog
+            Logger.i(
+                TAG,
+                "✅ Layout MS1/Extra aplicado via .ini: VE=${formatPageId(catalog.veTable.page)}, " +
+                    "IGN=${formatPageId(catalog.ignitionTable.page)}"
+            )
+            return true
+        }
+
         if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
             val catalog = MegaSpeedIniTableDefinitions.fromIni(definition) ?: return false
             megaSpeedIniCatalog = catalog
@@ -767,6 +780,7 @@ class SpeeduinoClient(
         activeIniDefinition = null
         speeduinoIniCatalog = null
         megaSpeedIniCatalog = null
+        msExtraIniCatalog = null
         rusefiIniCatalog = null
         pendingRusefiVeTableReadback = null
         pendingRusefiIgnitionTableReadback = null
@@ -1587,7 +1601,20 @@ class SpeeduinoClient(
      */
     override suspend fun readVeTable(mapIndex: Int): VeTable {
         if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
-            throw UnsupportedOperationException("VE Table MS1/Extra ainda não mapeada nesta versão")
+            val catalog = msExtraIniCatalog
+                ?: throw UnsupportedOperationException(
+                    "VE Table MS1/Extra requer uma definição .ini carregada (Configurações > Definição .ini)"
+                )
+            val layout = catalog.veTable
+            val pageSize = ecuDefinition?.pageCatalog?.firstOrNull { it.id == layout.page }?.size ?: 189
+            Logger.d(TAG, "Lendo VE Table MS1/Extra via .ini (Page ${formatPageId(layout.page)}, $pageSize bytes)...")
+            val pageData = readPage(pageNum = layout.page, offset = 0, length = pageSize)
+            val loadType = if (layout.loadField.name.startsWith("tpsBins", ignoreCase = true)) {
+                VeTable.LoadType.TPS
+            } else {
+                VeTable.LoadType.MAP
+            }
+            return MsExtraIniTableDefinitions.decodeVeTable(layout, pageData, loadType)
         }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             return readMs2VeTable()
@@ -1643,7 +1670,20 @@ class SpeeduinoClient(
      */
     override suspend fun readIgnitionTable(mapIndex: Int): IgnitionTable {
         if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
-            throw UnsupportedOperationException("Ignition Table MS1/Extra ainda não mapeada nesta versão")
+            val catalog = msExtraIniCatalog
+                ?: throw UnsupportedOperationException(
+                    "Ignition Table MS1/Extra requer uma definição .ini carregada (Configurações > Definição .ini)"
+                )
+            val layout = catalog.ignitionTable
+            val pageSize = ecuDefinition?.pageCatalog?.firstOrNull { it.id == layout.page }?.size ?: 189
+            Logger.d(TAG, "Lendo Ignition Table MS1/Extra via .ini (Page ${formatPageId(layout.page)}, $pageSize bytes)...")
+            val pageData = readPage(pageNum = layout.page, offset = 0, length = pageSize)
+            val loadType = if (layout.loadField.name.startsWith("tpsBins", ignoreCase = true)) {
+                IgnitionTable.LoadType.TPS
+            } else {
+                IgnitionTable.LoadType.MAP
+            }
+            return MsExtraIniTableDefinitions.decodeIgnitionTable(layout, pageData, loadType)
         }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             return readMs2IgnitionTable()

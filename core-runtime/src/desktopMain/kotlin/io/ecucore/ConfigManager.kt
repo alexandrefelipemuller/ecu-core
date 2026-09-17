@@ -1,5 +1,8 @@
 package io.ecucore
 
+import io.ecucore.definition.IniDefinition
+import io.ecucore.definition.MsqCodec
+import io.ecucore.definition.PageFieldCodec
 import io.ecucore.model.AfrTable
 import io.ecucore.model.EcuFamily
 import io.ecucore.model.EngineConstants
@@ -253,6 +256,40 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
                 entry = zip.nextEntry
             }
         }
+
+        return sessionDir
+    }
+
+    /**
+     * Gera o XML MSQ (formato de tune do TunerStudio) a partir dos bytes de página já
+     * baixados, usando a definição .ini ativa da ECU conectada para nomear/escalar cada campo.
+     */
+    fun exportSessionToMsq(definition: IniDefinition, pageBytes: Map<Int, ByteArray>): String {
+        val decoded = PageFieldCodec.decodeAllPages(definition, pageBytes)
+        return MsqCodec.encode(
+            signature = definition.signature,
+            firmwareInfo = definition.sourceName,
+            pages = decoded,
+        )
+    }
+
+    /**
+     * Importa um tune MSQ, aplicando os valores nomeados sobre uma cópia de [basePages] (bytes
+     * de página já baixados da ECU, usados como base para campos que o MSQ não cobrir) e salva
+     * o resultado como uma nova sessão, pronta para ser restaurada como um backup normal.
+     */
+    fun importSessionFromMsq(
+        xmlText: String,
+        definition: IniDefinition,
+        basePages: Map<Int, ByteArray>,
+    ): File {
+        val doc = MsqCodec.decode(xmlText)
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val sessionDir = File(configDir, "${timestamp}_imported_msq").apply { mkdirs() }
+
+        val mutablePages = basePages.mapValues { (_, bytes) -> bytes.copyOf() }
+        PageFieldCodec.applyMsqDocument(definition, doc, mutablePages)
+        mutablePages.forEach { (page, bytes) -> File(sessionDir, "page_$page.bin").writeBytes(bytes) }
 
         return sessionDir
     }
