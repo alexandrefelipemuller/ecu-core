@@ -97,6 +97,34 @@ class SpeeduinoProtocol(
     @Volatile
     private var sessionFirmwareEra: FirmwareEra? = null
 
+    /**
+     * `true` depois que o firmware respondeu (processou) um comando com envelope nesta sessão.
+     *
+     * Speeduino 202201+ (speeduino/comms.cpp, serialReceive): ao processar UM frame com CRC válido
+     * o firmware faz `BIT_CLEAR(status4, BIT_STATUS4_ALLOW_LEGACY_COMMS)` - legacy fica travado até
+     * a ECU ser desligada. Daí em diante um 'p'/'W'/'B' cru vira os 2 bytes de tamanho de um
+     * envelope (0x70 0x00 = 28672) e a leitura de página só volta timeout: silêncio ou um frame de
+     * 7 bytes `00 01 80 <CRC32>` (SERIAL_RC_TIMEOUT).
+     *
+     * Achado de campo 2026-09 (Speeduino 202310 via Bluetooth e USB): o live data dessas eras já
+     * vai em envelope ('r' 0x30), então um download de páginas disparado com o dashboard rodando
+     * mandava 'p' cru pra uma ECU já travada -> "Timeout: expected 256 bytes, received 7" em todas
+     * as páginas. Em 202501+ não acontecia porque ali o config read já é moderno.
+     *
+     * Usado só por [sessionModernEnvelopeOverrideForConfigRead]: antes do lockout nada muda (o
+     * download inicial continua legacy, como validado em bench); depois dele legacy é garantido
+     * morto, então passar pro envelope não tem como piorar nada.
+     */
+    @Volatile
+    private var legacyCommsLockedOut = false
+
+    /** Nova sessão (desconexão): não dá pra saber se a ECU foi desligada, então volta ao default. */
+    fun resetLegacyCommsLockout() {
+        legacyCommsLockedOut = false
+    }
+
+    fun isLegacyCommsLockedOut(): Boolean = legacyCommsLockedOut
+
     fun setSessionLegacyPreferred(preferLegacy: Boolean) {
         sessionLegacyPreferred = preferLegacy
         legacyPageReadUnsupported = false
@@ -160,6 +188,9 @@ class SpeeduinoProtocol(
             // um comando que o firmware já removeu. Restrito a essa era exata para não repetir a
             // regressão de 2026-08-18 (USB) em eras 202201-202412, onde o legacy 'p' ainda existe
             // e funciona, e o modern trava a ECU.
+            // Também depois do lockout de legacy (ver [legacyCommsLockedOut]): o firmware já
+            // não aceita mais 'p'/'W'/'B' cru até ser desligado, então só o envelope funciona.
+            if (legacyCommsLockedOut && sessionModernEnvelope == true) return true
             return if (sessionFirmwareEra == FirmwareEra.MODERN_2025) sessionModernEnvelope else null
         }
         return sessionModernEnvelope
@@ -1187,7 +1218,21 @@ class SpeeduinoProtocol(
         val packet = lengthBytes + payload + crcBytes
         connection.send(packet)
 
-        return readModernResponse(cmd, maxResponseSize)
+        return readModernResponse(cmd, maxResponseSize).also(::noteModernCommandProcessed)
+    }
+
+    /**
+     * Resposta em envelope = o firmware processou o frame (CRC ok) e travou legacy - exceto
+     * SERIAL_RC_CRC_ERR (frame rejeitado) e SERIAL_RC_TIMEOUT (frame incompleto), que o
+     * serialReceive devolve sem chegar no processSerialCommand/BIT_CLEAR.
+     */
+    private fun noteModernCommandProcessed(response: ByteArray) {
+        val rejected = response.size == 1 &&
+            (response[0] == SERIAL_RC_CRC_ERR || response[0] == SERIAL_RC_TIMEOUT)
+        if (response.isNotEmpty() && !rejected && !legacyCommsLockedOut) {
+            legacyCommsLockedOut = true
+            Logger.d("SpeeduinoProtocol", "Firmware processou comando em envelope: legacy travado até power cycle")
+        }
     }
 
     /**

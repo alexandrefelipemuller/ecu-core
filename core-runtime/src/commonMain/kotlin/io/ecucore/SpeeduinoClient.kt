@@ -767,6 +767,7 @@ class SpeeduinoClient(
         connection.disconnect()
         protocol.setSessionLegacyPreferred(false)
         protocol.setSessionModernEnvelope(null)
+        protocol.resetLegacyCommsLockout()
         protocol.setSessionFirmwareEra(null)
         protocol.setSessionEcuFamily(null)
         protocol.setSessionSchemaId(null)
