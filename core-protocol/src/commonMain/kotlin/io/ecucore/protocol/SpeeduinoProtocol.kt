@@ -238,6 +238,19 @@ class SpeeduinoProtocol(
             connection.supportsModernConfigReads()
     }
 
+    /**
+     * MS2/Extra, MegaSpeed e MS3 só leem/gravam/queimam config via 'r'/'w'/'b' em envelope - não
+     * existe 'p'/'M'/'W' cru nessas famílias -, então o gate de transporte legacy-first não tem
+     * alternativa a oferecer: bloquear só faz a operação falhar sem nada ir pro fio. Diferente do
+     * Speeduino, o firmware newserial delas aceita o envelope [length][payload][CRC32] em paralelo
+     * aos comandos legacy ('Q'/'S'/'A'), sem lockout de legacy depois - e o 1º byte do envelope
+     * (0x00, tamanho alto) não é comando legacy nenhum. Achado de campo 2026-09-21 (MS2/Extra
+     * 3.4.3 via Bluetooth): a ECU respondeu em envelope logo após o handshake legacy.
+     * `FORCE_LEGACY_PROTOCOL` continua valendo (checado em [sendModernCommand]).
+     */
+    private fun isMsNewserialFamily(family: EcuFamily): Boolean =
+        family == EcuFamily.MS2 || family == EcuFamily.MEGASPEED || family == EcuFamily.MS3
+
     private fun requireModernCommandSupport(operation: String, ignoreSessionLegacyPreferred: Boolean = false) {
         if (!canAttemptModernFallback(ignoreSessionLegacyPreferred)) {
             throw Exception("Modern protocol unavailable for $operation on this connection")
@@ -531,7 +544,10 @@ class SpeeduinoProtocol(
         allowPartial: Boolean = false,
         allowModernTransportFallback: Boolean = false,
     ): ByteArray {
-        if (allowModernTransportFallback) {
+        val bypassTransportGate = isMsNewserialFamily(family)
+        if (bypassTransportGate) {
+            // sem gate de transporte - ver isMsNewserialFamily()
+        } else if (allowModernTransportFallback) {
             if (!canAttemptModernConfigRead(ignoreSessionLegacyPreferred = true)) {
                 throw Exception("Modern config read unavailable for table read on this connection")
             }
@@ -563,7 +579,12 @@ class SpeeduinoProtocol(
                 payload[3] = (offset and 0xFF).toByte()
                 payload[4] = ((length shr 8) and 0xFF).toByte()
                 payload[5] = (length and 0xFF).toByte()
-                sendModernCommand('r'.code.toByte(), payload, allowConfigReadFallback = allowModernTransportFallback)
+                sendModernCommand(
+                    'r'.code.toByte(),
+                    payload,
+                    allowConfigReadFallback = allowModernTransportFallback,
+                    bypassTransportGate = bypassTransportGate,
+                )
             }
 
             if (response.isEmpty() || response[0] != SERIAL_RC_OK) {
@@ -1137,8 +1158,11 @@ class SpeeduinoProtocol(
         maxResponseSize: Int = 2048,
         ignoreSessionLegacyPreferred: Boolean = false,
         allowConfigReadFallback: Boolean = false,
+        bypassTransportGate: Boolean = false,
     ): ByteArray {
-        val modernAllowed = if (allowConfigReadFallback) {
+        val modernAllowed = if (bypassTransportGate) {
+            !FORCE_LEGACY_PROTOCOL
+        } else if (allowConfigReadFallback) {
             canAttemptModernConfigRead(ignoreSessionLegacyPreferred)
         } else {
             canAttemptModernFallback(ignoreSessionLegacyPreferred)
@@ -1430,7 +1454,10 @@ class SpeeduinoProtocol(
     }
 
     suspend fun writeTable(tableId: Int, offset: Int, data: ByteArray, family: EcuFamily) {
-        requireModernCommandSupport("table write", ignoreSessionLegacyPreferred = family == EcuFamily.RUSEFI)
+        val bypassTransportGate = isMsNewserialFamily(family)
+        if (!bypassTransportGate) {
+            requireModernCommandSupport("table write", ignoreSessionLegacyPreferred = family == EcuFamily.RUSEFI)
+        }
 
         val response = if (family == EcuFamily.RUSEFI) {
             val payload = ByteArray(6 + data.size)
@@ -1451,7 +1478,7 @@ class SpeeduinoProtocol(
             payload[4] = ((data.size shr 8) and 0xFF).toByte()
             payload[5] = (data.size and 0xFF).toByte()
             data.copyInto(payload, 6)
-            sendModernCommand('w'.code.toByte(), payload)
+            sendModernCommand('w'.code.toByte(), payload, bypassTransportGate = bypassTransportGate)
         }
 
         if (response.isEmpty() || response[0] != SERIAL_RC_OK) {
@@ -1478,7 +1505,10 @@ class SpeeduinoProtocol(
     }
 
     suspend fun burnTable(tableId: Int, family: EcuFamily) {
-        requireModernCommandSupport("table burn", ignoreSessionLegacyPreferred = family == EcuFamily.RUSEFI)
+        val bypassTransportGate = isMsNewserialFamily(family)
+        if (!bypassTransportGate) {
+            requireModernCommandSupport("table burn", ignoreSessionLegacyPreferred = family == EcuFamily.RUSEFI)
+        }
 
         val response = if (family == EcuFamily.RUSEFI) {
             val payload = byteArrayOf(
@@ -1488,7 +1518,7 @@ class SpeeduinoProtocol(
             sendModernCommand('B'.code.toByte(), payload, ignoreSessionLegacyPreferred = true)
         } else {
             val payload = byteArrayOf(0x00, (tableId and 0xFF).toByte())
-            sendModernCommand('b'.code.toByte(), payload)
+            sendModernCommand('b'.code.toByte(), payload, bypassTransportGate = bypassTransportGate)
         }
         if (response.isEmpty()) {
             throw Exception("Burn da tabela ${formatPageId(tableId)} sem resposta")

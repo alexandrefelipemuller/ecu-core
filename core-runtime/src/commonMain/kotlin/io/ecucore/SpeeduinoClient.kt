@@ -1064,18 +1064,16 @@ class SpeeduinoClient(
 
     private fun resolveConfigReadMode(family: EcuFamily): EcuConfigReadMode {
         val baseMode = ecuDefinition?.runtime?.configReadMode ?: EcuConfigReadMode.MODERN_TABLE
-        // MS2/MEGASPEED/MS3 sempre reportam usesModernEnvelope()=false (só Speeduino
-        // 202201+/rusEFI usam envelope moderno de verdade - ver FirmwareEra.usesModernEnvelope()),
-        // então esta mesma guarda vale pra elas sem o risco documentado abaixo pro Speeduino:
-        // nenhuma dessas famílias tem um firmware que trate o envelope [length][payload][CRC32]
-        // como obrigatório. Sem isso, Ms2DefinitionProvider/MegaSpeedDefinitionProvider (que não
-        // fixam configReadMode, herdando o default MODERN_TABLE) mandam protocol.readTable() com
-        // CRC32 em transportes legacy-first (USB/BT) pra firmwares MS2/Extra clássicos que nunca
-        // respondem a esse envelope - visto em bench: readTable trava em silêncio total (nenhum
-        // rx) enquanto o handshake legacy 'Q'/'S' funciona normal, e o download de config nunca
-        // libera a leitura pra iniciar o live data (watchdog live_data_never_started).
+        // Só Speeduino: o LEGACY_PAGE manda o 'p' cru, que é comando exclusivo do firmware
+        // Speeduino. MS2/Extra, MegaSpeed e MS3 não têm 'p' - a leitura delas é 'r' (table read),
+        // e em firmware newserial (ex.: "MS2Extra comms342h2") um 'p' cru é lido como o 1º byte
+        // do tamanho de um envelope: 0x7000 bytes -> a ECU responde envelope com 0x84 (out of
+        // range) e a página nunca baixa. Achado de campo 2026-09-21 via Bluetooth (MS2/Extra
+        // 3.4.3): tx `70 00 04 00 00 00 01`, rx `00 01 84 <CRC32>`, download travado e watchdog
+        // live_data_never_started. Essas famílias ficam no MODERN_TABLE -> protocol.readTable()
+        // mesmo em USB/BT (ver comentário lá sobre o gate de transporte).
         if (
-            family in setOf(EcuFamily.SPEEDUINO, EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3) &&
+            family == EcuFamily.SPEEDUINO &&
             baseMode == EcuConfigReadMode.MODERN_TABLE &&
             !connection.supportsModernConfigReads() &&
             // Rebaixar para legacy por causa do transporte quebra firmware 202201+: a ECU lê os
