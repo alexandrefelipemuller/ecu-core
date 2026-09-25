@@ -65,6 +65,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import io.ecucore.shared.MonotonicClock
+import io.ecucore.shared.WallClock
 import io.ecucore.shared.formatDecimal
 import io.ecucore.shared.toHex02
 
@@ -887,7 +888,7 @@ class SpeeduinoClient(
         // Cache-through persistente: serve páginas frescas do disco sem tocar na ECU.
         val cacheIdentity = cacheIdentity()
         if (cacheIdentity != null) {
-            pageCache.read(cacheIdentity, pageNum, offset, length, MonotonicClock.nowMillis(), pageCacheTtlMs)
+            pageCache.read(cacheIdentity, pageNum, offset, length, WallClock.nowEpochMillis(), pageCacheTtlMs)
                 ?.let { cached ->
                     Logger.d(TAG, "Cache hit página ${formatPageId(pageNum)} offset=$offset length=$length")
                     return cached
@@ -907,7 +908,7 @@ class SpeeduinoClient(
         }
 
         if (cacheIdentity != null && result.size == length) {
-            pageCache.store(cacheIdentity, pageNum, offset, length, result, MonotonicClock.nowMillis())
+            pageCache.store(cacheIdentity, pageNum, offset, length, result, WallClock.nowEpochMillis())
         }
         return result
     }
