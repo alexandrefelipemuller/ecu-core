@@ -33,7 +33,7 @@ object MsqCodec {
         signature: String,
         firmwareInfo: String?,
         pages: List<Pair<Int, List<DecodedField>>>,
-        author: String = "SpeeduinoManager",
+        author: String = "Thrace",
     ): String {
         val sb = StringBuilder()
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")

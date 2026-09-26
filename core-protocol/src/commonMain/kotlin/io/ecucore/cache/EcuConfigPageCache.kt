@@ -14,7 +14,8 @@ package io.ecucore.cache
 interface EcuConfigPageCache {
     /**
      * Retorna os bytes em cache para a entrada `(pageNum, offset, length)` se existirem e estiverem
-     * frescos (`nowMs - fetchedAt < ttlMs`); caso contrário `null`.
+     * frescos (`0 <= nowMs - fetchedAt < ttlMs`); caso contrário `null`. `nowMs` é epoch ms
+     * (relógio de parede): o timestamp é persistido e comparado entre execuções do app.
      */
     fun read(identity: String, pageNum: Int, offset: Int, length: Int, nowMs: Long, ttlMs: Long): ByteArray?
 

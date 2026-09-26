@@ -33,6 +33,8 @@ class SpeeduinoProtocol(
         // e TCP/Wi-Fi precisa de modern protocol (simulador e firmwares novos).
         private const val FORCE_LEGACY_PROTOCOL = false
         private const val VERBOSE_MODERN_FRAME_LOGS = false
+        private const val PAGE_READ_CRC_MAX_ATTEMPTS = 3
+        private const val PAGE_READ_CRC_RETRY_DELAY_MS = 40L
 
         // Response codes
         const val SERIAL_RC_OK = 0x00.toByte()
@@ -500,6 +502,28 @@ class SpeeduinoProtocol(
         length: Int,
         allowConfigReadFallback: Boolean = false,
     ): ByteArray {
+        var attempt = 0
+        while (true) {
+            try {
+                return readPageModernOnce(pageNum, offset, length, allowConfigReadFallback)
+            } catch (e: ModernCrcMismatchException) {
+                attempt++
+                if (attempt >= PAGE_READ_CRC_MAX_ATTEMPTS) throw e
+                Logger.w(
+                    "SpeeduinoProtocol",
+                    "readPage CRC mismatch page=${formatPageId(pageNum)} attempt=$attempt/$PAGE_READ_CRC_MAX_ATTEMPTS, repetindo: ${e.message}"
+                )
+                delay(PAGE_READ_CRC_RETRY_DELAY_MS)
+            }
+        }
+    }
+
+    private fun readPageModernOnce(
+        pageNum: Byte,
+        offset: Int,
+        length: Int,
+        allowConfigReadFallback: Boolean,
+    ): ByteArray {
         val pageLabel = formatPageId(pageNum)
         val ecuFamily = sessionEcuFamily
         val useTableEnvelope = ecuFamily == EcuFamily.MS2 || ecuFamily == EcuFamily.MEGASPEED || ecuFamily == EcuFamily.MS3
@@ -520,6 +544,7 @@ class SpeeduinoProtocol(
                 payload,
                 ignoreSessionLegacyPreferred = allowConfigReadFallback,
                 allowConfigReadFallback = allowConfigReadFallback,
+                strictCrc = true,
             )
         } else {
             val payload = ByteArray(6)
@@ -542,6 +567,7 @@ class SpeeduinoProtocol(
                 payload,
                 ignoreSessionLegacyPreferred = allowConfigReadFallback,
                 allowConfigReadFallback = allowConfigReadFallback,
+                strictCrc = true,
             )
         }
 
@@ -1190,6 +1216,7 @@ class SpeeduinoProtocol(
         ignoreSessionLegacyPreferred: Boolean = false,
         allowConfigReadFallback: Boolean = false,
         bypassTransportGate: Boolean = false,
+        strictCrc: Boolean = false,
     ): ByteArray {
         val modernAllowed = if (bypassTransportGate) {
             !FORCE_LEGACY_PROTOCOL
@@ -1218,7 +1245,15 @@ class SpeeduinoProtocol(
         val packet = lengthBytes + payload + crcBytes
         connection.send(packet)
 
-        return readModernResponse(cmd, maxResponseSize).also(::noteModernCommandProcessed)
+        val response = try {
+            readModernResponse(cmd, maxResponseSize, strictCrc)
+        } catch (e: ModernCrcMismatchException) {
+            // O frame chegou inteiro: o firmware processou o comando (e travou legacy) mesmo que
+            // os bytes tenham corrompido no caminho de volta.
+            noteModernCommandProcessed(e.payload)
+            throw e
+        }
+        return response.also(::noteModernCommandProcessed)
     }
 
     /**
@@ -1238,7 +1273,7 @@ class SpeeduinoProtocol(
     /**
      * Lê resposta modern (length + payload + crc32)
      */
-    private fun readModernResponse(cmd: Byte, maxResponseSize: Int = 2048): ByteArray {
+    private fun readModernResponse(cmd: Byte, maxResponseSize: Int = 2048, strictCrc: Boolean = false): ByteArray {
         // Read length (2 bytes, big-endian)
         val lengthBytes = try {
             readExactly(2, "modern length cmd=0x${cmd.toInt().and(0xFF).toString(16)}")
@@ -1303,6 +1338,12 @@ class SpeeduinoProtocol(
 
         // ⚠️ IMPORTANTE: Ignorar validação se CRC = 0 (Speeduino não envia CRC em alguns comandos)
         if (receivedCrc != 0L && receivedCrc != calculatedCrc) {
+            if (strictCrc) {
+                // Leitura de config: um byte trocado no caminho vira uma célula absurda na tabela
+                // (e vai pro cache persistente de páginas). Descarta e deixa o chamador repetir.
+                connection.clearInputBuffer()
+                throw ModernCrcMismatchException(cmd, receivedCrc, calculatedCrc, payload)
+            }
             Logger.w("SpeeduinoProtocol", "CRC mismatch, mas continuando (received=0x${receivedCrc.toString(16)}, calculated=0x${calculatedCrc.toString(16)})")
             // throw Exception("CRC error: received=0x${receivedCrc.toString(16)}, calculated=0x${calculatedCrc.toString(16)}")
         }
@@ -1399,6 +1440,16 @@ class SpeeduinoProtocol(
         private val cmd: Byte
     ) : Exception(
         "Incomplete modern response ($stage) for cmd=0x${cmd.toInt().and(0xFF).toString(16)}: expected $expected bytes, received $received"
+    )
+
+    class ModernCrcMismatchException(
+        cmd: Byte,
+        receivedCrc: Long,
+        calculatedCrc: Long,
+        val payload: ByteArray,
+    ) : Exception(
+        "Modern response CRC mismatch for cmd=0x${cmd.toInt().and(0xFF).toString(16)}: " +
+            "received=0x${receivedCrc.toString(16)}, calculated=0x${calculatedCrc.toString(16)}"
     )
 
     class ModernResponseReadException(
