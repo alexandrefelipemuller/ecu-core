@@ -1,5 +1,7 @@
 package io.ecucore.transport
 
+import io.ecucore.model.Ms3GenericSensorConfig
+import io.ecucore.model.Ms3GenericSensorsSnapshot
 import io.ecucore.definition.IniDefinition
 import io.ecucore.ecu.FirmwareInfo
 import io.ecucore.model.AfrTable
@@ -215,6 +217,11 @@ class PromotingObd2Transport(
 
     override suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean) =
         selected().writeTpsCalibration(calibration, burn)
+
+    override suspend fun readMs3GenericSensors(): Ms3GenericSensorsSnapshot = selected().readMs3GenericSensors()
+
+    override suspend fun writeMs3GenericSensor(config: Ms3GenericSensorConfig, burn: Boolean) =
+        selected().writeMs3GenericSensor(config, burn)
 
     override suspend fun readSecondarySerialConfig(): SecondarySerialConfig =
         selected().readSecondarySerialConfig()

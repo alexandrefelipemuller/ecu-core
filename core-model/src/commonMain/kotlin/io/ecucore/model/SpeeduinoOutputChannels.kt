@@ -131,6 +131,72 @@ object SpeeduinoOutputChannels {
         OutputField("oil", 212, DataType.S16, scale = 0.1, units = "bar", byteOrder = EcuByteOrder.BIG_ENDIAN),
     )
 
+    /**
+     * MS3 (ochBlockSize 509 no 0523, 512 no 0592+/MS3Pro; o app lê 509). O começo do outpc é
+     * igual ao da MS2, mas vários campos mudaram de lugar - tpsADC em especial (226 aqui, 86 na
+     * MS2). Antes deste layout existir, getDefinition(509) caía no da MegaSpeed/MS2 e o
+     * calibrador de TPS leria o offset errado. Offsets conferidos em megasquirt3.ini (0523),
+     * ms3.ini (0592) e ms3pro*.ini (0601).
+     */
+    val MS3_509_FIELDS: List<OutputField> = listOf(
+        OutputField("secl", 0, DataType.U16, byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("rpm", 6, DataType.U16, units = "rpm", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("advance", 8, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("squirt", 10, DataType.U08, units = "bits"),
+        OutputField("engine", 11, DataType.U08, units = "bits"),
+        OutputField("baro", 16, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("map", 18, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("tps", 24, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("batteryVoltage", 26, DataType.S16, scale = 0.1, units = "V", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("afr", 28, DataType.S16, scale = 0.1, units = "AFR", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("afr2", 30, DataType.S16, scale = 0.1, units = "AFR", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("egoCorrection1", 34, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("egoCorrection2", 36, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("warmupEnrich", 40, DataType.S16, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("accelEnrich", 42, DataType.S16, scale = 0.1, units = "ms", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("baroCorrection", 46, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("veCurr1", 50, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("iacstep", 54, DataType.S16, byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("dwell", 62, DataType.U16, scale = 0.1, units = "ms", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("mafload", 64, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("knockRetard", 71, DataType.U08, scale = 0.1, units = "deg"),
+        OutputField("egoV", 74, DataType.S16, scale = 0.01, units = "V", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("egoV2", 76, DataType.S16, scale = 0.01, units = "V", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("status1", 78, DataType.U08),
+        OutputField("status2", 79, DataType.U08),
+        OutputField("status3", 80, DataType.U08),
+        OutputField("status4", 81, DataType.U08),
+        OutputField("synccnt", 94, DataType.U08),
+        OutputField("boostduty", 139, DataType.U08, units = "%"),
+        OutputField("tpsADC", 226, DataType.U16, byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("looptime", 424, DataType.U16, units = "us", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("adv1", 464, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("adv2", 466, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("adv3", 468, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
+    ) + (1..Ms3GenericSensors.SENSOR_COUNT).map { Ms3GenericSensors.liveField(it) }
+
+    /**
+     * Campos com nome de papel ("oilPressure", "fuelPressure", ...) definidos pelo usuário no app
+     * - a ECU não sabe o que está ligado em cada entrada. MS3: aponta pra um Generic Sensor
+     * (sensorNN). MS2: converte o ADC cru (adc6/adc7/gpioadcN) com a curva do sensor, como o
+     * TunerStudio faz no PC. Valem só para os block sizes da família e não são limpos por
+     * [clearAllRuntimeDefinitions]: são configuração do usuário, não do firmware conectado.
+     */
+    @kotlin.concurrent.Volatile
+    private var roleAliases: Map<EcuFamily, List<OutputField>> = emptyMap()
+
+    fun setSensorRoleAliases(family: EcuFamily, aliases: List<OutputField>) {
+        roleAliases = roleAliases + (family to aliases.toList())
+    }
+
+    private fun withRoleAliases(family: EcuFamily, fields: List<OutputField>): List<OutputField> {
+        val aliases = roleAliases[family].orEmpty()
+        // Alias vem antes: getField() pega o primeiro com o nome.
+        return if (aliases.isEmpty()) fields else aliases + fields
+    }
+
+    fun isMs3BlockSize(blockSize: Int): Boolean = blockSize in 509..512
+
     val MEGASPEED_219_FIELDS = MS2_212_FIELDS + listOf(
         OutputField("fuel", 214, DataType.S16, scale = 0.1, units = "bar", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("runsecs", 216, DataType.U16, units = "s", byteOrder = EcuByteOrder.BIG_ENDIAN),
@@ -430,6 +496,11 @@ object SpeeduinoOutputChannels {
             return it
         }
         return when {
+            isMs3BlockSize(blockSize) -> {
+                logDefinitionSelectionOnce("ms3:$blockSize", "Using MS3 output channels ($blockSize bytes)")
+                withRoleAliases(EcuFamily.MS3, MS3_509_FIELDS)
+            }
+
             blockSize == 2068 -> {
                 logDefinitionSelectionOnce("rusefi-f407:$blockSize", "Using rusEFI f407-discovery output channels ($blockSize bytes)")
                 RUSEFI_2068_FIELDS
@@ -447,7 +518,7 @@ object SpeeduinoOutputChannels {
 
             blockSize >= 212 -> {
                 logDefinitionSelectionOnce("ms2:$blockSize", "Using MS2 output channels ($blockSize bytes)")
-                MS2_212_FIELDS
+                withRoleAliases(EcuFamily.MS2, MS2_212_FIELDS)
             }
 
             // Modern 2024-2025 (127-130 bytes)
@@ -496,7 +567,7 @@ object SpeeduinoOutputChannels {
      */
     fun getCatalog(): List<OutputField> {
         val byName = LinkedHashMap<String, OutputField>()
-        val definitions = runtimeDefinitions.values.toList() + listOf(RUSEFI_2084_FIELDS, RUSEFI_2068_FIELDS, MEGASPEED_219_FIELDS, MS2_212_FIELDS, MODERN_2024_FIELDS, MODERN_2020_FIELDS, LEGACY_FIELDS)
+        val definitions = runtimeDefinitions.values.toList() + listOf(RUSEFI_2084_FIELDS, RUSEFI_2068_FIELDS, MEGASPEED_219_FIELDS, MS2_212_FIELDS, MODERN_2024_FIELDS, MODERN_2020_FIELDS, LEGACY_FIELDS, MS3_509_FIELDS)
         definitions.forEach { fields ->
             fields.forEach { field ->
                 if (!byName.containsKey(field.name)) {

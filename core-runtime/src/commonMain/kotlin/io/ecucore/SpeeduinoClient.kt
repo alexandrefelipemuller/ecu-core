@@ -2,6 +2,9 @@ package io.ecucore
 
 import kotlin.concurrent.Volatile
 
+import io.ecucore.model.Ms3GenericSensors
+import io.ecucore.model.Ms3GenericSensorConfig
+import io.ecucore.model.Ms3GenericSensorsSnapshot
 import io.ecucore.definition.IniDefinition
 import io.ecucore.definition.IniFieldKind
 import io.ecucore.ecu.FirmwareConsensus
@@ -1295,6 +1298,62 @@ class SpeeduinoClient(
             delay(300)
             protocol.burnConfig()
         }
+    }
+
+    /**
+     * Lê os 16 Generic Sensor Inputs da MS3 (tabela 0x05). Ver [Ms3GenericSensors].
+     */
+    override suspend fun readMs3GenericSensors(): Ms3GenericSensorsSnapshot = withContext(Dispatchers.IO) {
+        val signature = requireMs3Signature("readMs3GenericSensors")
+        val generation = Ms3GenericSensors.generationFor(signature)
+        val page = readFullPage(
+            pageNum = Ms3GenericSensors.TABLE_ID,
+            pageSize = Ms3GenericSensors.PAGE_SIZE,
+            blockSize = 256,
+        )
+        Ms3GenericSensorsSnapshot(
+            generation = generation,
+            boardInputs = Ms3GenericSensors.boardInputs(signature),
+            sensors = Ms3GenericSensors.parse(page, generation),
+        )
+    }
+
+    /**
+     * Grava um slot de Generic Sensor da MS3 (read-modify-write da tabela 0x05) + burn.
+     *
+     * Só o trecho dos campos de sensores genéricos (662..773) vai pro fio - o resto da página
+     * (idle, flex, ...) nunca é reenviado, então um byte lido errado ali não tem como ser gravado.
+     */
+    override suspend fun writeMs3GenericSensor(config: Ms3GenericSensorConfig, burn: Boolean) = withContext(Dispatchers.IO) {
+        ensureWritable("writeMs3GenericSensor")
+        val signature = requireMs3Signature("writeMs3GenericSensor")
+        val generation = Ms3GenericSensors.generationFor(signature)
+        val basePage = readFullPage(
+            pageNum = Ms3GenericSensors.TABLE_ID,
+            pageSize = Ms3GenericSensors.PAGE_SIZE,
+            blockSize = 256,
+        )
+        val updated = Ms3GenericSensors.apply(basePage, config, generation)
+        val span = Ms3GenericSensors.CONFIG_SPAN
+        protocol.writeTable(
+            tableId = Ms3GenericSensors.TABLE_ID,
+            offset = span.first,
+            data = updated.copyOfRange(span.first, span.last + 1),
+            family = EcuFamily.MS3,
+        )
+        if (burn) {
+            delay(300)
+            protocol.burnTable(Ms3GenericSensors.TABLE_ID, EcuFamily.MS3)
+        }
+        Logger.d(TAG, "Sensor genérico MS3 #${config.index} gravado (source=${config.source} trans=${config.transform})")
+    }
+
+    private fun requireMs3Signature(operation: String): String {
+        val info = firmwareInfo ?: throw IllegalStateException("$operation: ECU não conectada")
+        if (info.family != EcuFamily.MS3) {
+            throw UnsupportedOperationException("$operation: disponível apenas para MS3 (conectado: ${info.family})")
+        }
+        return info.signature
     }
 
     /**

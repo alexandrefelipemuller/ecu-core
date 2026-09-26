@@ -1,5 +1,7 @@
 package io.ecucore.transport
 
+import io.ecucore.model.Ms3GenericSensorConfig
+import io.ecucore.model.Ms3GenericSensorsSnapshot
 import io.ecucore.SpeeduinoLiveData
 import io.ecucore.definition.IniDefinition
 import io.ecucore.ecu.FirmwareInfo
@@ -144,6 +146,12 @@ interface EcuTransport {
 
     suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean = true): Unit =
         throw UnsupportedOperationException("TPS calibration write not supported by this transport")
+
+    suspend fun readMs3GenericSensors(): Ms3GenericSensorsSnapshot =
+        throw UnsupportedOperationException("MS3 generic sensors not supported by this transport")
+
+    suspend fun writeMs3GenericSensor(config: Ms3GenericSensorConfig, burn: Boolean = true): Unit =
+        throw UnsupportedOperationException("MS3 generic sensor write not supported by this transport")
 
     suspend fun readSecondarySerialConfig(): SecondarySerialConfig =
         throw UnsupportedOperationException("Secondary serial config not supported by this transport")
