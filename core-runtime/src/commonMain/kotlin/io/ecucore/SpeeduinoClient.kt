@@ -110,6 +110,17 @@ class SpeeduinoClient(
         // intervalo alvo o ticker realinha o relógio e emite o comando seguinte colado no
         // anterior — num link Bluetooth lento isso vira uma rajada contínua sobre a ECU.
         private const val LIVE_STREAM_MIN_COMMAND_GAP_MS = 25L
+        // Após um SERIAL_RC_CRC_ERR (0x82) a ECU ainda pode ter restos do frame corrompido no
+        // buffer serial dela; um novo comando enviado logo em seguida é concatenado a esse lixo
+        // e volta 0x82 de novo (ou 0x80 quando o "comprimento" lido do lixo nunca completa).
+        // Esperar mais que o timeout de recepção serial do firmware (~400ms) deixa a ECU
+        // descartar o frame parcial e voltar a aceitar comandos alinhados.
+        private const val LIVE_DATA_DESYNC_RESYNC_DELAY_MS = 450L
+        // Marcador estável na mensagem de erro quando o stream desiste por dessincronização
+        // persistente num link que já estava funcionando. Usado pelo app para classificar a
+        // falha como condição de link (ruído/perda de bytes), não como defeito de protocolo.
+        const val LIVE_DATA_LINK_DESYNC_MARKER = "link_desync"
+        private const val LIVE_DATA_CRC_ERR_RESPONSE = "response code = 0x82"
         private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
         private const val CONFIG_CHUNK_READ_RETRY_DELAY_MS = 40L
         private const val RUSEFI_CONFIG_READ_CHUNK_SIZE = 64
@@ -2836,7 +2847,7 @@ class SpeeduinoClient(
                         Logger.w(TAG, "Modern fallback falhou (tentativa $attempt/$maxAttempts): ${modernError.message}")
                         if (attempt < maxAttempts) {
                             connection.clearInputBuffer()
-                            delay(25)
+                            delay(liveDataRetryDelayMs(modernError))
                         }
                     }
                 }
@@ -2870,7 +2881,7 @@ class SpeeduinoClient(
                     Logger.w(TAG, "Modern Protocol falhou (tentativa $attempt/$maxAttempts): ${e.message}")
                     connection.clearInputBuffer()
                     if (attempt < maxAttempts) {
-                        delay(25)
+                        delay(liveDataRetryDelayMs(e))
                     }
                 }
             }
@@ -3001,30 +3012,32 @@ class SpeeduinoClient(
                     // Isso não é erro de protocolo/transporte.
                     break
                 } catch (e: Exception) {
+                    val isLinkDesync = isLiveDataLinkDesync(e)
                     val isRecoverableLiveTimeout =
                         _isStreaming &&
                             connection.isConnected() &&
-                            isRecoverableLiveDataTimeout(e)
+                            (isRecoverableLiveDataTimeout(e) || isLinkDesync)
                     if (isRecoverableLiveTimeout) {
                         recoverableReadTimeouts++
+                        val kind = if (isLinkDesync) "recoverable_desync" else "recoverable_timeout"
                         ConnectionTrace.info(
                             "live_data",
-                            "recoverable_timeout attempt=$recoverableReadTimeouts message=${e.message ?: "unknown"}"
+                            "$kind attempt=$recoverableReadTimeouts message=${e.message ?: "unknown"}"
                         )
                         Logger.w(
                             TAG,
-                            "Timeout parcial no stream (${recoverableReadTimeouts}/${LIVE_STREAM_RECOVERABLE_TIMEOUT_LIMIT}): ${e.message}"
+                            "Falha recuperável no stream ($kind ${recoverableReadTimeouts}/${LIVE_STREAM_RECOVERABLE_TIMEOUT_LIMIT}): ${e.message}"
                         )
                         connection.clearInputBuffer()
 
                         if (recoverableReadTimeouts < LIVE_STREAM_RECOVERABLE_TIMEOUT_LIMIT) {
-                            delay(intervalMs.coerceAtLeast(25L))
+                            delay(maxOf(intervalMs.coerceAtLeast(25L), liveDataRetryDelayMs(e)))
                             continue
                         }
 
                         Logger.e(
                             TAG,
-                            "Falha no stream após $recoverableReadTimeouts timeouts parciais consecutivos"
+                            "Falha no stream após $recoverableReadTimeouts falhas recuperáveis consecutivas"
                         )
                     }
 
@@ -3037,11 +3050,24 @@ class SpeeduinoClient(
                                 e
                             )
                         }
-                        onError("Erro no stream: ${e.message}")
+                        // Dessincronização persistente depois que o mesmo comando já tinha sido
+                        // aceito neste stream = link ruidoso (bytes perdidos/corrompidos no BT/serial),
+                        // não CRC calculado errado pelo app. Sem nenhum pacote válido, mantém a
+                        // mensagem crua: aí 0x82 pode ser defeito real de framing e deve ser reportado.
+                        val linkDesyncAfterHealthyStream = isLinkDesync && packetCount > 0
+                        val streamErrorMessage = if (linkDesyncAfterHealthyStream) {
+                            buildLinkDesyncStreamErrorMessage(recoverableReadTimeouts, e)
+                        } else {
+                            "Erro no stream: ${e.message}"
+                        }
+                        onError(streamErrorMessage)
 
                         if (!connection.isConnected()) {
                             Logger.w(TAG, "🔴 Conexão perdida detectada durante stream")
-                        } else if (shouldDisconnectAfterStreamFailure(e)) {
+                        } else if (
+                            (linkDesyncAfterHealthyStream && !liveDataStreamStopRequested) ||
+                                shouldDisconnectAfterStreamFailure(e)
+                        ) {
                             Logger.w(
                                 TAG,
                                 "🔴 Stream falhou com socket ainda marcado como conectado; forçando disconnect"
@@ -3089,6 +3115,22 @@ class SpeeduinoClient(
         val received = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return false
         return received >= 0
     }
+
+    /**
+     * response code 0x82 = SERIAL_RC_CRC_ERR: a ECU recebeu um frame cujo CRC não bate. O frame
+     * que o app envia é sempre byte-a-byte o mesmo (e é aceito nos ciclos vizinhos), então isso
+     * indica bytes perdidos/corrompidos no caminho ou restos de um frame anterior no buffer da
+     * ECU - condição de link, recuperável esperando a ECU descartar o frame parcial.
+     */
+    internal fun isLiveDataLinkDesync(error: Exception): Boolean =
+        error.message?.contains(LIVE_DATA_CRC_ERR_RESPONSE, ignoreCase = true) == true
+
+    internal fun liveDataRetryDelayMs(error: Exception): Long =
+        if (isLiveDataLinkDesync(error)) LIVE_DATA_DESYNC_RESYNC_DELAY_MS else 25L
+
+    internal fun buildLinkDesyncStreamErrorMessage(attempts: Int, error: Exception): String =
+        "Erro no stream: comunicação instável com a ECU, dados corrompidos no link " +
+            "($LIVE_DATA_LINK_DESYNC_MARKER attempts=$attempts: ${error.message}); reconectando"
 
     private fun shouldDisconnectAfterStreamFailure(error: Exception): Boolean {
         if (!connection.isConnected() || liveDataStreamStopRequested) {

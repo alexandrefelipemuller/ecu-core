@@ -2,6 +2,7 @@ package io.ecucore
 
 import io.ecucore.connection.ISpeeduinoConnection
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -46,6 +47,36 @@ class SpeeduinoClientLiveDataErrorClassificationTest {
                 Exception("Erro ao ler live data modern: response code = 0x80")
             )
         )
+    }
+
+    @Test
+    fun `SERIAL_RC_CRC_ERR response code 0x82 is a link desync with longer resync delay`() {
+        // Trace real (Speeduino 202501 via HC-05): o mesmo frame 'r' é aceito, depois volta 0x82
+        // duas vezes em sequência e em seguida 0x80. O retry de 25ms caía no mesmo lixo do buffer
+        // da ECU; é preciso esperar ela descartar o frame parcial.
+        val crcErr = Exception("Erro ao ler live data modern: response code = 0x82")
+        assertTrue(client.isLiveDataLinkDesync(crcErr))
+        assertFalse(client.isRecoverableLiveDataTimeout(crcErr))
+        assertTrue(client.liveDataRetryDelayMs(crcErr) > 400L)
+        assertEquals(25L, client.liveDataRetryDelayMs(Exception("Timeout: no data received")))
+    }
+
+    @Test
+    fun `other response codes are not treated as link desync`() {
+        assertFalse(client.isLiveDataLinkDesync(Exception("Erro ao ler live data modern: response code = 0x80")))
+        assertFalse(client.isLiveDataLinkDesync(Exception("Erro ao ler live data modern: response code = 0x83")))
+        assertFalse(client.isLiveDataLinkDesync(Exception("Erro ao ler live data modern: response code = 0x84")))
+    }
+
+    @Test
+    fun `link desync stream error message carries stable marker and original detail`() {
+        val message = client.buildLinkDesyncStreamErrorMessage(
+            attempts = 3,
+            error = Exception("Erro ao ler live data modern: response code = 0x82"),
+        )
+        assertTrue(message.startsWith("Erro no stream: "))
+        assertTrue(SpeeduinoClient.LIVE_DATA_LINK_DESYNC_MARKER in message)
+        assertTrue("response code = 0x82" in message)
     }
 
     @Test
