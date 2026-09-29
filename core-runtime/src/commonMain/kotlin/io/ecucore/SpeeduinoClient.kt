@@ -169,6 +169,14 @@ class SpeeduinoClient(
     private var pendingRusefiVeTableReadback: VeTable? = null
     private var pendingRusefiIgnitionTableReadback: IgnitionTable? = null
     private val pendingSpeeduinoPageReadbacks = mutableMapOf<Int, ByteArray>()
+
+    /**
+     * Recebe [PageWriteAnomaly] quando o read-back de uma tabela diverge ou a escrita falha -
+     * inclusive quando a regravação corrige. É o único sinal de corrupção que de outra forma
+     * seria silenciosa; o app deve mandar isso pra telemetria.
+     */
+    @Volatile
+    var pageWriteAnomalyListener: ((PageWriteAnomaly) -> Unit)? = null
     private var lastDisconnectWasRusefi: Boolean = false
     private var lastDisconnectAtMs: Long = 0L
     private var cachedEngineConstants: EngineConstants? = null
@@ -1972,7 +1980,14 @@ class SpeeduinoClient(
         Logger.d(TAG, "Pagina ${formatPageId(pageNum)} gravada em chunks sem burn")
     }
 
-    private suspend fun writePageChunksWithRetry(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) {
+    /** @return erros de chunks que falharam mas foram recuperados por retry (vazio = limpo). */
+    private suspend fun writePageChunksWithRetry(
+        pageNum: Int,
+        data: ByteArray,
+        chunkSize: Int,
+        startOffset: Int,
+    ): List<Exception> {
+        val recoveredErrors = mutableListOf<Exception>()
         var offset = startOffset
         val end0 = startOffset + data.size
         var chunkIndex = 0
@@ -1991,6 +2006,7 @@ class SpeeduinoClient(
                     throw e
                 } catch (e: Exception) {
                     if (attempt >= TABLE_WRITE_CHUNK_MAX_ATTEMPTS) throw e
+                    recoveredErrors += e
                     Logger.w(TAG, "Chunk #$chunkIndex da pagina ${formatPageId(pageNum)} falhou (tentativa $attempt): ${e.message}; retentando")
                     runCatching { connection.abortPendingRead() }
                     delay(pageWriteRetryDelayMs(e, attempt))
@@ -2002,6 +2018,7 @@ class SpeeduinoClient(
                 delay(60)
             }
         }
+        return recoveredErrors
     }
 
     /**
@@ -2025,16 +2042,30 @@ class SpeeduinoClient(
     private suspend fun writeSpeeduinoTableVerified(pageNum: Int, offset: Int, data: ByteArray, label: String) {
         var mismatches: List<Int> = emptyList()
         var lastWriteError: Exception? = null
+        var retriedWriteError: Exception? = null
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        fun report(recovered: Boolean) = anomalies.forEach { anomaly ->
+            val event = anomaly.copy(recovered = recovered)
+            ConnectionTrace.info(
+                "page_write",
+                "anomaly page=${event.pageId} pass=${event.pass} mismatches=${event.mismatchedOffsets.size} recovered=$recovered"
+            )
+            runCatching { pageWriteAnomalyListener?.invoke(event) }
+        }
         for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
             try {
-                writePageChunksWithRetry(pageNum, data, TABLE_WRITE_CHUNK_SIZE, offset)
+                val retried = writePageChunksWithRetry(pageNum, data, TABLE_WRITE_CHUNK_SIZE, offset)
+                // Chunk rejeitado e recuperado no retry: o retry pode ter sobrescrito o lixo, mas
+                // 0x82 no link continua sendo sinal que precisa chegar na telemetria.
                 lastWriteError = null
+                retriedWriteError = retried.lastOrNull()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 // Mesmo com a escrita falhando, relê: a RAM da ECU pode ter sido alterada pelo
                 // lixo do frame rejeitado e o usuário precisa saber se ela diverge da tela.
                 lastWriteError = e
+                retriedWriteError = null
                 Logger.w(TAG, "$label: escrita falhou no passe $pass: ${e.message}")
             }
             delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
@@ -2044,13 +2075,30 @@ class SpeeduinoClient(
             val readBack = readPage(pageNum, offset, data.size)
             invalidateCachedPage(pageNum)
             mismatches = data.indices.filter { i -> i >= readBack.size || readBack[i] != data[i] }
+            val passError = lastWriteError ?: retriedWriteError
+            if (mismatches.isNotEmpty() || passError != null) {
+                val shown = mismatches.take(16)
+                anomalies += PageWriteAnomaly(
+                    pageId = pageNum,
+                    label = label,
+                    pass = pass,
+                    mismatchedOffsets = mismatches,
+                    expected = shown.map { data[it].toInt() and 0xFF },
+                    actual = shown.map { readBack.getOrNull(it)?.toInt()?.and(0xFF) ?: -1 },
+                    writeErrorMessage = passError?.message,
+                    writeResponseCode = (passError as? SpeeduinoProtocol.PageWriteRejectedException)?.responseCode,
+                    recovered = false,
+                )
+            }
             if (mismatches.isEmpty() && lastWriteError == null) {
                 Logger.d(TAG, "$label: read-back confere (${data.size} bytes, passe $pass)")
+                report(recovered = true)
                 return
             }
             if (mismatches.isEmpty()) {
                 // Bytes certos na RAM apesar do erro (ex.: ACK perdido na volta): pode seguir.
                 Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${lastWriteError?.message})")
+                report(recovered = true)
                 return
             }
             Logger.w(
@@ -2059,6 +2107,7 @@ class SpeeduinoClient(
                     "(offsets ${mismatches.take(8).joinToString()}); regravando"
             )
         }
+        report(recovered = false)
         throw PageWriteVerificationException(
             pageId = pageNum,
             label = label,

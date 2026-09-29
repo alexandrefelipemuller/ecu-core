@@ -8,6 +8,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 /**
  * Regressão de campo 2026-09 (Speeduino via Bluetooth): "Erro ao gravar página 2: CRC_ERR (0x82)"
@@ -21,8 +22,12 @@ class SpeeduinoClientVerifiedTableWriteTest {
 
     @Test
     fun `0x82 com lixo na RAM e corrigido pelo read-back antes do burn`() = runBlocking {
-        val ecu = FakeEcuMemory(rejectFirstWritesWithCrcErr = 1, corruptOffsetOnReject = 37)
+        // 3º chunk rejeitado; o lixo cai no 1º chunk, que já tinha sido gravado e não é regravado
+        // pelo retry - só o read-back enxerga.
+        val ecu = FakeEcuMemory(rejectWriteNumber = 3, corruptOffsetOnReject = 37)
         val client = newClient(ecu)
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        client.pageWriteAnomalyListener = { anomalies += it }
         client.connect()
         val metadata = client.getTableDefinitions()!!.veTable
         ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
@@ -33,18 +38,64 @@ class SpeeduinoClientVerifiedTableWriteTest {
         val expected = TableDomainFacade.prepareVeWrite(metadata, edited).data
         assertContentEquals(expected, ecu.read(metadata.page, metadata.offset, expected.size))
         assertEquals(1, ecu.burns, "burn só depois da RAM conferida")
+
+        // A corrupção foi corrigida, mas NÃO pode passar em silêncio: tem que chegar na telemetria.
+        val anomaly = anomalies.single()
+        assertEquals(true, anomaly.recovered)
+        assertEquals(metadata.page, anomaly.pageId)
+        assertEquals(0x82, anomaly.writeResponseCode)
+        assertEquals(listOf(37 - metadata.offset), anomaly.mismatchedOffsets)
+        assertEquals(listOf(212), anomaly.actual)
+    }
+
+    @Test
+    fun `0x82 mascarado pelo retry do chunk ainda chega na telemetria`() = runBlocking {
+        // Lixo cai no próprio chunk rejeitado; o retry sobrescreve e o read-back sai limpo.
+        val ecu = FakeEcuMemory(rejectWriteNumber = 1, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        client.pageWriteAnomalyListener = { anomalies += it }
+        client.connect()
+
+        client.writeVeTable(veTable(40), 1)
+
+        val anomaly = anomalies.single()
+        assertTrue(anomaly.recovered)
+        assertEquals(emptyList(), anomaly.mismatchedOffsets)
+        assertEquals(0x82, anomaly.writeResponseCode)
+        assertEquals(1, ecu.burns)
+    }
+
+    @Test
+    fun `gravacao limpa nao emite anomalia`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        client.pageWriteAnomalyListener = { anomalies += it }
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+
+        client.writeVeTable(veTable(40), 1)
+
+        assertEquals(emptyList(), anomalies)
+        assertEquals(1, ecu.burns)
     }
 
     @Test
     fun `divergencia persistente lanca excecao e nao faz burn`() = runBlocking {
-        val ecu = FakeEcuMemory(rejectFirstWritesWithCrcErr = 0, corruptOffsetOnReject = 37, corruptEveryWrite = true)
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptEveryWrite = true)
         val client = newClient(ecu)
         client.connect()
         val metadata = client.getTableDefinitions()!!.veTable
         ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
 
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        client.pageWriteAnomalyListener = { anomalies += it }
+
         val error = assertFailsWith<PageWriteVerificationException> { client.writeVeTable(veTable(50), 1) }
         assertEquals(metadata.page, error.pageId)
+        assertEquals(2, anomalies.size, "um evento por passe")
+        assertTrue(anomalies.none { it.recovered })
         assertEquals(0, ecu.burns, "RAM divergente nunca pode ir pra EEPROM")
     }
 
@@ -65,7 +116,7 @@ class SpeeduinoClientVerifiedTableWriteTest {
      * ECU 202501 com memória de páginas: responde handshake Q/S e 'p'/'M'/'B' em envelope.
      */
     private class FakeEcuMemory(
-        private var rejectFirstWritesWithCrcErr: Int,
+        private val rejectWriteNumber: Int?,
         private val corruptOffsetOnReject: Int,
         private val corruptEveryWrite: Boolean = false,
     ) : ISpeeduinoConnection {
@@ -83,6 +134,7 @@ class SpeeduinoClientVerifiedTableWriteTest {
         private val pending = ArrayDeque<ByteArray>()
         private var lastCommand: Byte? = null
         private var connected = false
+        private var writes = 0
         var burns = 0
             private set
 
@@ -105,8 +157,8 @@ class SpeeduinoClientVerifiedTableWriteTest {
                     val pageNum = p[1].toInt() and 0xFF
                     val offset = u16(2)
                     val length = u16(4)
-                    if (rejectFirstWritesWithCrcErr > 0) {
-                        rejectFirstWritesWithCrcErr--
+                    writes++
+                    if (writes == rejectWriteNumber) {
                         // Frame rejeitado; o resto dele chega depois do flush e vira um 'W' legacy.
                         page(pageNum)[corruptOffsetOnReject] = 212.toByte()
                         pending += rc(0x82)
