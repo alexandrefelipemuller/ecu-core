@@ -1452,6 +1452,22 @@ class SpeeduinoProtocol(
             "received=0x${receivedCrc.toString(16)}, calculated=0x${calculatedCrc.toString(16)}"
     )
 
+    /**
+     * A ECU recusou um 'M'/'w' com um código de retorno != OK. [isFrameRejected] = o frame nem
+     * chegou a ser processado (0x82 CRC_ERR ou 0x80 TIMEOUT): bytes perdidos/corrompidos no link.
+     * Nesse caso o resto do frame pode continuar chegando na ECU depois do flush dela, então quem
+     * retentar precisa esperar a ECU descartar esse lixo antes de mandar o próximo comando.
+     */
+    class PageWriteRejectedException(
+        val pageId: Int,
+        val responseCode: Int,
+        message: String,
+    ) : Exception(message) {
+        val isFrameRejected: Boolean
+            get() = responseCode == (SERIAL_RC_CRC_ERR.toInt() and 0xFF) ||
+                responseCode == (SERIAL_RC_TIMEOUT.toInt() and 0xFF)
+    }
+
     class ModernResponseReadException(
         private val stage: String,
         private val cmd: Byte,
@@ -1534,7 +1550,11 @@ class SpeeduinoProtocol(
                     "⚠️  Page ${formatPageId(pageNum)} respondeu 0x80; seguindo como escrita sem ACK explícito: $errorMsg"
                 )
             } else {
-                throw Exception("Erro ao gravar página ${formatPageId(pageNum)}: $errorMsg")
+                throw PageWriteRejectedException(
+                    pageId = pageNum.toInt() and 0xFF,
+                    responseCode = responseCode,
+                    message = "Erro ao gravar página ${formatPageId(pageNum)}: $errorMsg",
+                )
             }
         } else {
             val responseCode = response[0].toInt() and 0xFF

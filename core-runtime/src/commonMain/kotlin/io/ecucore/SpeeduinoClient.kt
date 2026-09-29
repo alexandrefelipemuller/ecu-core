@@ -122,6 +122,14 @@ class SpeeduinoClient(
         const val LIVE_DATA_LINK_DESYNC_MARKER = "link_desync"
         private const val LIVE_DATA_CRC_ERR_RESPONSE = "response code = 0x82"
         private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
+        // Gravação de tabelas de tuning (VE/Ignição/AFR): chunks pequenos reduzem a chance de
+        // perder bytes num frame grande via Bluetooth, e cada página é relida e comparada antes
+        // do burn. Um 0x82 (CRC_ERR) deixa o resto do frame chegando na ECU depois do flush dela;
+        // com legacy ainda liberado, bytes 'A'..'z' desse lixo viram comandos 'W' (escrita de 1
+        // byte na RAM) - célula corrompida sem nenhum erro visível. Só o read-back pega isso.
+        private const val TABLE_WRITE_CHUNK_SIZE = 64
+        private const val TABLE_WRITE_CHUNK_MAX_ATTEMPTS = 3
+        private const val TABLE_WRITE_VERIFY_MAX_PASSES = 2
         private const val CONFIG_CHUNK_READ_RETRY_DELAY_MS = 40L
         private const val RUSEFI_CONFIG_READ_CHUNK_SIZE = 64
         private const val RUSEFI_RECONNECT_SETTLE_DELAY_MS = 3_000L
@@ -1957,6 +1965,14 @@ class SpeeduinoClient(
             return
         }
 
+        writePageChunksWithRetry(pageNum, data, chunkSize, startOffset)
+        settleAfterConfigWrite()
+        delay(150)
+        runCatching { connection.clearInputBuffer() }
+        Logger.d(TAG, "Pagina ${formatPageId(pageNum)} gravada em chunks sem burn")
+    }
+
+    private suspend fun writePageChunksWithRetry(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) {
         var offset = startOffset
         val end0 = startOffset + data.size
         var chunkIndex = 0
@@ -1971,12 +1987,14 @@ class SpeeduinoClient(
                 try {
                     writeConfigPage(pageNum = pageNum.toByte(), offset = offset, data = chunk)
                     break
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    if (attempt >= 3) throw e
+                    if (attempt >= TABLE_WRITE_CHUNK_MAX_ATTEMPTS) throw e
                     Logger.w(TAG, "Chunk #$chunkIndex da pagina ${formatPageId(pageNum)} falhou (tentativa $attempt): ${e.message}; retentando")
                     runCatching { connection.abortPendingRead() }
+                    delay(pageWriteRetryDelayMs(e, attempt))
                     runCatching { connection.clearInputBuffer() }
-                    delay(250L * attempt)
                 }
             }
             offset = end
@@ -1984,10 +2002,69 @@ class SpeeduinoClient(
                 delay(60)
             }
         }
-        settleAfterConfigWrite()
-        delay(150)
-        runCatching { connection.clearInputBuffer() }
-        Logger.d(TAG, "Pagina ${formatPageId(pageNum)} gravada em chunks sem burn")
+    }
+
+    /**
+     * Frame rejeitado (0x82/0x80): espera mais que o timeout serial do firmware (~400ms) para a
+     * ECU descartar o resto do frame antes do próximo comando - retentar em 250ms concatenaria o
+     * frame novo ao lixo e voltaria a falhar.
+     */
+    internal fun pageWriteRetryDelayMs(error: Exception, attempt: Int): Long {
+        val base = 250L * attempt
+        val frameRejected = (error as? SpeeduinoProtocol.PageWriteRejectedException)?.isFrameRejected == true ||
+            isLiveDataLinkDesync(error)
+        return if (frameRejected) maxOf(base, LIVE_DATA_DESYNC_RESYNC_DELAY_MS) else base
+    }
+
+    /**
+     * Grava uma tabela de tuning Speeduino em chunks e confirma por read-back byte a byte antes
+     * de liberar o burn. Divergência = regrava a região inteira (corrige também bytes que a ECU
+     * escreveu a partir de lixo do link); persistindo, lança [PageWriteVerificationException]
+     * e o chamador NÃO faz burn - a EEPROM continua com a tabela anterior, íntegra.
+     */
+    private suspend fun writeSpeeduinoTableVerified(pageNum: Int, offset: Int, data: ByteArray, label: String) {
+        var mismatches: List<Int> = emptyList()
+        var lastWriteError: Exception? = null
+        for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
+            try {
+                writePageChunksWithRetry(pageNum, data, TABLE_WRITE_CHUNK_SIZE, offset)
+                lastWriteError = null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Mesmo com a escrita falhando, relê: a RAM da ECU pode ter sido alterada pelo
+                // lixo do frame rejeitado e o usuário precisa saber se ela diverge da tela.
+                lastWriteError = e
+                Logger.w(TAG, "$label: escrita falhou no passe $pass: ${e.message}")
+            }
+            delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+            invalidateCachedPage(pageNum)
+            pendingSpeeduinoPageReadbacks.remove(pageNum)
+            val readBack = readPage(pageNum, offset, data.size)
+            invalidateCachedPage(pageNum)
+            mismatches = data.indices.filter { i -> i >= readBack.size || readBack[i] != data[i] }
+            if (mismatches.isEmpty() && lastWriteError == null) {
+                Logger.d(TAG, "$label: read-back confere (${data.size} bytes, passe $pass)")
+                return
+            }
+            if (mismatches.isEmpty()) {
+                // Bytes certos na RAM apesar do erro (ex.: ACK perdido na volta): pode seguir.
+                Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${lastWriteError?.message})")
+                return
+            }
+            Logger.w(
+                TAG,
+                "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass " +
+                    "(offsets ${mismatches.take(8).joinToString()}); regravando"
+            )
+        }
+        throw PageWriteVerificationException(
+            pageId = pageNum,
+            label = label,
+            mismatchedOffsets = mismatches,
+            cause = lastWriteError,
+        )
     }
 
     suspend fun writeRawPageChunkedWithoutBurn(pageNum: Byte, data: ByteArray, chunkSize: Int = 64, startOffset: Int = 0) {
@@ -2064,19 +2141,9 @@ class SpeeduinoClient(
         val pageData = TableDomainFacade.prepareVeWrite(metadata, veTable).data
         Logger.d(TAG, "VE Table serializada: ${pageData.size} bytes")
 
-        // 3. Write to ECU using dynamic page number (fire-and-forget, não aguarda resposta)
-        writeConfigPage(
-            pageNum = metadata.page.toByte(),
-            offset = metadata.offset,
-            data = pageData
-        )
-        Logger.d(TAG, "VE Table $mapIndex enviada para Page ${metadata.page}")
-
-        // ⚠️ CRÍTICO: Delay MAIOR para Speeduino processar write completo
-        // Write page é assíncrono - 304 bytes levam tempo para gravar na RAM
-        // Delay conservador: ~3ms por byte @ 115200 baud = ~900ms + margem
-        delay(1000) // 1 segundo de delay (conservador)
-        Logger.d(TAG, "Aguardou 1s para processamento do write")
+        // Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
+        writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "VE Table $mapIndex")
+        Logger.d(TAG, "VE Table $mapIndex gravada e conferida na Page ${metadata.page}")
 
         // Burn to EEPROM (também demora - grava na flash/EEPROM)
         protocol.burnConfig()
@@ -2122,13 +2189,9 @@ class SpeeduinoClient(
         val pageData = TableDomainFacade.prepareIgnitionWrite(metadata, ignitionTable).data
         Logger.d(TAG, "Ignition Table serializada: ${pageData.size} bytes")
 
-        // 3. Write to ECU (fire-and-forget, não aguarda resposta)
-        writeConfigPage(pageNum = metadata.page.toByte(), offset = metadata.offset, data = pageData)
-        Logger.d(TAG, "Ignition Table enviada")
-
-        // 4. Delay para processar write
-        delay(1000)
-        Logger.d(TAG, "Aguardou 1s para processamento do write")
+        // 3. Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
+        writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "Ignition Table $mapIndex")
+        Logger.d(TAG, "Ignition Table gravada e conferida")
 
         // 5. Burn to EEPROM
         protocol.burnConfig()
@@ -2524,17 +2587,9 @@ class SpeeduinoClient(
         val pageData = TableDomainFacade.prepareAfrWrite(metadata, afrTable).data
         Logger.d(TAG, "AFR Table serializada: ${pageData.size} bytes")
 
-        // Write to ECU using dynamic page number
-        writeConfigPage(
-            pageNum = metadata.page.toByte(),
-            offset = metadata.offset,
-            data = pageData
-        )
-        Logger.d(TAG, "AFR Table enviada para Page ${metadata.page}")
-
-        // Delay para processar write
-        delay(1000)
-        Logger.d(TAG, "Aguardou 1s para processamento do write")
+        // Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
+        writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "AFR Table")
+        Logger.d(TAG, "AFR Table gravada e conferida na Page ${metadata.page}")
 
         // Burn to EEPROM
         protocol.burnConfig()
