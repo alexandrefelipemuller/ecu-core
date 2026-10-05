@@ -143,8 +143,9 @@ class EngineConstantsTest {
         assertEquals(200, back.channel2Angle)
         assertEquals(300, back.channel3Angle)
         assertEquals(400, back.channel4Angle)
-        // os offsets 24-26 são compartilhados com reqFuel/divider/config: só as 3 primeiras taxas sobrevivem
-        assertEquals(source.injectorVoltageCorrectionRates.take(3), back.injectorVoltageCorrectionRates.take(3))
+        // offsets 15 e 24-26 pertencem a outros campos: essas entradas voltam ao padrão
+        assertEquals(listOf(150, 130, 110, 100, 92, 88), back.injectorVoltageCorrectionRates)
+        assertEquals(listOf(6.0f, 9f, 11f, 13f, 15f, 17f), back.batteryVoltageBins.map { kotlin.math.round(it * 10f) / 10f })
         // bytes que o modelo não possui continuam como estavam
         for (i in listOf(0, 1, 2, 10, 60, 100, 127)) assertEquals(0x11.toByte(), written[i], "byte $i")
     }
@@ -163,7 +164,7 @@ class EngineConstantsTest {
         val back = EngineConstants.fromPage1(c.applyToPage1(dirty))
         assertEquals(InjectorBatteryCorrectionMode.WHOLE_PULSE, back.injectorBatteryCorrectionMode)
         assertEquals(InjectorStaging.SIMULTANEOUS, back.injectorStaging)
-        assertTrue(!back.ignitionPerToothEnabled)
+        assertTrue(!back.ignitionFixedTimingEnabled && !back.ignitionPerToothEnabled)
         assertEquals(EngineStroke.FOUR_STROKE, back.engineStroke)
         assertEquals(InjectorPortType.PORT, back.injectorPortType)
     }
@@ -483,5 +484,66 @@ class EngineConstantsTest {
         assertEquals("Odd fire", EngineType.ODD_FIRE.displayName)
         assertEquals("Semi-Sequential", InjectorLayout.SEMI_SEQUENTIAL.displayName)
         assertContentEquals(listOf(true), listOf(base().toPage1().size == 128))
+    }
+
+    // ---- regressões: campos compartilhados e bit de ângulo fixo --------------------------------------------------
+
+    @Test
+    fun `fixed timing flag is cleared when the stored page had it on`() {
+        val dirty = ByteArray(128) { 0xFF.toByte() }
+        val off = base().copy(ignitionFixedTimingEnabled = false).applyToPage1(dirty)
+        assertEquals(0, off[37].toInt() and 0x08)
+        assertTrue(!EngineConstants.fromPage1(off).ignitionFixedTimingEnabled)
+        val on = base().copy(ignitionFixedTimingEnabled = true).applyToPage1(ByteArray(128))
+        assertEquals(0x08, on[37].toInt() and 0x08)
+        // os outros campos do byte continuam intactos
+        val c = base().copy(algorithm = Algorithm.IMAP_EMAP, numberOfInjectors = 6, ignitionFixedTimingEnabled = false)
+        val back = EngineConstants.fromPage1(c.applyToPage1(dirty))
+        assertEquals(Algorithm.IMAP_EMAP, back.algorithm)
+        assertEquals(6, back.numberOfInjectors)
+    }
+
+    @Test
+    fun `voltage tables never clobber the fields that share their offsets`() {
+        val index = (1..60).first { PinLayoutDetector.fromIndex(it).name != null }
+        val name = PinLayoutDetector.fromIndex(index).name!!
+        val basePage = ByteArray(128)
+        basePage[15] = index.toByte()
+        basePage[26] = 0x8E.toByte() // bits de config que o modelo não possui
+        val c = EngineConstants.fromPage1(basePage).copy(
+            boardLayout = name,
+            reqFuel = 8.0f,
+            squirtsPerCycle = 2,
+            injectorStaging = InjectorStaging.ALTERNATING,
+            batteryVoltageBins = listOf(1f, 2f, 3f, 4f, 5f, 6f),
+            injectorVoltageCorrectionRates = listOf(10, 20, 30, 40, 50, 60),
+        )
+        val written = c.applyToPage1(basePage)
+        assertEquals(index, written[15].toInt() and 0xFF) // pin layout, não a tensão
+        assertEquals(80, written[24].toInt() and 0xFF) // reqFuel, não taxa
+        assertEquals(2, written[25].toInt() and 0xFF) // divider, não taxa
+        assertEquals(0x8E, written[26].toInt() and 0x8E) // bits preservados
+        assertEquals(1, written[26].toInt() and 0x01) // staging alternado
+        assertEquals(20, written[16].toInt() and 0xFF) // entradas sem dono continuam gravadas
+        assertEquals(10, written[21].toInt() and 0xFF)
+        assertEquals(30, written[23].toInt() and 0xFF)
+    }
+
+    @Test
+    fun `unknown board layouts keep the stored pin layout index`() {
+        val basePage = ByteArray(128).also { it[15] = 9 }
+        val written = base().copy(boardLayout = "placa-desconhecida").applyToPage1(basePage)
+        assertEquals(9, written[15].toInt() and 0xFF)
+    }
+
+    @Test
+    fun `reading ignores bytes owned by other fields when decoding the voltage tables`() {
+        val d = page1()
+        d[15] = 77; d[24] = 99; d[25] = 98; d[26] = 97
+        d[16] = 80; d[21] = 140.toByte()
+        val c = EngineConstants.fromPage1(d)
+        assertEquals(6.0f, c.batteryVoltageBins[0]) // padrão, não 7.7
+        assertEquals(8.0f, c.batteryVoltageBins[1], 1e-4f)
+        assertEquals(listOf(140, 0, 0, 100, 92, 88), c.injectorVoltageCorrectionRates)
     }
 }

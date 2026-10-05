@@ -49,6 +49,12 @@ data class EngineConstants(
         /**
          * Parse Page 1 (128 bytes) into EngineConstants
          */
+        private const val BATTERY_BINS_OFFSET = 15
+        private const val VOLTAGE_RATES_OFFSET = 21
+
+        /** Pin layout (15), reqFuel (24), divider (25) e config de staging (26). */
+        private val SHARED_OFFSETS = setOf(15, 24, 25, 26)
+
         fun fromPage1(data: ByteArray): EngineConstants {
             require(data.size >= 128) { "Page 1 deve ter 128 bytes" }
             val pinLayoutInfo = PinLayoutDetector.fromPage1(data)
@@ -58,11 +64,21 @@ data class EngineConstants(
             } else {
                 InjectorBatteryCorrectionMode.WHOLE_PULSE
             }
+            // Os offsets 15, 24, 25 e 26 pertencem a outros campos (pin layout, reqFuel, divider e
+            // config de staging); as entradas que cairiam neles ficam no valor padrão.
             val batteryVoltageBins = List(6) { index ->
-                (data[15 + index].toInt() and 0xFF) * 0.1f
+                if (BATTERY_BINS_OFFSET + index in SHARED_OFFSETS) {
+                    DEFAULT_BATTERY_VOLTAGE_BINS[index]
+                } else {
+                    (data[BATTERY_BINS_OFFSET + index].toInt() and 0xFF) * 0.1f
+                }
             }
             val injectorVoltageCorrectionRates = List(6) { index ->
-                data[21 + index].toInt() and 0xFF
+                if (VOLTAGE_RATES_OFFSET + index in SHARED_OFFSETS) {
+                    DEFAULT_INJECTOR_VOLTAGE_RATES[index]
+                } else {
+                    data[VOLTAGE_RATES_OFFSET + index].toInt() and 0xFF
+                }
             }
 
             // Offset 24: reqFuel (U08, scale 0.1)
@@ -492,16 +508,20 @@ data class EngineConstants(
             InjectorBatteryCorrectionMode.OPEN_TIME_ONLY -> (correctionModeBase or 0x04).toByte()
         }
 
-        // Offsets 15-20: battery voltage bins (U08, scale 0.1)
+        // Offsets 15-20: battery voltage bins (U08, scale 0.1) e 21-26: taxas de correção (U08).
+        // Entradas que cairiam em offsets de outros campos (pin layout, reqFuel, divider, config
+        // de staging) não são gravadas: esses campos têm dono e preservam bits não modelados.
         repeat(6) { index ->
+            val offset = BATTERY_BINS_OFFSET + index
+            if (offset in SHARED_OFFSETS) return@repeat
             val value = batteryVoltageBins.getOrElse(index) { DEFAULT_BATTERY_VOLTAGE_BINS[index] }
-            data[15 + index] = (value / 0.1f).toInt().coerceIn(0, 255).toByte()
+            data[offset] = (value / 0.1f).toInt().coerceIn(0, 255).toByte()
         }
-
-        // Offsets 21-26: injector voltage correction rates (U08)
         repeat(6) { index ->
+            val offset = VOLTAGE_RATES_OFFSET + index
+            if (offset in SHARED_OFFSETS) return@repeat
             val value = injectorVoltageCorrectionRates.getOrElse(index) { DEFAULT_INJECTOR_VOLTAGE_RATES[index] }
-            data[21 + index] = value.coerceIn(0, 255).toByte()
+            data[offset] = value.coerceIn(0, 255).toByte()
         }
 
         // Offset 24: reqFuel (U08, scale 0.1)
@@ -525,9 +545,8 @@ data class EngineConstants(
         data[36] = config1.toByte()
 
         // Offset 37: Config2 byte
-        val config2Base = data[37].toInt() and 0xFF
-        var config2 = config2Base and 0x08
-        config2 = config2 or algorithm.toBits()
+        // Todos os 8 bits do byte são modelados (algoritmo, ângulo fixo, nº de injetores): nada a preservar.
+        var config2 = algorithm.toBits()
         if (ignitionFixedTimingEnabled) config2 = config2 or 0x08
         config2 = config2 or (injectorsToBits(numberOfInjectors) shl 4)
         data[37] = config2.toByte()
