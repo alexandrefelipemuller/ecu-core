@@ -29,7 +29,8 @@ internal class ScriptedConnection(
     /** Erros entregues, um por chamada, antes de qualquer dado. */
     val receiveErrors = ArrayDeque<Throwable>()
     val readAvailableErrors = ArrayDeque<Throwable>()
-    var sendError: Throwable? = null
+    /** Um item por `send()`: `null` = sem erro. */
+    val sendErrors = ArrayDeque<Throwable?>()
 
     /** `true` = inbox vazio devolve `ByteArray(0)` (silêncio); `false` = lança erro rápido. */
     var silenceWhenEmpty = false
@@ -40,7 +41,7 @@ internal class ScriptedConnection(
     override fun disconnect() { connected = false }
 
     override fun send(data: ByteArray) {
-        sendError?.let { throw it }
+        sendErrors.removeFirstOrNull()?.let { throw it }
         sent += data.copyOf()
         onSend(data)?.forEach { inbox.addLast(it) }
     }
