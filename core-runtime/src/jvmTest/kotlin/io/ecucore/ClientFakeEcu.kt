@@ -13,12 +13,16 @@ internal class ClientFakeEcu(
     val kind: Kind,
     private val modernFallback: Boolean = true,
     private val prefersLegacy: Boolean = true,
+    private val modernProtocol: Boolean = false,
     private val info: String = "tcp:10.0.0.5:5555",
 ) : ISpeeduinoConnection {
 
     enum class Kind(val signature: String, val product: String) {
         SPEEDUINO_2025("speeduino 202501", "speeduino 202501"),
         SPEEDUINO_2023("speeduino 202310", "speeduino 202310"),
+        SPEEDUINO_2020("speeduino 202008", "speeduino 202008"),
+        SPEEDUINO_LEGACY("speeduino 201609", "speeduino 201609"),
+        MS1("MS/Extra format hr_10", "MS/Extra format hr_10"),
         MS3("MS3 Format 0592.13 ", "MS3 1.5.1 release 20170101 (c)JSM/KC"),
         MS2("MS2Extra comms342h2", "MS2/Extra 3.4.3 release  20191126 15:29BST(c)KC/JSM/JB   MS2"),
         MEGASPEED("MS2Extra MegaSpeed", "MS2Extra MegaSpeed 1.0"),
@@ -40,6 +44,11 @@ internal class ClientFakeEcu(
 
     /** Resposta para comandos legacy crus além de Q/S/V (ex.: 'A'). */
     var onLegacy: ((cmd: Char, data: ByteArray) -> ByteArray?)? = null
+
+    /** Sobrescrevem a assinatura/produto do [kind] (ex.: firmware não suportado). */
+    var signature: String = kind.signature
+    var product: String = kind.product
+    private var ms1Page = 0
 
     var connected = false
     var clearCalls = 0
@@ -71,26 +80,28 @@ internal class ClientFakeEcu(
         val custom = onLegacy?.invoke(c, data)
         when {
             custom != null -> pending += custom
-            c == 'Q' -> pending += (kind.signature + "\u0000").toByteArray(Charsets.US_ASCII)
-            c == 'S' -> pending += kind.product.toByteArray(Charsets.US_ASCII)
-            c == 'A' -> pending += (liveBytes ?: ByteArray(128))
+            c == 'Q' -> pending += (signature + "\u0000").toByteArray(Charsets.US_ASCII)
+            c == 'S' -> pending += product.toByteArray(Charsets.US_ASCII)
+            c == 'A' -> pending += (liveBytes ?: ByteArray(512))
             c == 'p' && data.size >= 7 -> {
                 val page = data[2].toInt() and 0xFF
                 val off = u16le(data, 3)
                 val len = u16le(data, 5)
                 pending += mem(page).copyOfRange(off, off + len)
             }
-            c == 'P' || c == 'W' || c == 'B' -> Unit
+            c == 'P' && data.size >= 2 -> ms1Page = (data[1].toInt() and 0xFF) + 1
+            c == 'V' -> pending += mem(ms1Page).copyOfRange(0, 189)
+            c == 'W' || c == 'B' -> Unit
         }
     }
 
     private fun handleFrame(cmd: Char, p: ByteArray): List<ByteArray> {
         fun ok(body: ByteArray = ByteArray(0)) = ModernEnvelopeFake.framedResponse(body)
         fun code(c: Int) = listOf(byteArrayOf(0x00, 0x01), byteArrayOf(c.toByte()), ByteArray(4))
-        val speeduino = kind == Kind.SPEEDUINO_2025 || kind == Kind.SPEEDUINO_2023
+        val speeduino = kind.name.startsWith("SPEEDUINO")
         return when (cmd) {
-            'Q' -> ok((kind.signature + "\u0000").toByteArray(Charsets.US_ASCII))
-            'S' -> ok(kind.product.toByteArray(Charsets.US_ASCII))
+            'Q' -> ok((signature + "\u0000").toByteArray(Charsets.US_ASCII))
+            'S' -> ok(product.toByteArray(Charsets.US_ASCII))
             'f' -> ok(byteArrayOf(2, 0x01, 0x00, 0x01, 0x00))
             'd' -> ok(byteArrayOf(0x11, 0x22, 0x33, 0x44))
             'p' -> {
@@ -161,7 +172,7 @@ internal class ClientFakeEcu(
 
     override fun isConnected(): Boolean = connected
     override fun getConnectionInfo(): String = info
-    override fun supportsModernProtocol(): Boolean = false
+    override fun supportsModernProtocol(): Boolean = modernProtocol
     override fun supportsModernProtocolFallback(): Boolean = modernFallback
     override fun prefersLegacyProtocol(): Boolean = prefersLegacy
     override fun legacyFirmwareHandshakeAttempts(): Int = 2
