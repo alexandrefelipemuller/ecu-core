@@ -231,11 +231,10 @@ class SpeeduinoProtocol(
      * continua visível no app por decisão explícita (ver conversa 2026-08-18), não foi escondido.
      */
 
-    private fun isModernEnabled(ignoreSessionLegacyPreferred: Boolean = false): Boolean {
+    private fun isModernEnabled(): Boolean {
         if (FORCE_LEGACY_PROTOCOL) return false
         sessionModernEnvelopeOverrideForConfigRead()?.let { return it }
-        return (ignoreSessionLegacyPreferred || !sessionLegacyPreferred) &&
-            connection.supportsModernProtocol()
+        return !sessionLegacyPreferred && connection.supportsModernProtocol()
     }
 
     private fun canAttemptModernFallback(ignoreSessionLegacyPreferred: Boolean = false): Boolean {
@@ -810,19 +809,6 @@ class SpeeduinoProtocol(
         }
     }
 
-    private fun fallbackLegacyString(cmd: Byte, label: String): String {
-        val response = sendLegacyCommand(cmd)
-        if (response.isEmpty()) {
-            Logger.w("SpeeduinoProtocol", "Legacy $label returned empty response")
-            return "Unknown"
-        }
-
-        val cleaned = parseLegacyStringResponse(response, label)
-
-        Logger.w("SpeeduinoProtocol", "Legacy $label response: ${response.joinToString(" ") { "0x${it.toHex02()}" }}")
-        return cleaned.ifBlank { "Unknown" }
-    }
-
     private fun parseLegacyStringResponse(response: ByteArray, label: String): String {
         val framedString = parseModernFrameString(response, label)
         if (framedString != null) {
@@ -885,7 +871,7 @@ class SpeeduinoProtocol(
             return ""
         }
 
-        val payloadText = if (payload.isNotEmpty() && payload[0] == SERIAL_RC_OK) {
+        val payloadText = if (payload[0] == SERIAL_RC_OK) {
             payload.copyOfRange(1, payload.size)
         } else {
             payload
@@ -894,15 +880,6 @@ class SpeeduinoProtocol(
         val zeroIndex = payloadText.indexOf(0)
         val lengthText = if (zeroIndex >= 0) zeroIndex else payloadText.size
         return payloadText.decodeToString(0, lengthText).trim()
-    }
-
-    private fun safeLegacyString(cmd: Byte, label: String): String {
-        return try {
-            fallbackLegacyString(cmd, label)
-        } catch (e: Exception) {
-            Logger.w("SpeeduinoProtocol", "Legacy $label failed: ${e.message}")
-            "Unknown"
-        }
     }
 
     private fun queryStringCandidates(commands: List<Byte>, label: String): String {
@@ -1280,9 +1257,6 @@ class SpeeduinoProtocol(
         } catch (e: Exception) {
             throw ModernResponseReadException("length", cmd, 2, e)
         }
-        if (lengthBytes.size < 2) {
-            throw IncompleteResponseException("length", 2, lengthBytes.size, cmd)
-        }
         if (VERBOSE_MODERN_FRAME_LOGS) {
             Logger.d("SpeeduinoProtocol", "Length bytes: ${lengthBytes.joinToString(" ") { "0x${it.toHex02()}" }}")
         }
@@ -1308,9 +1282,6 @@ class SpeeduinoProtocol(
         } catch (e: Exception) {
             throw ModernResponseReadException("payload", cmd, length, e)
         }
-        if (payload.size < length) {
-            throw IncompleteResponseException("payload", length, payload.size, cmd)
-        }
         if (VERBOSE_MODERN_FRAME_LOGS) {
             Logger.d("SpeeduinoProtocol", "Payload bytes: ${payload.joinToString(" ") { "0x${it.toHex02()}" }}")
         }
@@ -1320,9 +1291,6 @@ class SpeeduinoProtocol(
             readExactly(4, "modern crc cmd=0x${cmd.toInt().and(0xFF).toString(16)}")
         } catch (e: Exception) {
             throw ModernResponseReadException("crc", cmd, 4, e)
-        }
-        if (crcBytes.size < 4) {
-            throw IncompleteResponseException("crc", 4, crcBytes.size, cmd)
         }
         if (VERBOSE_MODERN_FRAME_LOGS) {
             Logger.d("SpeeduinoProtocol", "CRC bytes: ${crcBytes.joinToString(" ") { "0x${it.toHex02()}" }}")
