@@ -19,7 +19,7 @@ sonar {
 
 // Cobertura agregada dos 4 módulos (target desktop). Uso:
 //   ./gradlew jacocoAggregateReport                       -> HTML/XML em build/reports/jacoco/aggregate
-//   ./gradlew jacocoCoverageGate -PcoverageMinimum=0.40   -> falha se linhas < 40%
+//   ./gradlew jacocoCoverageGate -PcoverageMinimum=0.40   -> falha se linhas < 40% (padrão 0.31 = linha de base)
 val coverageModules = listOf("core-model", "core-protocol", "core-runtime", "core-tuning")
 
 fun JacocoReportBase.wireAggregate() {
@@ -59,7 +59,7 @@ tasks.register<JacocoCoverageVerification>("jacocoCoverageGate") {
         rule {
             limit {
                 counter = "LINE"
-                minimum = providers.gradleProperty("coverageMinimum").getOrElse("0.0").toBigDecimal()
+                minimum = providers.gradleProperty("coverageMinimum").getOrElse("0.31").toBigDecimal()
             }
         }
     }
