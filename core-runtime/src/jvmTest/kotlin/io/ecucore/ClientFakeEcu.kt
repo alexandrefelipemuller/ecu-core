@@ -14,6 +14,8 @@ internal class ClientFakeEcu(
     private val modernFallback: Boolean = true,
     private val prefersLegacy: Boolean = true,
     private val modernProtocol: Boolean = false,
+    private val configReads: Boolean? = null,
+    private val wholePageLegacy: Boolean = false,
     private val info: String = "tcp:10.0.0.5:5555",
 ) : ISpeeduinoConnection {
 
@@ -27,6 +29,7 @@ internal class ClientFakeEcu(
         MS2("MS2Extra comms342h2", "MS2/Extra 3.4.3 release  20191126 15:29BST(c)KC/JSM/JB   MS2"),
         MEGASPEED("MS2Extra MegaSpeed", "MS2Extra MegaSpeed 1.0"),
         RUSEFI("rusEFI master.2025.01.01.proteus_f4.abcdef", "rusEFI master.2025.01.01.proteus_f4.abcdef"),
+        RUSEFI_F407("rusEFI master.2025.01.01.f407-discovery.abcdef", "rusEFI master.2025.01.01.f407-discovery.abcdef"),
     }
 
     class Write(val id: Int, val offset: Int, val data: ByteArray)
@@ -50,6 +53,11 @@ internal class ClientFakeEcu(
     var product: String = kind.product
     private var ms1Page = 0
 
+    /** Um item por `send()`: lançado antes de processar o comando (`null` = sem erro). */
+    val sendErrors = ArrayDeque<Throwable?>()
+    var failPrefers = false
+    var failHandshakeRetry = false
+
     var connected = false
     var clearCalls = 0
     private val pending = ArrayDeque<ByteArray>()
@@ -62,6 +70,7 @@ internal class ClientFakeEcu(
     override fun disconnect() { connected = false }
 
     override fun send(data: ByteArray) {
+        sendErrors.removeFirstOrNull()?.let { throw it }
         pending.clear()
         if (ModernEnvelopeFake.isModernFrame(data)) {
             val cmd = data[2].toInt().toChar()
@@ -174,7 +183,16 @@ internal class ClientFakeEcu(
     override fun getConnectionInfo(): String = info
     override fun supportsModernProtocol(): Boolean = modernProtocol
     override fun supportsModernProtocolFallback(): Boolean = modernFallback
-    override fun prefersLegacyProtocol(): Boolean = prefersLegacy
+    override fun prefersLegacyProtocol(): Boolean {
+        if (failPrefers) throw RuntimeException("fake: prefersLegacyProtocol falhou")
+        return prefersLegacy
+    }
+    override fun supportsModernConfigReads(): Boolean = configReads ?: (modernProtocol || modernFallback)
+    override fun useWholePageLegacyConfigReads(): Boolean = wholePageLegacy
+    override suspend fun prepareHandshakeRetry(attempt: Int): Boolean {
+        if (failHandshakeRetry) throw RuntimeException("fake: prepareHandshakeRetry falhou")
+        return false
+    }
     override fun legacyFirmwareHandshakeAttempts(): Int = 2
     override fun setOnConnectionStateChanged(callback: (Boolean) -> Unit) = Unit
     override fun setOnError(callback: (String) -> Unit) = Unit

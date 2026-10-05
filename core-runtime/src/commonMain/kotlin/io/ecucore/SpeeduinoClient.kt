@@ -1069,12 +1069,7 @@ class SpeeduinoClient(
         while (copied < length) {
             val chunkOffset = offset + copied
             val currentSize = minOf(chunkSize, length - copied)
-            val chunk = readConfigChunkSingleAttempt(pageId, chunkOffset, currentSize)
-            if (chunk.size != currentSize) {
-                throw Exception(
-                    "Short rusEFI config chunk page=${formatPageId(pageId)} offset=$chunkOffset length=$currentSize received=${chunk.size}"
-                )
-            }
+            val chunk = protocol.readTable(pageId, chunkOffset, currentSize, EcuFamily.RUSEFI)
             chunk.copyInto(data, copied)
             copied += currentSize
             if (copied < length) {
@@ -1082,16 +1077,6 @@ class SpeeduinoClient(
             }
         }
         return data
-    }
-
-    private suspend fun readConfigChunkSingleAttempt(pageId: Int, offset: Int, length: Int): ByteArray {
-        val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
-        return when (family) {
-            EcuFamily.RUSEFI -> protocol.readTable(pageId, offset, length, EcuFamily.RUSEFI)
-            EcuFamily.MS2, EcuFamily.MEGASPEED -> protocol.readTable(pageId, offset, length, EcuFamily.MS2)
-            EcuFamily.MS3 -> protocol.readTable(pageId, offset, length, EcuFamily.MS3)
-            else -> readPage(pageId, offset, length)
-        }
     }
 
     private fun resolveConfigReadMode(family: EcuFamily): EcuConfigReadMode {
@@ -3331,7 +3316,7 @@ class SpeeduinoClient(
         return TableDomainFacade.resolveIgnitionLoadType(engineConstants)
     }
 
-    private suspend fun resolveAfrLoadType(isLegacyFormat: Boolean = false): AfrTable.LoadType {
+    private suspend fun resolveAfrLoadType(isLegacyFormat: Boolean): AfrTable.LoadType {
         return TableDomainFacade.resolveAfrLoadType(resolveEngineConstantsOrNull(), isLegacyFormat)
     }
 
@@ -3528,14 +3513,6 @@ class SpeeduinoClient(
 
     // ==================== Data Parsing ====================
 
-    /**
-     * Parse live data packet (127 bytes)
-     * Based on Speeduino logger.cpp getTSLogEntry function
-     */
-    private fun parseLiveData(data: ByteArray): SpeeduinoLiveData {
-        return SpeeduinoLiveDataParser.fromLegacyFrame(data)
-    }
-
     private fun parseOutputChannelsWithFallback(data: ByteArray): SpeeduinoLiveData {
         val parsed = SpeeduinoLiveDataParser.fromOutputChannels(data)
         val score = liveDataOutOfRangeScore(parsed)
@@ -3560,9 +3537,6 @@ class SpeeduinoClient(
     }
 
     private fun shiftOutputChannels(data: ByteArray): ByteArray {
-        if (data.isEmpty()) {
-            return data
-        }
         val shifted = ByteArray(data.size)
         data.copyInto(shifted, 0, 1, data.size)
         shifted[shifted.lastIndex] = 0
@@ -3622,7 +3596,7 @@ class SpeeduinoClient(
         io.ecucore.connection.ConnectionTrace.info("live_data", message)
     }
 
-    private fun isWithinLiveDataWarmupWindow(now: Long = MonotonicClock.nowMillis()): Boolean {
+    private fun isWithinLiveDataWarmupWindow(now: Long): Boolean {
         val startedAt = lastLiveDataStreamStartedAtMs
         return startedAt <= 0L || now - startedAt < LIVE_DATA_STREAM_WARMUP_MS
     }
