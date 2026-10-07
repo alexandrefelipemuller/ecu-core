@@ -50,6 +50,16 @@ class Obd2Transport(
     private val enableFeatureOptimization: Boolean = true,
     private val investigationRecorder: Obd2InvestigationSink? = null,
     private val diagnosticsSink: ConnectionDiagnosticsSink = NoopConnectionDiagnosticsSink,
+    /**
+     * Marca do veículo escolhida pelo usuário (ex.: "Ford"), lida no início do preflight.
+     * Só reordena a varredura de protocolos (tenta primeiro o mais provável pra marca);
+     * nunca remove nenhum protocolo da varredura.
+     */
+    private val vehicleMakeHint: () -> String? = { null },
+    /** Ano-modelo escolhido pelo usuário; restringe a promoção J1850 a carros ≤ 2008. */
+    private val vehicleYearHint: () -> Int? = { null },
+    /** Exploração pós-falha (opt-in do usuário). null = desativada (ex.: delegates PSA/Renault). */
+    private val failureExplorationHooks: Obd2FailureExplorationHooks? = null,
 ) : EcuTransport, Obd2DiagnosticsCapable {
 
     companion object {
@@ -72,6 +82,10 @@ class Obd2Transport(
         private val BASE_INIT_COMMANDS = listOf("ATZ", "ATL0", "ATH0")
         private const val FIRMWARE_SIGNATURE = "OBD2 ELM327"
         private const val OBD2_PRECHECK_PID = "0100"
+        private const val J1850_LAST_MODEL_YEAR = 2008
+        private const val FAILURE_EXPLORATION_BUDGET_MS = 90_000L
+        // Auto por último: a busca do ELM é a mais lenta e cobre o que os fixos não pegarem.
+        private val FAILURE_EXPLORATION_PROTOCOLS = listOf("6", "8", "7", "9", "1", "2", "3", "4", "5", "0")
         private val DISCOVERY_BASE_PIDS = listOf(0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0)
         private val BITMAP_QUERY_PIDS = setOf(0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0)
         private val CORE_PIDS = setOf(0x0C, 0x05, 0x0B, 0x0F, 0x11, 0x0E, 0x42)
@@ -263,6 +277,9 @@ class Obd2Transport(
                 "connect_failure",
                 "reason=${e.message ?: e::class.simpleName}"
             )
+            if (e is Obd2PreflightFailedException) {
+                runFailureExplorationIfAllowed(e.message.orEmpty())
+            }
             safeDisconnect()
             throw e
         }
@@ -397,10 +414,15 @@ class Obd2Transport(
         }
     }
 
-    private suspend fun initializeCommand(command: String, required: Boolean = true) {
+    private suspend fun initializeCommand(
+        command: String,
+        required: Boolean = true,
+        onResponse: (String) -> Unit = {},
+    ) {
         var success = false
         repeat(2) { attempt ->
             val response = runCatching { sendCommand(command, timeoutMs = if (command == "ATZ") 1800 else 1200) }
+                .onSuccess(onResponse)
                 .onFailure { error ->
                     logError(
                         "init command failed cmd=$command attempt=${attempt + 1}: ${error.message}",
@@ -567,28 +589,123 @@ class Obd2Transport(
         }
     }
 
-    private suspend fun runObd2PreflightChecks() {
-        val attempts = listOf(
-            "default" to emptyList<String>(),
-            "fallback_kwp_5baud" to listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP4", "ATSI", "ATAT1", "ATST20"),
-            "fallback_kwp_5baud_96" to listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP4", "ATSI", "ATAT1", "ATST96"),
-            "fallback_kwp_fast" to listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP5", "ATFI", "ATAT1", "ATST20"),
-            "fallback_kwp_fast_96" to listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP5", "ATFI", "ATAT1", "ATST96"),
-            "fallback_can11_500" to listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP6", "ATAT1", "ATST20"),
-            "fallback_can11_500_7df" to
+    private data class PreflightProfile(
+        val label: String,
+        val elmProtocol: String,
+        val setupCommands: List<String>,
+        val timeoutMs: Long,
+    )
+
+    /**
+     * Varredura de protocolos OBD2 do preflight.
+     *
+     * Segregação anti-regressão: [legacyPreflightProfiles] é exatamente a varredura que
+     * já conectava os carros suportados (mesma ordem, comandos e timeouts) e roda sempre
+     * primeiro. Os protocolos que nunca eram testados (J1850 PWM/VPW, ISO 9141, CAN 29
+     * bits e 250k — Focus 2006 falhou assim em 2026-10-04) só entram DEPOIS dela, então um
+     * carro que já conectava acha a ECU no mesmo perfil de antes.
+     *
+     * Única exceção, o mais estreita possível: Ford/GM/Chrysler com ano-modelo conhecido
+     * ≤ 2008 (era J1850; CAN é obrigatório a partir de 2008) testam J1850 logo após o
+     * "default". Ano desconhecido, outras marcas ou ≥ 2009 → ordem antiga intacta.
+     */
+    private fun buildPreflightProfiles(): List<PreflightProfile> {
+        val base = currentFlags.preflightTimeoutMs
+        val legacy = legacyPreflightProfiles(base)
+        val extended = extendedPreflightProfiles(base)
+        val preferred = preferredExtendedProtocolsFor(vehicleMakeHint(), vehicleYearHint())
+        val promoted = preferred.mapNotNull { sp -> extended.firstOrNull { it.elmProtocol == sp } }
+        return legacy.take(1) + promoted + legacy.drop(1) + (extended - promoted.toSet())
+    }
+
+    private fun legacyPreflightProfiles(base: Long): List<PreflightProfile> {
+        fun p(label: String, sp: String, cmds: List<String>) = PreflightProfile(label, sp, cmds, base)
+        return listOf(
+            p("default", "", emptyList()),
+            p("fallback_kwp_5baud", "4", listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP4", "ATSI", "ATAT1", "ATST20")),
+            p("fallback_kwp_5baud_96", "4", listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP4", "ATSI", "ATAT1", "ATST96")),
+            p("fallback_kwp_fast", "5", listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP5", "ATFI", "ATAT1", "ATST20")),
+            p("fallback_kwp_fast_96", "5", listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP5", "ATFI", "ATAT1", "ATST96")),
+            p("fallback_can11_500", "6", listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP6", "ATAT1", "ATST20")),
+            p(
+                "fallback_can11_500_7df", "6",
                 listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP6", "ATSH7DF", "ATAT1", "ATST20")
+            ),
         )
+    }
+
+    /**
+     * Protocolos fora da varredura antiga. Timeouts próprios: init 5-baud (ISO 9141/KWP
+     * slow) leva ~2,5-3s só pra acordar a ECU, então o base de 1,8s expirava antes da
+     * resposta. Sem ATFI (clones respondem "?"); ATD limpa o ATSH7DF do perfil anterior.
+     */
+    private fun extendedPreflightProfiles(base: Long): List<PreflightProfile> {
+        fun p(label: String, sp: String, timeoutMs: Long, vararg extra: String) = PreflightProfile(
+            label, sp,
+            listOf("ATD", "ATE0", "ATS0", "ATL0", "ATH0", "ATSP$sp", *extra, "ATAT1", "ATST96"),
+            maxOf(base, timeoutMs),
+        )
+        return listOf(
+            // ATSP0 com tempo pra busca automática terminar: em todas as sessões do Focus o
+            // 0100 do "default" expirou em 1,8s com ZERO bytes — a busca do ELM (SP1→SP9)
+            // leva 5-10s e nunca chegava a responder nem "UNABLE TO CONNECT".
+            p("ext_auto_long", "0", 12_000L),
+            p("ext_j1850_pwm", "1", 3_000L),
+            p("ext_j1850_vpw", "2", 3_000L),
+            p("ext_iso9141", "3", 5_000L),
+            p("ext_kwp_5baud_slow", "4", 5_000L),
+            p("ext_can29_500", "7", 2_000L),
+            p("ext_can11_250", "8", 2_000L),
+            p("ext_can29_250", "9", 2_000L),
+        )
+    }
+
+    private fun preferredExtendedProtocolsFor(make: String?, year: Int?): List<String> {
+        if (year == null || year > J1850_LAST_MODEL_YEAR) return emptyList()
+        val normalized = make?.trim()?.lowercase().orEmpty()
+        return when {
+            normalized.startsWith("ford") -> listOf("1")
+            normalized.startsWith("chevrolet") || normalized == "gm" -> listOf("2")
+            normalized in setOf("jeep", "dodge", "chrysler", "ram") -> listOf("2")
+            else -> emptyList()
+        }
+    }
+
+    private suspend fun runObd2PreflightChecks() {
+        val profiles = buildPreflightProfiles()
         val attemptSummaries = mutableListOf<String>()
         var lastFailure: PreflightFailure? = null
 
         ioMutex.withLock {
-            for ((label, setupCommands) in attempts) {
-                for (command in setupCommands) {
-                    initializeCommand(command)
+            for (profile in profiles) {
+                val label = profile.label
+                var lateResponse: String? = null
+                for (command in profile.setupCommands) {
+                    initializeCommand(command) { response ->
+                        if (lateResponse == null &&
+                            parsePidBytes(command = OBD2_PRECHECK_PID, response = response, dataLength = 4) != null
+                        ) {
+                            lateResponse = response
+                        }
+                    }
+                    if (lateResponse != null) break
+                }
+                // A resposta do 0100 do perfil anterior chegou atrasada e veio "colada" na
+                // resposta de um comando de setup (busca automática do ELM leva 5-10s;
+                // trace 2026-08-22: "4100BE3EA811\r\r>OK" lido como resposta do ATS0 e
+                // descartado, e o ATSP4 seguinte derrubava o barramento). A ECU respondeu:
+                // aceita e para a varredura aqui, antes de trocar o protocolo.
+                if (lateResponse != null) {
+                    diagnosticsSink.log(
+                        "elm327",
+                        "probe",
+                        "preflight pid=0100 ok late_response before_profile=$label response=${compactElmResponse(lateResponse!!) ?: "-"}"
+                    )
+                    return
                 }
 
                 val response = runCatching {
-                    sendCommand(OBD2_PRECHECK_PID, timeoutMs = currentFlags.preflightTimeoutMs)
+                    sendCommand(OBD2_PRECHECK_PID, timeoutMs = profile.timeoutMs)
                 }.getOrElse { error ->
                     val message = (error.message ?: error::class.simpleName ?: "unknown").take(80)
                     val failure = PreflightFailure(reason = "IO_EXCEPTION", compactResponse = message)
@@ -647,7 +764,7 @@ class Obd2Transport(
             return
         }
 
-        throw IllegalStateException(
+        throw Obd2PreflightFailedException(
             "Adaptador ELM327 conectado, mas sem comunicação OBD2 válida (PID 0100: $reason). " +
                 "Resposta: $compactResponse. Perfis testados: $fallbackSummary"
         )
@@ -1307,6 +1424,75 @@ class Obd2Transport(
         pidFailureStreak.clear()
     }
 
+    private suspend fun runFailureExplorationIfAllowed(failureSummary: String) {
+        val hooks = failureExplorationHooks ?: return
+        if (!connection.isConnected()) return
+        val accepted = runCatching { hooks.askConsent(failureSummary) }.getOrDefault(false)
+        diagnosticsSink.log("elm327", "explore", "consent=$accepted")
+        if (!accepted || !connection.isConnected()) return
+
+        val startedAt = MonotonicClock.nowMillis()
+        val entries = linkedMapOf<String, String>()
+        val responding = mutableListOf<String>()
+        fun budgetLeft() = MonotonicClock.nowMillis() - startedAt < FAILURE_EXPLORATION_BUDGET_MS
+
+        suspend fun probe(key: String, command: String, timeoutMs: Long): String {
+            val response = runCatching { sendCommand(command, timeoutMs) }
+                .getOrElse { "ERR:${it.message ?: it::class.simpleName}" }
+            entries[key] = compactElmResponse(response) ?: "<sem resposta>"
+            diagnosticsSink.log("elm327", "explore", "$key cmd=$command rsp=${entries[key]}")
+            return response
+        }
+
+        runCatching {
+            ioMutex.withLock {
+                runCatching { connection.clearInputBuffer() }
+                // Headers ligados de propósito: o endereço da ECU que responde (7E8, 48 6B...)
+                // identifica protocolo/fabricante melhor que o payload.
+                for (setup in listOf("ATD", "ATE0", "ATS1", "ATL0", "ATH1", "ATAT1", "ATST FF")) {
+                    runCatching { sendCommand(setup.replace(" ", ""), 1_200L) }
+                }
+                probe("adapter", "ATI", 1_200L)
+                probe("adapter_desc", "AT@1", 1_200L)
+                probe("vbat", "ATRV", 1_200L)
+                probe("sti", "STI", 1_200L)
+
+                for (sp in FAILURE_EXPLORATION_PROTOCOLS) {
+                    if (!budgetLeft() || !connection.isConnected()) {
+                        entries["truncated"] = "at=sp$sp"
+                        break
+                    }
+                    runCatching { sendCommand("ATSP$sp", 1_200L) }
+                    val timeout = if (sp == "0") 12_000L else 6_000L
+                    val response = probe("sp$sp", OBD2_PRECHECK_PID, timeout)
+                    if (parsePidBytes(OBD2_PRECHECK_PID, response, dataLength = 4) != null) {
+                        responding += sp
+                        if (responding.size == 1) {
+                            probe("sp${sp}_dpn", "ATDPN", 1_200L)
+                            probe("sp${sp}_mode09", "0900", 3_000L)
+                            probe("sp${sp}_mil", "0101", 3_000L)
+                        }
+                    }
+                }
+            }
+        }.onFailure { error ->
+            entries["aborted"] = (error.message ?: error::class.simpleName ?: "unknown").take(80)
+        }
+
+        val result = Obd2ExplorationResult(
+            entries = entries,
+            respondingProtocols = responding,
+            elapsedMs = MonotonicClock.nowMillis() - startedAt,
+            failureSummary = failureSummary,
+        )
+        diagnosticsSink.log(
+            "elm327",
+            "explore",
+            "done responding=${responding.joinToString(",").ifBlank { "-" }} elapsedMs=${result.elapsedMs}"
+        )
+        runCatching { hooks.onResult(result) }
+    }
+
     private fun compactElmResponse(response: String): String? {
         return response
             .replace("\r", " ")
@@ -1692,3 +1878,6 @@ class Obd2Transport(
 
     private fun StringBuilder.contains(ch: Char): Boolean = indexOf(ch.toString()) >= 0
 }
+
+/** Preflight esgotou todos os perfis sem resposta OBD2 válida (carro não conectou). */
+class Obd2PreflightFailedException(message: String) : IllegalStateException(message)
