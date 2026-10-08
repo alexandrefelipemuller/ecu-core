@@ -190,6 +190,11 @@ class SpeeduinoClient(
      */
     var tableChangeGuard: (suspend (TableChangeAssessment) -> Boolean)? = null
 
+    private fun isMsOrRusefiFamily(): Boolean = when (firmwareInfo?.family) {
+        EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI -> true
+        else -> false
+    }
+
     private suspend fun confirmTableChange(
         kind: TableChangeKind,
         updated: List<List<Int>>,
@@ -2201,6 +2206,11 @@ class SpeeduinoClient(
      */
     override suspend fun writeVeTable(veTable: VeTable, mapIndex: Int) {
         ensureWritable("writeVeTable")
+        // Speeduino confirma depois da validação (dentro do caminho abaixo); as demais famílias,
+        // aqui, antes de seguirem para o seu serializador próprio.
+        if (isMsOrRusefiFamily()) {
+            confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(mapIndex).values }
+        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             writeMs2VeTable(veTable)
             return
@@ -2251,6 +2261,9 @@ class SpeeduinoClient(
      */
     override suspend fun writeIgnitionTable(ignitionTable: IgnitionTable, mapIndex: Int) {
         ensureWritable("writeIgnitionTable")
+        if (isMsOrRusefiFamily()) {
+            confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(mapIndex).values }
+        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             writeMs2IgnitionTable(ignitionTable)
             return
@@ -2657,6 +2670,9 @@ class SpeeduinoClient(
      */
     override suspend fun writeAfrTable(afrTable: AfrTable) {
         ensureWritable("writeAfrTable")
+        if (isMsOrRusefiFamily()) {
+            confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             writeMs2AfrTable(afrTable)
             return

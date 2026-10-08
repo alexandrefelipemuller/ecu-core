@@ -40,6 +40,43 @@ class SpeeduinoClientMs2ConfigTest {
         assertMs2ConfigWriteUsesEnvelope(FakeMs2Connection(modernFallback = false))
     }
 
+    @Test
+    fun `MS2 guard recusa mudanca grande de VE antes de qualquer escrita`() = runBlocking {
+        val connection = FakeMs2Connection(modernFallback = true)
+        val client = SpeeduinoClient(connection = connection, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
+        client.connect()
+        val current = client.readVeTable()
+        val edited = current.copy(values = current.values.map { row -> row.map { 120 } })
+        var assessed: io.ecucore.model.TableChangeAssessment? = null
+        client.tableChangeGuard = { assessed = it; false }
+
+        val error = kotlin.test.assertFailsWith<TableChangeRejectedException> { client.writeVeTable(edited) }
+
+        assertEquals(error.assessment, assessed)
+        assertTrue(connection.envelopedTableWrites.isEmpty(), "nada pode ser gravado quando o guard recusa")
+        assertTrue(connection.envelopedBurns.isEmpty())
+    }
+
+    @Test
+    fun `MS2 sem guard nao faz leitura extra antes de gravar`() = runBlocking {
+        val connection = FakeMs2Connection(modernFallback = true)
+        val client = SpeeduinoClient(connection = connection, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
+        client.connect()
+        val current = client.readVeTable()
+        val readsBefore = connection.envelopedTableReads
+
+        val valid = current.copy(
+            rpmBins = current.rpmBins.indices.map { (it + 1) * 500 },
+            loadBins = current.loadBins.indices.map { (it + 1) * 10 },
+            values = current.values.map { row -> row.map { 60 } },
+        )
+
+        client.writeVeTable(valid)
+
+        assertEquals(readsBefore, connection.envelopedTableReads)
+        assertTrue(connection.envelopedTableWrites.isNotEmpty())
+    }
+
     private suspend fun assertMs2ConfigWriteUsesEnvelope(connection: FakeMs2Connection) {
         val client = SpeeduinoClient(
             connection = connection,
