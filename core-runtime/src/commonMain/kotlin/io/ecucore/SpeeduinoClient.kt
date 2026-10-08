@@ -39,6 +39,7 @@ import io.ecucore.model.TableDefinitions
 import io.ecucore.model.TableMetadata
 import io.ecucore.model.TableValidator
 import io.ecucore.model.UnsupportedFirmwareException
+import io.ecucore.model.ConfigValidator
 import io.ecucore.model.ValidationException
 import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.IgnitionTable
@@ -1286,6 +1287,7 @@ class SpeeduinoClient(
      */
     override suspend fun writePressureCalibration(calibration: PressureCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writePressureCalibration")
+        ConfigValidator.requireValid(ConfigValidator.validatePressureCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeS8(basePage, 46, calibration.mapMin)
         writeU16(basePage, 47, calibration.mapMax)
@@ -1316,6 +1318,7 @@ class SpeeduinoClient(
      */
     override suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeTpsCalibration")
+        ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeU8(basePage, 44, calibration.tpsMin)
         writeU8(basePage, 45, calibration.tpsMax)
@@ -1534,6 +1537,7 @@ class SpeeduinoClient(
      */
     override suspend fun writeEngineProtectionConfig(config: EngineProtectionConfig, burn: Boolean) {
         ensureWritable("writeEngineProtectionConfig")
+        ConfigValidator.requireValid(ConfigValidator.validateEngineProtection(config))
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("Engine Protection rusEFI ainda não mapeado nesta versão")
         }
@@ -1599,7 +1603,9 @@ class SpeeduinoClient(
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("Trigger Settings rusEFI ainda não mapeados nesta versão")
         }
-        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+        val isMs2Trigger = firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED
+        ConfigValidator.requireValid(ConfigValidator.validateTrigger(settings, ms2 = isMs2Trigger))
+        if (isMs2Trigger) {
             Logger.d(TAG, "Gravando Trigger Settings MS2 (Page 0x04)...")
             val basePage = readFullPage(
                 pageNum = TriggerSettings.MS2_PAGE_NUMBER,

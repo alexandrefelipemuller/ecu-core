@@ -153,6 +153,72 @@ class SpeeduinoClientWriteSafetyTest {
         assertEquals(0, ecu.burns)
     }
 
+    @Test
+    fun `calibracao de TPS invalida nao envia nada e nao faz burn`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        val sentBefore = ecu.sent
+
+        assertFailsWith<ValidationException> { client.writeTpsCalibration(TpsCalibration(tpsMin = 200, tpsMax = 100), burn = true) }
+        assertFailsWith<ValidationException> { client.writeTpsCalibration(TpsCalibration(tpsMin = 0, tpsMax = 300), burn = true) }
+
+        assertEquals(sentBefore, ecu.sent)
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `protecao do motor com RPM fora da faixa nao envia nada`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        val sentBefore = ecu.sent
+        val config = EngineProtectionConfig(
+            protectionCut = ProtectionCut.BOTH,
+            cutMethod = CutMethod.FULL,
+            engineProtectionRpmMin = 40000,
+            engineProtectEnabled = true,
+            revLimiterEnabled = true,
+            boostLimitEnabled = false,
+            oilPressureProtectionEnabled = false,
+            afrProtectionEnabled = false,
+            coolantProtectionEnabled = false,
+        )
+
+        assertFailsWith<ValidationException> { client.writeEngineProtectionConfig(config, burn = true) }
+
+        assertEquals(sentBefore, ecu.sent)
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `trigger com angulo fora da faixa nao envia nada`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        val sentBefore = ecu.sent
+        val settings = TriggerSettings(
+            triggerAngleDeg = 500,
+            triggerAngleMultiplier = 1,
+            triggerPattern = 0,
+            primaryBaseTeeth = 36,
+            missingTeeth = 1,
+            primaryTriggerSpeed = TriggerSettings.TriggerSpeed.CRANK,
+            triggerEdge = TriggerSettings.SignalEdge.RISING,
+            secondaryTriggerEdge = TriggerSettings.SignalEdge.RISING,
+            secondaryTriggerType = 0,
+            levelForFirstPhaseHigh = false,
+            skipRevolutions = 0,
+            triggerFilter = TriggerSettings.TriggerFilter.OFF,
+            reSyncEveryCycle = false,
+        )
+
+        assertFailsWith<ValidationException> { client.writeTriggerSettings(settings, burn = true) }
+
+        assertEquals(sentBefore, ecu.sent)
+        assertEquals(0, ecu.burns)
+    }
+
     private fun veTable(value: Int) = VeTable(
         rpmBins = (1..16).map { it * 500 },
         loadBins = (1..16).map { it * 10 },
