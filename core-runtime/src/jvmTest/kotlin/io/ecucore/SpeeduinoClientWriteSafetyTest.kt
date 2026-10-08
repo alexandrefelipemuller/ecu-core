@@ -127,6 +127,32 @@ class SpeeduinoClientWriteSafetyTest {
         assertEquals(1, ecu.burns)
     }
 
+    @Test
+    fun `AFR alvo perigosamente pobre nao envia nada e nao faz burn`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        val sentBefore = ecu.sent
+
+        assertFailsWith<ValidationException> { client.writeAfrTable(afrTable(190)) }
+
+        assertEquals(sentBefore, ecu.sent)
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `VE sem combustivel nao envia nada e nao faz burn`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        val sentBefore = ecu.sent
+
+        assertFailsWith<ValidationException> { client.writeVeTable(veTable(0), 1) }
+
+        assertEquals(sentBefore, ecu.sent)
+        assertEquals(0, ecu.burns)
+    }
+
     private fun veTable(value: Int) = VeTable(
         rpmBins = (1..16).map { it * 500 },
         loadBins = (1..16).map { it * 10 },
