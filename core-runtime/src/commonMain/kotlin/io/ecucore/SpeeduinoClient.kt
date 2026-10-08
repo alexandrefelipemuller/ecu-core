@@ -40,6 +40,9 @@ import io.ecucore.model.TableMetadata
 import io.ecucore.model.TableValidator
 import io.ecucore.model.UnsupportedFirmwareException
 import io.ecucore.model.ConfigValidator
+import io.ecucore.model.TableChangeAnalyzer
+import io.ecucore.model.TableChangeAssessment
+import io.ecucore.model.TableChangeKind
 import io.ecucore.model.ValidationException
 import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.IgnitionTable
@@ -178,6 +181,34 @@ class SpeeduinoClient(
      */
     @Volatile
     var pageWriteAnomalyListener: ((PageWriteAnomaly) -> Unit)? = null
+
+    /**
+     * Confirmação opcional de mudanças grandes em VE/Ignição/AFR (Speeduino). Quando definido, antes
+     * de gravar o client compara a tabela nova com a da ECU; se alguma célula mudar além do limite
+     * de [TableChangeAnalyzer], o callback decide (true = prosseguir). Falso lança
+     * [TableChangeRejectedException] sem enviar nada. Nulo (padrão) = sem checagem, nem leitura extra.
+     */
+    var tableChangeGuard: (suspend (TableChangeAssessment) -> Boolean)? = null
+
+    private suspend fun confirmTableChange(
+        kind: TableChangeKind,
+        updated: List<List<Int>>,
+        readCurrent: suspend () -> List<List<Int>>,
+    ) {
+        val guard = tableChangeGuard ?: return
+        val current = try {
+            readCurrent()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "Tabela atual ilegível; checagem de mudança grande ignorada: ${e.message}")
+            return
+        }
+        val assessment = TableChangeAnalyzer.assess(kind, current, updated)
+        if (assessment.requiresConfirmation && !guard(assessment)) {
+            throw TableChangeRejectedException(assessment)
+        }
+    }
     private var lastDisconnectWasRusefi: Boolean = false
     private var lastDisconnectAtMs: Long = 0L
     private var cachedEngineConstants: EngineConstants? = null
@@ -2198,6 +2229,8 @@ class SpeeduinoClient(
         val pageData = TableDomainFacade.prepareVeWrite(metadata, veTable).data
         Logger.d(TAG, "VE Table serializada: ${pageData.size} bytes")
 
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(mapIndex).values }
+
         // Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
         writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "VE Table $mapIndex")
         Logger.d(TAG, "VE Table $mapIndex gravada e conferida na Page ${metadata.page}")
@@ -2245,6 +2278,8 @@ class SpeeduinoClient(
 
         val pageData = TableDomainFacade.prepareIgnitionWrite(metadata, ignitionTable).data
         Logger.d(TAG, "Ignition Table serializada: ${pageData.size} bytes")
+
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(mapIndex).values }
 
         // 3. Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
         writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "Ignition Table $mapIndex")
@@ -2643,6 +2678,8 @@ class SpeeduinoClient(
 
         val pageData = TableDomainFacade.prepareAfrWrite(metadata, afrTable).data
         Logger.d(TAG, "AFR Table serializada: ${pageData.size} bytes")
+
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
 
         // Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
         writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "AFR Table")

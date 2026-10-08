@@ -138,6 +138,59 @@ class SpeeduinoClientVerifiedTableWriteTest {
         assertEquals(0, ecu.burns)
     }
 
+    @Test
+    fun `mudanca grande rejeitada pelo guard nao grava nem faz burn`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        val original = TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data
+        ecu.load(metadata.page, metadata.offset, original)
+        var assessed: io.ecucore.model.TableChangeAssessment? = null
+        client.tableChangeGuard = { assessed = it; false }
+
+        val error = assertFailsWith<TableChangeRejectedException> { client.writeVeTable(veTable(90), 1) }
+
+        assertTrue(error.assessment.bulkReplacement)
+        assertEquals(error.assessment, assessed)
+        assertContentEquals(original, ecu.read(metadata.page, metadata.offset, original.size))
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `mudanca grande confirmada pelo guard grava normalmente`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
+        client.tableChangeGuard = { true }
+
+        client.writeVeTable(veTable(90), 1)
+
+        assertContentEquals(
+            TableDomainFacade.prepareVeWrite(metadata, veTable(90)).data,
+            ecu.read(metadata.page, metadata.offset, 288),
+        )
+        assertEquals(1, ecu.burns)
+    }
+
+    @Test
+    fun `mudanca pequena nao consulta o guard`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
+        var asked = false
+        client.tableChangeGuard = { asked = true; false }
+
+        client.writeVeTable(veTable(44), 1)
+
+        assertEquals(false, asked)
+        assertEquals(1, ecu.burns)
+    }
+
     private fun veTable(value: Int) = VeTable(
         rpmBins = (1..16).map { it * 500 },
         loadBins = (1..16).map { it * 10 },
