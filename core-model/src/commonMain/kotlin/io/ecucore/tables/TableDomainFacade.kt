@@ -105,6 +105,7 @@ object TableDomainFacade {
     }
 
     fun prepareAfrWrite(metadata: TableMetadata, table: AfrTable): TableWritePayload {
+        validateTable(metadata, table)
         val storageFormat = AfrTable.StorageFormat.fromTotalSize(metadata.totalSize)
         val data = storageFormat?.let(table::toByteArray) ?: table.toByteArray()
         return TableWritePayload(metadata = metadata, data = data)

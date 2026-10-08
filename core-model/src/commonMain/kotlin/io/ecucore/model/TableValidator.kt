@@ -35,6 +35,9 @@ class TableValidator(private val metadata: TableMetadata) {
         const val VE_VERY_RICH_THRESHOLD = 200.0             // %
         const val AFR_LEAN_THRESHOLD = 16.0                  // AFR
         const val AFR_RICH_THRESHOLD = 10.0                  // AFR
+        const val AFR_HARD_LEAN_THRESHOLD = 18.0             // AFR - alvo >= isto bloqueia a gravação
+        const val VE_NO_FUEL_THRESHOLD = 10.0                // % - célula praticamente sem combustível
+        const val VE_NO_FUEL_MAX_CELL_FRACTION = 0.10        // >= 10% das células sem combustível bloqueia
         const val IGNITION_ADVANCE_HARD_MAX = 54.0           // ECU compatibility limit
         private const val MAP_LOAD_SCALE = 2
         private const val MAP_LOAD_MAX = MAP_LOAD_SCALE * 255
@@ -57,7 +60,9 @@ class TableValidator(private val metadata: TableMetadata) {
             is IgnitionTable -> {
                 validateIgnitionTable(table, errors, warnings)
             }
-            // AFR Table validation can be added here
+            is AfrTable -> {
+                validateAfrTable(table, errors, warnings)
+            }
             else -> {
                 errors.add("Unknown table type: ${table::class.simpleName}")
             }
@@ -119,6 +124,21 @@ class TableValidator(private val metadata: TableMetadata) {
 
         // 4. Check for extreme VE values
         checkExtremeVeValues(table.values, warnings)
+
+        // 5. Bloqueia tabela com parte relevante das células sem combustível (mistura pobre/motor não pega)
+        checkNoFuelVeValues(table.values, errors)
+    }
+
+    private fun checkNoFuelVeValues(values: List<List<Int>>, errors: MutableList<String>) {
+        val total = values.sumOf { it.size }
+        if (total == 0) return
+        val noFuel = values.sumOf { row -> row.count { it < VE_NO_FUEL_THRESHOLD } }
+        if (noFuel.toDouble() / total >= VE_NO_FUEL_MAX_CELL_FRACTION) {
+            errors.add(
+                "🚨 CRITICAL: $noFuel of $total VE cells are below ${VE_NO_FUEL_THRESHOLD.toInt()}% (no fuel). " +
+                    "This can cause a lean condition and ENGINE DAMAGE; table looks blank or corrupted."
+            )
+        }
     }
 
     private fun validateVeValues(values: List<List<Int>>, errors: MutableList<String>, warnings: MutableList<String>) {
@@ -160,6 +180,49 @@ class TableValidator(private val metadata: TableMetadata) {
 
         if (veryRichCount > 0) {
             warnings.add("⚠️  $veryRichCount cells with very rich VE (>${VE_VERY_RICH_THRESHOLD.toInt()}%) - excessive fuel consumption")
+        }
+    }
+
+    // ========================================
+    // AFR Target Table Validation
+    // ========================================
+
+    private fun validateAfrTable(table: AfrTable, errors: MutableList<String>, warnings: MutableList<String>) {
+        Logger.d(TAG, "Validating AFR Table...")
+        var outOfRange = 0
+        var hardLean = 0
+        var lean = 0
+        var rich = 0
+        table.values.forEachIndexed { row, rowValues ->
+            rowValues.forEachIndexed { col, raw ->
+                val afr = raw / 10.0
+                when {
+                    afr !in metadata.valueRange -> {
+                        outOfRange++
+                        if (outOfRange <= 5) {
+                            errors.add("AFR target out of range at [$row,$col]: $afr (valid: ${metadata.valueRange})")
+                        }
+                    }
+                    afr >= AFR_HARD_LEAN_THRESHOLD -> hardLean++
+                    afr > AFR_LEAN_THRESHOLD -> lean++
+                    afr < AFR_RICH_THRESHOLD -> rich++
+                }
+            }
+        }
+        if (outOfRange > 5) {
+            errors.add("... and ${outOfRange - 5} more AFR targets out of range")
+        }
+        if (hardLean > 0) {
+            errors.add(
+                "🚨 CRITICAL: $hardLean AFR targets >= ${AFR_HARD_LEAN_THRESHOLD.toInt()}:1 (dangerously lean). " +
+                    "This can cause SEVERE ENGINE DAMAGE (overheating/detonation)!"
+            )
+        }
+        if (lean > 0) {
+            warnings.add("⚠️  $lean AFR targets leaner than ${AFR_LEAN_THRESHOLD.toInt()}:1 - confirm this is intended (lean-burn)")
+        }
+        if (rich > 0) {
+            warnings.add("ℹ️  $rich AFR targets richer than ${AFR_RICH_THRESHOLD.toInt()}:1 - normal for E85/methanol, otherwise excess fuel")
         }
     }
 
