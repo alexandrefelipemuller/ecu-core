@@ -1,6 +1,7 @@
 package io.ecucore
 
 import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.model.DwellTable
 import io.ecucore.model.VeTable
 import io.ecucore.tables.TableDomainFacade
 import kotlinx.coroutines.runBlocking
@@ -97,6 +98,44 @@ class SpeeduinoClientVerifiedTableWriteTest {
         assertEquals(2, anomalies.size, "um evento por passe")
         assertTrue(anomalies.none { it.recovered })
         assertEquals(0, ecu.burns, "RAM divergente nunca pode ir pra EEPROM")
+    }
+
+    @Test
+    fun `dwell e conferido por read-back e so entao faz burn`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+        val table = DwellTable.createDefault()
+
+        client.writeDwellTable(table)
+
+        assertContentEquals(table.toByteArray(), ecu.read(12, 0, table.toByteArray().size))
+        assertEquals(1, ecu.burns)
+    }
+
+    @Test
+    fun `dwell com divergencia persistente lanca excecao e nao faz burn`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptEveryWrite = true)
+        val client = newClient(ecu)
+        client.connect()
+
+        val error = assertFailsWith<PageWriteVerificationException> { client.writeDwellTable(DwellTable.createDefault()) }
+
+        assertEquals(12, error.pageId)
+        assertEquals(0, ecu.burns, "RAM divergente nunca pode ir pra EEPROM")
+    }
+
+    @Test
+    fun `calibracao de TPS com divergencia persistente nao faz burn`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptEveryWrite = true)
+        val client = newClient(ecu)
+        client.connect()
+
+        assertFailsWith<PageWriteVerificationException> {
+            client.writeTpsCalibration(io.ecucore.model.TpsCalibration(tpsMin = 10, tpsMax = 240), burn = true)
+        }
+
+        assertEquals(0, ecu.burns)
     }
 
     private fun veTable(value: Int) = VeTable(

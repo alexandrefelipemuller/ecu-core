@@ -970,6 +970,19 @@ class SpeeduinoClient(
         invalidateCachedPage(pageNum.toInt() and 0xFF)
     }
 
+    /**
+     * Grava uma página de configuração e, em Speeduino, confere por read-back antes de o chamador
+     * fazer burn (mesma garantia das tabelas VE/Ign/AFR). Divergência persistente lança
+     * [PageWriteVerificationException]. Outras famílias mantêm a gravação simples.
+     */
+    private suspend fun writeConfigPageVerified(pageNum: Byte, offset: Int, data: ByteArray, label: String) {
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) {
+            writeSpeeduinoTableVerified(pageNum.toInt() and 0xFF, offset, data, label)
+        } else {
+            writeConfigPage(pageNum, offset, data)
+        }
+    }
+
     suspend fun readPage(pageNum: Byte, offset: Int, length: Int): ByteArray {
         return readPage(pageNum.toInt() and 0xFF, offset, length)
     }
@@ -1295,7 +1308,7 @@ class SpeeduinoClient(
         writeU16(basePage, 65, calibration.baroMax)
         writeS8(basePage, 67, calibration.emapMin)
         writeU16(basePage, 68, calibration.emapMax)
-        writeConfigPage(pageNum = 1, offset = 0, data = basePage)
+        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "Pressure Calibration")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1321,7 +1334,7 @@ class SpeeduinoClient(
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeU8(basePage, 44, calibration.tpsMin)
         writeU8(basePage, 45, calibration.tpsMax)
-        writeConfigPage(pageNum = 1, offset = 0, data = basePage)
+        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "TPS Calibration")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1410,8 +1423,8 @@ class SpeeduinoClient(
         val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
         val page4Data = settings.applyToPage4(basePage)
         val page7Data = settings.applyTargetRpmToPage7(targetPage)
-        writeConfigPage(pageNum = IdleControlSettings.PAGE_NUMBER.toByte(), offset = 0, data = page4Data)
-        writeConfigPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER.toByte(), offset = 0, data = page7Data)
+        writeConfigPageVerified(IdleControlSettings.PAGE_NUMBER.toByte(), 0, page4Data, "Idle Control (Page 4)")
+        writeConfigPageVerified(IdleControlSettings.TARGET_PAGE_NUMBER.toByte(), 0, page7Data, "Idle Target (Page 7)")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1547,10 +1560,11 @@ class SpeeduinoClient(
         )
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
         val updatedData = EngineProtectionMapper.applyToPage(basePage, config, era)
-        writeConfigPage(
+        writeConfigPageVerified(
             pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
             offset = 0,
-            data = updatedData
+            data = updatedData,
+            label = "Engine Protection",
         )
         if (burn) {
             delay(300)
@@ -1577,10 +1591,11 @@ class SpeeduinoClient(
             length = ClosedLoopCorrectionMapper.PAGE_SIZE
         )
         val updatedData = ClosedLoopCorrectionMapper.applyToPage(basePage, config, era)
-        writeConfigPage(
+        writeConfigPageVerified(
             pageNum = ClosedLoopCorrectionMapper.PAGE_NUMBER.toByte(),
             offset = 0,
-            data = updatedData
+            data = updatedData,
+            label = "Closed Loop Corrections",
         )
         if (burn) {
             delay(300)
@@ -1629,10 +1644,11 @@ class SpeeduinoClient(
             length = TriggerSettings.PAGE_LENGTH
         )
         val updatedData = settings.toPageData(basePage)
-        writeConfigPage(
+        writeConfigPageVerified(
             pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
             offset = 0,
-            data = updatedData
+            data = updatedData,
+            label = "Trigger Settings",
         )
         if (burn) {
             delay(300)
@@ -1657,10 +1673,11 @@ class SpeeduinoClient(
         val original = baseData.firstOrNull()?.toInt()?.and(0xFF) ?: 0
         val updated = config.applyToByte(original)
 
-        writeConfigPage(
+        writeConfigPageVerified(
             pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
             offset = SecondarySerialConfig.OFFSET,
-            data = byteArrayOf(updated.toByte())
+            data = byteArrayOf(updated.toByte()),
+            label = "Secondary Serial",
         )
 
         if (burn) {
@@ -1858,7 +1875,7 @@ class SpeeduinoClient(
             Logger.d(TAG, "Page 1 serializada: ${pageData.size} bytes")
 
             // Write to ECU
-            writeConfigPage(pageNum = 1, offset = 0, data = pageData)
+            writeConfigPageVerified(pageNum = 1, offset = 0, data = pageData, label = "Engine Constants (Page 1)")
             Logger.d(TAG, "Page 1 gravada com sucesso")
 
             // Burn to EEPROM
@@ -2260,7 +2277,7 @@ class SpeeduinoClient(
         val pageData = dwellTable.toByteArray()
         Logger.d(TAG, "Dwell Table serializada: ${pageData.size} bytes")
 
-        writeConfigPage(pageNum = 12.toByte(), offset = 0, data = pageData)
+        writeConfigPageVerified(pageNum = 12.toByte(), offset = 0, data = pageData, label = "Dwell Table")
         Logger.d(TAG, "Dwell Table enviada")
 
         delay(1000)
