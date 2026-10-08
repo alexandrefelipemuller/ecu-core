@@ -190,6 +190,13 @@ class SpeeduinoClient(
      */
     var tableChangeGuard: (suspend (TableChangeAssessment) -> Boolean)? = null
 
+    /**
+     * Autorização opcional antes de qualquer escrita/burn (ex.: aviso de uso, veículo em movimento).
+     * Recebe o nome da operação; false cancela com [WriteNotPermittedException] antes de enviar algo.
+     * Chamada depois do modo somente leitura. Nulo (padrão) = sem checagem.
+     */
+    var writeGuard: (suspend (operation: String) -> Boolean)? = null
+
     private fun isMsOrRusefiFamily(): Boolean = when (firmwareInfo?.family) {
         EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI -> true
         else -> false
@@ -3552,12 +3559,14 @@ class SpeeduinoClient(
         data[offset + 1] = ((clamped shr 8) and 0xFF).toByte()
     }
 
-    private fun ensureWritable(operation: String) {
+    private suspend fun ensureWritable(operation: String) {
         if (readOnlySafeModeEnabled) {
             throw IllegalStateException(
                 "Read-only safe mode enabled ($operation blocked). Disable manual firmware profile to write."
             )
         }
+        val guard = writeGuard ?: return
+        if (!guard(operation)) throw WriteNotPermittedException(operation)
     }
 
     /**

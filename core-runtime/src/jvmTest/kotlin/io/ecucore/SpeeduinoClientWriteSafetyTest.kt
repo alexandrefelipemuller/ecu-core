@@ -219,6 +219,52 @@ class SpeeduinoClientWriteSafetyTest {
         assertEquals(0, ecu.burns)
     }
 
+    @Test
+    fun `writeGuard negado cancela toda escrita sem enviar bytes`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        val sentBefore = ecu.sent
+        val operations = mutableListOf<String>()
+        client.writeGuard = { operations += it; false }
+
+        val error = assertFailsWith<io.ecucore.WriteNotPermittedException> { client.writeVeTable(veTable(40), 1) }
+        assertFailsWith<io.ecucore.WriteNotPermittedException> { client.writeTpsCalibration(TpsCalibration(10, 240), burn = true) }
+        assertFailsWith<io.ecucore.WriteNotPermittedException> { client.writeRawPage(2, ByteArray(16)) }
+        assertFailsWith<io.ecucore.WriteNotPermittedException> { client.burnConfigs() }
+
+        assertEquals("writeVeTable", error.operation)
+        assertEquals(listOf("writeVeTable", "writeTpsCalibration", "writeRawPage", "burnConfigs"), operations)
+        assertEquals(sentBefore, ecu.sent)
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `writeGuard aprovado deixa a escrita seguir`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        client.writeGuard = { true }
+
+        client.writeIgnitionTable(ignitionTable(10), 1)
+
+        assertEquals(1, ecu.burns)
+    }
+
+    @Test
+    fun `modo somente leitura vence o writeGuard`() = runBlocking {
+        val ecu = CountingEcu()
+        val client = newClient(ecu)
+        client.connect()
+        client.setManualFirmwareProfile("speeduino 202501", readOnly = true)
+        var asked = false
+        client.writeGuard = { asked = true; true }
+
+        assertFailsWith<IllegalStateException> { client.writeVeTable(veTable(40), 1) }
+
+        assertEquals(false, asked)
+    }
+
     private fun veTable(value: Int) = VeTable(
         rpmBins = (1..16).map { it * 500 },
         loadBins = (1..16).map { it * 10 },
