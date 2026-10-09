@@ -101,6 +101,39 @@ class SpeeduinoClientVerifiedTableWriteTest {
     }
 
     @Test
+    fun `divergencia persistente restaura a RAM ao valor anterior e nao faz burn`() = runBlocking {
+        // 5 chunks x 2 passes = 10 gravações corrompidas; o rollback (11ª em diante) sai limpo
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptFirstWrites = 10)
+        val client = newClient(ecu)
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        val original = TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data
+        ecu.load(metadata.page, metadata.offset, original)
+
+        val error = assertFailsWith<PageWriteVerificationException> { client.writeVeTable(veTable(50), 1) }
+
+        assertTrue(error.rolledBack, "a RAM deveria ter voltado ao valor anterior")
+        assertTrue(error.message!!.contains("valor anterior restaurado"))
+        assertContentEquals(original, ecu.read(metadata.page, metadata.offset, original.size))
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `rollback que tambem falha e informado e a RAM pode estar divergente`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptEveryWrite = true)
+        val client = newClient(ecu)
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
+
+        val error = assertFailsWith<PageWriteVerificationException> { client.writeVeTable(veTable(50), 1) }
+
+        assertEquals(false, error.rolledBack)
+        assertTrue(error.message!!.contains("pode estar divergente"))
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
     fun `dwell e conferido por read-back e so entao faz burn`() = runBlocking {
         val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
         val client = newClient(ecu)
@@ -211,6 +244,7 @@ class SpeeduinoClientVerifiedTableWriteTest {
         private val rejectWriteNumber: Int?,
         private val corruptOffsetOnReject: Int,
         private val corruptEveryWrite: Boolean = false,
+        private val corruptFirstWrites: Int = 0,
     ) : ISpeeduinoConnection {
         private val pages = mutableMapOf<Int, ByteArray>()
         private val handshake = mutableMapOf(
@@ -256,7 +290,7 @@ class SpeeduinoClientVerifiedTableWriteTest {
                         pending += rc(0x82)
                     } else {
                         p.copyInto(page(pageNum), offset, 6, 6 + length)
-                        if (corruptEveryWrite) page(pageNum)[corruptOffsetOnReject] = 212.toByte()
+                        if (corruptEveryWrite || writes <= corruptFirstWrites) page(pageNum)[corruptOffsetOnReject] = 212.toByte()
                         pending += rc(0x00)
                     }
                 }

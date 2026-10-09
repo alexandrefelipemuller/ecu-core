@@ -2091,6 +2091,8 @@ class SpeeduinoClient(
      * e o chamador NÃO faz burn - a EEPROM continua com a tabela anterior, íntegra.
      */
     private suspend fun writeSpeeduinoTableVerified(pageNum: Int, offset: Int, data: ByteArray, label: String) {
+        // Imagem anterior da região, para restaurar a RAM se a gravação não puder ser confirmada.
+        val original = captureSpeeduinoRegion(pageNum, offset, data.size)
         var mismatches: List<Int> = emptyList()
         var lastWriteError: Exception? = null
         var retriedWriteError: Exception? = null
@@ -2158,13 +2160,56 @@ class SpeeduinoClient(
                     "(offsets ${mismatches.take(8).joinToString()}); regravando"
             )
         }
+        // Não confirmou: devolve a RAM ao valor anterior (o burn nunca aconteceu, então a EEPROM
+        // já está íntegra). Sem a imagem anterior, ou se nem a restauração confirmar, avisa.
+        val rolledBack = original != null && original.size == data.size &&
+            rollbackSpeeduinoRegion(pageNum, offset, original, label)
         report(recovered = false)
         throw PageWriteVerificationException(
             pageId = pageNum,
             label = label,
             mismatchedOffsets = mismatches,
             cause = lastWriteError,
+            rolledBack = rolledBack,
         )
+    }
+
+    /** Lê a região atual da ECU antes de sobrescrevê-la; `null` se não foi possível. */
+    private suspend fun captureSpeeduinoRegion(pageNum: Int, offset: Int, length: Int): ByteArray? {
+        return try {
+            invalidateCachedPage(pageNum)
+            pendingSpeeduinoPageReadbacks.remove(pageNum)
+            val bytes = readPage(pageNum, offset, length)
+            invalidateCachedPage(pageNum)
+            bytes.takeIf { it.size == length }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "Região anterior ilegível (página $pageNum); sem rollback automático: ${e.message}")
+            null
+        }
+    }
+
+    /** Regrava [original] e confere por read-back. Nunca faz burn. */
+    private suspend fun rollbackSpeeduinoRegion(pageNum: Int, offset: Int, original: ByteArray, label: String): Boolean {
+        return try {
+            Logger.w(TAG, "$label: gravação não confirmada; restaurando o valor anterior na RAM")
+            writePageChunksWithRetry(pageNum, original, TABLE_WRITE_CHUNK_SIZE, offset)
+            delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+            invalidateCachedPage(pageNum)
+            pendingSpeeduinoPageReadbacks.remove(pageNum)
+            val readBack = readPage(pageNum, offset, original.size)
+            invalidateCachedPage(pageNum)
+            val restored = readBack.size >= original.size && original.indices.all { readBack[it] == original[it] }
+            Logger.w(TAG, "$label: rollback ${if (restored) "confirmado" else "NÃO confirmado"}")
+            restored
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "$label: rollback falhou: ${e.message}")
+            false
+        }
     }
 
     suspend fun writeRawPageChunkedWithoutBurn(pageNum: Byte, data: ByteArray, chunkSize: Int = 64, startOffset: Int = 0) {

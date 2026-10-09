@@ -376,6 +376,7 @@ class SpeeduinoClientEdgeCasesTest {
     @Test
     fun `cancellation during a table write is not retried`() = runBlocking<Unit> {
         val (c, ecu, _) = veWriteSetup()
+        ecu.sendErrors += null // 1º envio: leitura da imagem anterior (rollback); o erro vem na gravação
         ecu.sendErrors += CancellationException("cancelado")
         assertFailsWith<CancellationException> { c.writeVeTable(VeTable.createDefault(), 1) }
     }
