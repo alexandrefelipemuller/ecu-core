@@ -46,7 +46,12 @@ class SpeeduinoClientMs2ConfigTest {
         val client = SpeeduinoClient(connection = connection, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
         client.connect()
         val current = client.readVeTable()
-        val edited = current.copy(values = current.values.map { row -> row.map { 120 } })
+        // eixos válidos: a validação roda antes do guard
+        val edited = current.copy(
+            rpmBins = current.rpmBins.indices.map { (it + 1) * 500 },
+            loadBins = current.loadBins.indices.map { (it + 1) * 10 },
+            values = current.values.map { row -> row.map { 120 } },
+        )
         var assessed: io.ecucore.model.TableChangeAssessment? = null
         client.tableChangeGuard = { assessed = it; false }
 
@@ -58,23 +63,23 @@ class SpeeduinoClientMs2ConfigTest {
     }
 
     @Test
-    fun `MS2 sem guard nao faz leitura extra antes de gravar`() = runBlocking {
+    fun `MS2 confere a gravacao por read-back e nao faz burn quando a ECU nao persiste`() = runBlocking {
+        // Esta ECU falsa devolve sempre o mesmo padrão: nada do que se grava é lido de volta.
         val connection = FakeMs2Connection(modernFallback = true)
         val client = SpeeduinoClient(connection = connection, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
         client.connect()
         val current = client.readVeTable()
-        val readsBefore = connection.envelopedTableReads
-
         val valid = current.copy(
             rpmBins = current.rpmBins.indices.map { (it + 1) * 500 },
             loadBins = current.loadBins.indices.map { (it + 1) * 10 },
             values = current.values.map { row -> row.map { 60 } },
         )
 
-        client.writeVeTable(valid)
+        val error = kotlin.test.assertFailsWith<PageWriteVerificationException> { client.writeVeTable(valid) }
 
-        assertEquals(readsBefore, connection.envelopedTableReads)
-        assertTrue(connection.envelopedTableWrites.isNotEmpty())
+        assertTrue(connection.envelopedTableWrites.isNotEmpty(), "a gravação foi tentada")
+        assertTrue(connection.envelopedBurns.isEmpty(), "sem confirmação, sem burn")
+        assertTrue(error.rolledBack)
     }
 
     private suspend fun assertMs2ConfigWriteUsesEnvelope(connection: FakeMs2Connection) {

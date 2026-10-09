@@ -206,7 +206,7 @@ class SpeeduinoClientIniAndConnectTest {
         )
         c.writeVeTable(VeTable.createDefault(), 1)
         c.writeIgnitionTable(ign, 1)
-        c.writeAfrTable(AfrTable(rpmBins = (1..12).map { it * 500 }, loadBins = (1..12).map { it * 10 }, values = List(12) { List(12) { 14 } }))
+        c.writeAfrTable(AfrTable(rpmBins = (1..12).map { it * 500 }, loadBins = (1..12).map { it * 10 }, values = List(12) { List(12) { 147 } }))
         assertTrue(ecu.writes.isNotEmpty())
     }
 

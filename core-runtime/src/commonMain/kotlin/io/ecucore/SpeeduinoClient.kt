@@ -40,6 +40,9 @@ import io.ecucore.model.TableMetadata
 import io.ecucore.model.TableValidator
 import io.ecucore.model.UnsupportedFirmwareException
 import io.ecucore.model.ConfigValidator
+import io.ecucore.model.SerializedMs2Table
+import io.ecucore.model.SerializedMs3Table
+import io.ecucore.model.SerializedRusefiTable
 import io.ecucore.model.TableChangeAnalyzer
 import io.ecucore.model.TableChangeAssessment
 import io.ecucore.model.TableChangeKind
@@ -196,11 +199,6 @@ class SpeeduinoClient(
      * Chamada depois do modo somente leitura. Nulo (padrão) = sem checagem.
      */
     var writeGuard: (suspend (operation: String) -> Boolean)? = null
-
-    private fun isMsOrRusefiFamily(): Boolean = when (firmwareInfo?.family) {
-        EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI -> true
-        else -> false
-    }
 
     private suspend fun confirmTableChange(
         kind: TableChangeKind,
@@ -1330,6 +1328,7 @@ class SpeeduinoClient(
      */
     override suspend fun writePressureCalibration(calibration: PressureCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writePressureCalibration")
+        requireSpeeduinoLayout("writePressureCalibration")
         ConfigValidator.requireValid(ConfigValidator.validatePressureCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeS8(basePage, 46, calibration.mapMin)
@@ -1361,6 +1360,7 @@ class SpeeduinoClient(
      */
     override suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeTpsCalibration")
+        requireSpeeduinoLayout("writeTpsCalibration")
         ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeU8(basePage, 44, calibration.tpsMin)
@@ -1580,6 +1580,7 @@ class SpeeduinoClient(
      */
     override suspend fun writeEngineProtectionConfig(config: EngineProtectionConfig, burn: Boolean) {
         ensureWritable("writeEngineProtectionConfig")
+        requireSpeeduinoLayout("writeEngineProtectionConfig")
         ConfigValidator.requireValid(ConfigValidator.validateEngineProtection(config))
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("Engine Protection rusEFI ainda não mapeado nesta versão")
@@ -1656,14 +1657,17 @@ class SpeeduinoClient(
                 blockSize = 256
             )
             val updatedData = settings.toMs2PageData(basePage)
-            protocol.writeTable(
-                tableId = TriggerSettings.MS2_PAGE_NUMBER,
-                offset = 0,
-                data = updatedData
+            val changed = updatedData.indices.filter { it >= basePage.size || updatedData[it] != basePage[it] }.toSet()
+            val tableId = TriggerSettings.MS2_PAGE_NUMBER.toInt() and 0xFF
+            writeMsTableVerified(
+                TableRegions(
+                    listOf(TableRegion(tableId, 0, updatedData)),
+                    if (burn) setOf(tableId) else emptySet(),
+                    verifyOnly = changed,
+                ),
+                "Trigger Settings MS2",
             )
             if (burn) {
-                delay(300)
-                protocol.burnTable(TriggerSettings.MS2_PAGE_NUMBER)
                 Logger.d(TAG, "Trigger Settings MS2 gravados e burn executado")
             } else {
                 Logger.d(TAG, "Trigger Settings MS2 gravados (sem burn)")
@@ -1698,6 +1702,7 @@ class SpeeduinoClient(
      */
     override suspend fun writeSecondarySerialConfig(config: SecondarySerialConfig, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeSecondarySerialConfig")
+        requireSpeeduinoLayout("writeSecondarySerialConfig")
         Logger.d(TAG, "Gravando Secondary Serial Config (Page 9)...")
         val baseData = readPage(
             pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
@@ -1897,8 +1902,11 @@ class SpeeduinoClient(
             Logger.d(TAG, "Gravando Engine Constants MS2/MS3 (Page 0x04)...")
             val basePage = readFullPage(pageNum = 0x04, pageSize = 1024, blockSize = 256)
             val pageData = engineConstants.applyToMs2Page1(basePage)
-            protocol.writeTable(tableId = 0x04, offset = 0, data = pageData)
-            protocol.burnTable(tableId = 0x04)
+            val changed = pageData.indices.filter { it >= basePage.size || pageData[it] != basePage[it] }.toSet()
+            writeMsTableVerified(
+                TableRegions(listOf(TableRegion(0x04, 0, pageData)), setOf(0x04), verifyOnly = changed),
+                "Engine Constants (MS page 0x04)",
+            )
             Logger.d(TAG, "Page 0x04 gravada com sucesso")
         } else {
             Logger.d(TAG, "Gravando Engine Constants (Page 1)...")
@@ -2258,11 +2266,6 @@ class SpeeduinoClient(
      */
     override suspend fun writeVeTable(veTable: VeTable, mapIndex: Int) {
         ensureWritable("writeVeTable")
-        // Speeduino confirma depois da validação (dentro do caminho abaixo); as demais famílias,
-        // aqui, antes de seguirem para o seu serializador próprio.
-        if (isMsOrRusefiFamily()) {
-            confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(mapIndex).values }
-        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             writeMs2VeTable(veTable)
             return
@@ -2313,9 +2316,6 @@ class SpeeduinoClient(
      */
     override suspend fun writeIgnitionTable(ignitionTable: IgnitionTable, mapIndex: Int) {
         ensureWritable("writeIgnitionTable")
-        if (isMsOrRusefiFamily()) {
-            confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(mapIndex).values }
-        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             writeMs2IgnitionTable(ignitionTable)
             return
@@ -2722,9 +2722,6 @@ class SpeeduinoClient(
      */
     override suspend fun writeAfrTable(afrTable: AfrTable) {
         ensureWritable("writeAfrTable")
-        if (isMsOrRusefiFamily()) {
-            confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
-        }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             writeMs2AfrTable(afrTable)
             return
@@ -2758,19 +2755,187 @@ class SpeeduinoClient(
         Logger.d(TAG, "✅ Burn executado com sucesso!")
     }
 
+    // ---- Escrita verificada de tabelas MS2/MS3/MegaSpeed/rusEFI --------------------------------------------------
+
+    private class TableRegion(val tableId: Int, val offset: Int, val data: ByteArray)
+
+    /**
+     * [verifyOnly]: índices (no dado concatenado) que o read-back deve conferir. `null` = todos.
+     * Usado em páginas de configuração inteiras, onde a ECU pode recalcular campos que não
+     * fazem parte da alteração (conferir tudo geraria falso erro).
+     */
+    private class TableRegions(
+        val list: List<TableRegion>,
+        val burnTableIds: Set<Int>,
+        val verifyOnly: Set<Int>? = null,
+    )
+
+    private fun SerializedMs2Table.toRegions() = TableRegions(
+        listOf(
+            TableRegion(valuesTableId, valuesOffset, valuesData),
+            TableRegion(rpmAxisTableId, rpmAxisOffset, rpmAxisData),
+            TableRegion(loadAxisTableId, loadAxisOffset, loadAxisData),
+        ),
+        burnTableIds,
+    )
+
+    private fun SerializedMs3Table.toRegions() = TableRegions(
+        listOf(
+            TableRegion(valuesTableId, valuesOffset, valuesData),
+            TableRegion(rpmAxisTableId, rpmAxisOffset, rpmAxisData),
+            TableRegion(loadAxisTableId, loadAxisOffset, loadAxisData),
+        ),
+        burnTableIds,
+    )
+
+    private fun SerializedRusefiTable.toRegions() = TableRegions(
+        listOf(
+            TableRegion(valuesTableId, valuesOffset, valuesData),
+            TableRegion(rpmAxisTableId, rpmAxisOffset, rpmAxisData),
+            TableRegion(loadAxisTableId, loadAxisOffset, loadAxisData),
+        ),
+        burnTableIds,
+    )
+
+    private suspend fun writeMsTableVerified(regions: TableRegions, label: String) =
+        writeRegionsVerified(
+            regions = regions,
+            label = label,
+            write = { protocol.writeTable(it.tableId.toByte(), it.offset, it.data) },
+            burn = { protocol.burnTable(it.toByte()) },
+        )
+
+    private suspend fun writeRusefiTableVerified(regions: TableRegions, label: String) =
+        writeRegionsVerified(
+            regions = regions,
+            label = label,
+            write = { protocol.writeTable(it.tableId, it.offset, it.data, EcuFamily.RUSEFI) },
+            burn = { burnTableIfSupported(it, EcuFamily.RUSEFI) },
+        )
+
+    /**
+     * Mesma garantia do Speeduino para as demais famílias: grava as regiões da tabela (valores e
+     * eixos), confere por read-back antes do burn e, se a RAM não confirmar após regravar, devolve
+     * as regiões ao valor anterior (sem burn) e lança [PageWriteVerificationException].
+     */
+    private suspend fun writeRegionsVerified(
+        regions: TableRegions,
+        label: String,
+        write: suspend (TableRegion) -> Unit,
+        burn: suspend (Int) -> Unit,
+    ) {
+        val originals = captureRegions(regions)
+        var mismatches: List<Int> = emptyList()
+        var lastError: Exception? = null
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        val expected = regions.list.fold(ByteArray(0)) { acc, r -> acc + r.data }
+        for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
+            var writeError: Exception? = null
+            try {
+                regions.list.forEach { write(it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                writeError = e
+                Logger.w(TAG, "$label: escrita falhou no passe $pass: ${e.message}")
+            }
+            delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+            var readError: Exception? = null
+            val actual = try {
+                regions.list.fold(ByteArray(0)) { acc, r -> acc + readConfigChunk(r.tableId, r.offset, r.data.size) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                readError = e
+                null
+            }
+            lastError = readError ?: writeError
+            val checked = regions.verifyOnly?.sorted() ?: expected.indices.toList()
+            mismatches = if (actual == null) {
+                checked
+            } else {
+                checked.filter { it >= actual.size || actual[it] != expected[it] }
+            }
+            if (mismatches.isEmpty() && readError == null) {
+                if (writeError != null) {
+                    Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${writeError.message})")
+                }
+                anomalies.forEach { event ->
+                    runCatching { pageWriteAnomalyListener?.invoke(event.copy(recovered = true)) }
+                }
+                delay(300)
+                regions.burnTableIds.sorted().forEach { burn(it) }
+                return
+            }
+            val shown = mismatches.take(16)
+            anomalies += PageWriteAnomaly(
+                pageId = regions.list.first().tableId,
+                label = label,
+                pass = pass,
+                mismatchedOffsets = mismatches,
+                expected = shown.map { expected[it].toInt() and 0xFF },
+                actual = shown.map { actual?.getOrNull(it)?.toInt()?.and(0xFF) ?: -1 },
+                writeErrorMessage = lastError?.message,
+                writeResponseCode = (writeError as? SpeeduinoProtocol.PageWriteRejectedException)?.responseCode,
+                recovered = false,
+            )
+            Logger.w(TAG, "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass; regravando")
+        }
+        val rolledBack = originals != null && rollbackRegions(regions, originals, write, label)
+        anomalies.forEach { event -> runCatching { pageWriteAnomalyListener?.invoke(event) } }
+        throw PageWriteVerificationException(
+            pageId = regions.list.first().tableId,
+            label = label,
+            mismatchedOffsets = mismatches,
+            cause = lastError,
+            rolledBack = rolledBack,
+        )
+    }
+
+    private suspend fun captureRegions(regions: TableRegions): List<ByteArray>? = try {
+        regions.list.map { readConfigChunk(it.tableId, it.offset, it.data.size) }
+            .takeIf { read -> read.indices.all { read[it].size == regions.list[it].data.size } }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Logger.w(TAG, "Regiões anteriores ilegíveis; sem rollback automático: ${e.message}")
+        null
+    }
+
+    private suspend fun rollbackRegions(
+        regions: TableRegions,
+        originals: List<ByteArray>,
+        write: suspend (TableRegion) -> Unit,
+        label: String,
+    ): Boolean = try {
+        Logger.w(TAG, "$label: gravação não confirmada; restaurando o valor anterior na RAM")
+        regions.list.forEachIndexed { i, r -> write(TableRegion(r.tableId, r.offset, originals[i])) }
+        delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+        runCatching { connection.clearInputBuffer() }
+        val restored = regions.list.indices.all { i ->
+            val r = regions.list[i]
+            readConfigChunk(r.tableId, r.offset, originals[i].size).contentEquals(originals[i])
+        }
+        Logger.w(TAG, "$label: rollback ${if (restored) "confirmado" else "NÃO confirmado"}")
+        restored
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Logger.w(TAG, "$label: rollback falhou: ${e.message}")
+        false
+    }
+
     private suspend fun writeMs3VeTable(veTable: VeTable) {
         val validationResult = TableValidator(Ms3TableDefinitions.VE_TABLE_1.metadata)
             .validateBeforeWrite(veTable)
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
 
         val serialized = Ms3TableDefinitions.serializeVeTable(veTable)
-        protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-        protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-        protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+        writeMsTableVerified(serialized.toRegions(), "MS3 VE Table 1")
         Logger.d(TAG, "✅ MS3 VE Table 1 gravada e burn executado")
     }
 
@@ -2781,12 +2946,9 @@ class SpeeduinoClient(
                 if (!validationResult.isValid) {
                     throw ValidationException(validationResult)
                 }
+                confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
                 val serialized = MegaSpeedIniTableDefinitions.serializeVeTable(catalog.veTable, veTable)
-                protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-                protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-                protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-                delay(300)
-                serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+                writeMsTableVerified(serialized.toRegions(), "MegaSpeed VE Table 1")
                 Logger.d(TAG, "✅ MegaSpeed VE Table 1 gravada via .ini e burn executado")
                 return
             }
@@ -2796,13 +2958,10 @@ class SpeeduinoClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
 
         val serialized = Ms2TableDefinitions.serializeVeTable(veTable)
-        protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-        protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-        protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+        writeMsTableVerified(serialized.toRegions(), "MS2 VE Table 1")
         Logger.d(TAG, "✅ MS2 VE Table 1 gravada e burn executado")
     }
 
@@ -2812,13 +2971,10 @@ class SpeeduinoClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
 
         val serialized = Ms3TableDefinitions.serializeIgnitionTable(ignitionTable)
-        protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-        protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-        protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+        writeMsTableVerified(serialized.toRegions(), "MS3 Ignition Table 1")
         Logger.d(TAG, "✅ MS3 Ignition Table 1 gravada e burn executado")
     }
 
@@ -2829,12 +2985,9 @@ class SpeeduinoClient(
                 if (!validationResult.isValid) {
                     throw ValidationException(validationResult)
                 }
+                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
                 val serialized = MegaSpeedIniTableDefinitions.serializeIgnitionTable(catalog.ignitionTable, ignitionTable)
-                protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-                protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-                protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-                delay(300)
-                serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+                writeMsTableVerified(serialized.toRegions(), "MegaSpeed Ignition Table 1")
                 Logger.d(TAG, "✅ MegaSpeed Ignition Table 1 gravada via .ini e burn executado")
                 return
             }
@@ -2844,45 +2997,36 @@ class SpeeduinoClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
 
         val serialized = Ms2TableDefinitions.serializeIgnitionTable(ignitionTable)
-        protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-        protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-        protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+        writeMsTableVerified(serialized.toRegions(), "MS2 Ignition Table 1")
         Logger.d(TAG, "✅ MS2 Ignition Table 1 gravada e burn executado")
     }
 
     private suspend fun writeMs3AfrTable(afrTable: AfrTable) {
+        ConfigValidator.requireValid(TableValidator(Ms3TableDefinitions.AFR_TABLE_1.metadata).validateBeforeWrite(afrTable))
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
         val serialized = Ms3TableDefinitions.serializeAfrTable(afrTable)
-        protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-        protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-        protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+        writeMsTableVerified(serialized.toRegions(), "MS3 AFR Table 1")
         Logger.d(TAG, "✅ MS3 AFR Table 1 gravada e burn executado")
     }
 
     private suspend fun writeMs2AfrTable(afrTable: AfrTable) {
         if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
             megaSpeedIniCatalog?.let { catalog ->
+                ConfigValidator.requireValid(TableValidator(catalog.afrTable.metadata).validateBeforeWrite(afrTable))
+                confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
                 val serialized = MegaSpeedIniTableDefinitions.serializeAfrTable(catalog.afrTable, afrTable)
-                protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-                protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-                protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-                delay(300)
-                serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+                writeMsTableVerified(serialized.toRegions(), "MegaSpeed AFR Table 1")
                 Logger.d(TAG, "✅ MegaSpeed AFR Table 1 gravada via .ini e burn executado")
                 return
             }
         }
+        ConfigValidator.requireValid(TableValidator(Ms2TableDefinitions.AFR_TABLE_1.metadata).validateBeforeWrite(afrTable))
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
         val serialized = Ms2TableDefinitions.serializeAfrTable(afrTable)
-        protocol.writeTable(serialized.valuesTableId.toByte(), serialized.valuesOffset, serialized.valuesData)
-        protocol.writeTable(serialized.rpmAxisTableId.toByte(), serialized.rpmAxisOffset, serialized.rpmAxisData)
-        protocol.writeTable(serialized.loadAxisTableId.toByte(), serialized.loadAxisOffset, serialized.loadAxisData)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { protocol.burnTable(it.toByte()) }
+        writeMsTableVerified(serialized.toRegions(), "MS2 AFR Table 1")
         Logger.d(TAG, "✅ MS2 AFR Table 1 gravada e burn executado")
     }
 
@@ -2892,17 +3036,14 @@ class SpeeduinoClient(
             if (!validationResult.isValid) {
                 throw ValidationException(validationResult)
             }
+            confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
             val serialized = RusefiTableDefinitions.serializeVeTableWithLayout(
                 layout = catalog.veTable,
                 table = veTable,
                 signedValues = false,
                 valueScale = 10,
             )
-        protocol.writeTable(serialized.valuesTableId, serialized.valuesOffset, serialized.valuesData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.rpmAxisTableId, serialized.rpmAxisOffset, serialized.rpmAxisData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.loadAxisTableId, serialized.loadAxisOffset, serialized.loadAxisData, EcuFamily.RUSEFI)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { burnTableIfSupported(it, EcuFamily.RUSEFI) }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI VE Table 1")
         pendingRusefiVeTableReadback = veTable.copy()
         Logger.d(TAG, "✅ rusEFI VE Table 1 gravada via .ini e burn executado")
         return
@@ -2915,17 +3056,14 @@ class SpeeduinoClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
 
         val serialized = if (isF407Discovery) {
             RusefiF407DiscoveryDefinitions.serializeVeTable(veTable)
         } else {
             RusefiTableDefinitions.serializeVeTable(veTable)
         }
-        protocol.writeTable(serialized.valuesTableId, serialized.valuesOffset, serialized.valuesData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.rpmAxisTableId, serialized.rpmAxisOffset, serialized.rpmAxisData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.loadAxisTableId, serialized.loadAxisOffset, serialized.loadAxisData, EcuFamily.RUSEFI)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { burnTableIfSupported(it, EcuFamily.RUSEFI) }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI VE Table 1")
         pendingRusefiVeTableReadback = veTable.copy()
         Logger.d(TAG, "✅ rusEFI VE Table 1 gravada e burn executado")
     }
@@ -2936,12 +3074,9 @@ class SpeeduinoClient(
             if (!validationResult.isValid) {
                 throw ValidationException(validationResult)
             }
+            confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
             val serialized = RusefiTableDefinitions.serializeIgnitionTableWithLayout(catalog.ignitionTable, ignitionTable)
-        protocol.writeTable(serialized.valuesTableId, serialized.valuesOffset, serialized.valuesData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.rpmAxisTableId, serialized.rpmAxisOffset, serialized.rpmAxisData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.loadAxisTableId, serialized.loadAxisOffset, serialized.loadAxisData, EcuFamily.RUSEFI)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { burnTableIfSupported(it, EcuFamily.RUSEFI) }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI Ignition Table 1")
         pendingRusefiIgnitionTableReadback = ignitionTable.copy()
         Logger.d(TAG, "✅ rusEFI Ignition Table 1 gravada via .ini e burn executado")
         return
@@ -2954,44 +3089,37 @@ class SpeeduinoClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
 
         val serialized = if (isF407Discovery) {
             RusefiF407DiscoveryDefinitions.serializeIgnitionTable(ignitionTable)
         } else {
             RusefiTableDefinitions.serializeIgnitionTable(ignitionTable)
         }
-        protocol.writeTable(serialized.valuesTableId, serialized.valuesOffset, serialized.valuesData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.rpmAxisTableId, serialized.rpmAxisOffset, serialized.rpmAxisData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.loadAxisTableId, serialized.loadAxisOffset, serialized.loadAxisData, EcuFamily.RUSEFI)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { burnTableIfSupported(it, EcuFamily.RUSEFI) }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI Ignition Table 1")
         pendingRusefiIgnitionTableReadback = ignitionTable.copy()
         Logger.d(TAG, "✅ rusEFI Ignition Table 1 gravada e burn executado")
     }
 
     private suspend fun writeRusefiAfrTable(afrTable: AfrTable) {
         rusefiIniCatalog?.let { catalog ->
+            ConfigValidator.requireValid(TableValidator(catalog.afrTable.metadata).validateBeforeWrite(afrTable))
+            confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
             val serialized = RusefiTableDefinitions.serializeAfrTableWithLayout(catalog.afrTable, afrTable)
-        protocol.writeTable(serialized.valuesTableId, serialized.valuesOffset, serialized.valuesData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.rpmAxisTableId, serialized.rpmAxisOffset, serialized.rpmAxisData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.loadAxisTableId, serialized.loadAxisOffset, serialized.loadAxisData, EcuFamily.RUSEFI)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { burnTableIfSupported(it, EcuFamily.RUSEFI) }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI AFR Table 1")
         Logger.d(TAG, "✅ rusEFI AFR Table 1 gravada via .ini e burn executado")
         return
         }
         val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
         val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        ConfigValidator.requireValid(TableValidator((if (isF407Discovery) RusefiF407DiscoveryDefinitions.AFR_TABLE_1.metadata else RusefiTableDefinitions.AFR_TABLE_1.metadata)).validateBeforeWrite(afrTable))
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
         val serialized = if (isF407Discovery) {
             RusefiF407DiscoveryDefinitions.serializeAfrTable(afrTable)
         } else {
             RusefiTableDefinitions.serializeAfrTable(afrTable)
         }
-        protocol.writeTable(serialized.valuesTableId, serialized.valuesOffset, serialized.valuesData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.rpmAxisTableId, serialized.rpmAxisOffset, serialized.rpmAxisData, EcuFamily.RUSEFI)
-        protocol.writeTable(serialized.loadAxisTableId, serialized.loadAxisOffset, serialized.loadAxisData, EcuFamily.RUSEFI)
-        delay(300)
-        serialized.burnTableIds.sorted().forEach { burnTableIfSupported(it, EcuFamily.RUSEFI) }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI AFR Table 1")
         Logger.d(TAG, "✅ rusEFI AFR Table 1 gravada e burn executado")
     }
 
@@ -3587,6 +3715,15 @@ class SpeeduinoClient(
         val clamped = value.coerceIn(0, 65535)
         data[offset] = (clamped and 0xFF).toByte()
         data[offset + 1] = ((clamped shr 8) and 0xFF).toByte()
+    }
+
+    /** Estas páginas usam o layout do Speeduino; gravar em MS/rusEFI escreveria em tabelas erradas. */
+    private fun requireSpeeduinoLayout(operation: String) {
+        when (firmwareInfo?.family) {
+            EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI ->
+                throw UnsupportedOperationException("$operation usa o layout de página do Speeduino e não é suportado em ${firmwareInfo?.family}")
+            else -> Unit
+        }
     }
 
     private suspend fun ensureWritable(operation: String) {

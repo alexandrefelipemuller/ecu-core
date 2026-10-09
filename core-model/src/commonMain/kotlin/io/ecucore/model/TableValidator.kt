@@ -36,6 +36,8 @@ class TableValidator(private val metadata: TableMetadata) {
         const val AFR_LEAN_THRESHOLD = 16.0                  // AFR
         const val AFR_RICH_THRESHOLD = 10.0                  // AFR
         const val AFR_HARD_LEAN_THRESHOLD = 18.0             // AFR - alvo >= isto bloqueia a gravação
+        const val AFR_PLAUSIBLE_MIN = 5.0                    // AFR - abaixo disto (metanol ~6,4) é valor inválido
+        const val AFR_PLAUSIBLE_MAX = 25.5                   // AFR - teto do byte x10 (U08)
         const val VE_NO_FUEL_THRESHOLD = 10.0                // % - célula praticamente sem combustível
         const val VE_NO_FUEL_MAX_CELL_FRACTION = 0.10        // >= 10% das células sem combustível bloqueia
         const val IGNITION_ADVANCE_HARD_MAX = 54.0           // ECU compatibility limit
@@ -197,10 +199,10 @@ class TableValidator(private val metadata: TableMetadata) {
             rowValues.forEachIndexed { col, raw ->
                 val afr = raw / 10.0
                 when {
-                    afr !in metadata.valueRange -> {
+                    afr !in AFR_PLAUSIBLE_MIN..AFR_PLAUSIBLE_MAX -> {
                         outOfRange++
                         if (outOfRange <= 5) {
-                            errors.add("AFR target out of range at [$row,$col]: $afr (valid: ${metadata.valueRange})")
+                            errors.add("AFR target out of range at [$row,$col]: $afr (valid: $AFR_PLAUSIBLE_MIN..$AFR_PLAUSIBLE_MAX)")
                         }
                     }
                     afr >= AFR_HARD_LEAN_THRESHOLD -> hardLean++
