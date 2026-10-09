@@ -328,7 +328,8 @@ class SpeeduinoClientEdgeCasesTest {
     @Test
     fun `small config writes with burn`() = runBlocking<Unit> {
         val (c, ecu) = connected(ClientFakeEcu.Kind.SPEEDUINO_2025)
-        c.writeTpsCalibration(c.readTpsCalibration(), burn = true)
+        c.readTpsCalibration()
+        c.writeTpsCalibration(io.ecucore.model.TpsCalibration(10, 240), burn = true) // 0/0 da ECU falsa seria rejeitado
         c.writeIgnitionTable(IgnitionTable.createDefault(), 1)
         assertTrue(ecu.burns.isNotEmpty())
         val (ms3, _) = connected(ClientFakeEcu.Kind.MS3)

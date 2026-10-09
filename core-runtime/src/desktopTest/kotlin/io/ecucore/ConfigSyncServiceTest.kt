@@ -268,7 +268,9 @@ class ConfigSyncServiceTest {
     @Test
     fun `trigger fix rewrites page 4 through the typed settings`() = runBlocking<Unit> {
         val (client, ecu) = connected()
-        val dir = session("trig", 4 to ByteArray(128))
+        // roda 36-1: uma página zerada (0 dentes no padrão Missing Tooth) seria rejeitada pela validação
+        val page4 = ByteArray(128).also { it[15] = 36; it[16] = 1 }
+        val dir = session("trig", 4 to page4)
         val outcome = service.restoreConfigToEcu(client, dir, skipPages = (1..10).map { it.toByte() }.toSet(), applyTriggerFix = true)
         assertTrue("Página 4 corrigida (Trigger Settings)" in outcome.warnings)
         assertTrue(ecu.writes.any { it.id == 4 })

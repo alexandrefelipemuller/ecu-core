@@ -114,16 +114,18 @@ class SpeeduinoClientSpeeduinoConfigTest {
     @Test
     fun `calibrations idle and secondary serial round trip`() = runBlocking {
         val (c, ecu) = connected()
-        val pressure = c.readPressureCalibration()
-        c.writePressureCalibration(pressure, burn = true)
-        val tps = c.readTpsCalibration()
-        c.writeTpsCalibration(tps, burn = false)
+        // A ECU falsa começa zerada; calibração 0/0 é rejeitada pela validação, então grava valores válidos.
+        c.readPressureCalibration()
+        c.writePressureCalibration(io.ecucore.model.PressureCalibration(10, 260, 10, 260, 0, 0), burn = true)
+        c.readTpsCalibration()
+        c.writeTpsCalibration(io.ecucore.model.TpsCalibration(10, 240), burn = false)
         val idle = c.readIdleControlSettings()
         c.writeIdleControlSettings(idle, burn = true)
         val serial = c.readSecondarySerialConfig()
         c.writeSecondarySerialConfig(serial, burn = true)
         c.writeSecondarySerialConfig(serial, burn = false)
-        val trigger = c.readTriggerSettings()
+        // Missing Tooth com 0 dentes (página zerada) é inválido: usa uma roda 36-1.
+        val trigger = c.readTriggerSettings().copy(primaryBaseTeeth = 36, missingTeeth = 1)
         c.writeTriggerSettings(trigger, burn = true)
         c.writeTriggerSettings(trigger, burn = false)
         assertTrue(ecu.burns.size >= 4)
