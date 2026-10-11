@@ -4,6 +4,9 @@ object IniParser {
 
     fun parse(sourceName: String, text: String): IniDefinition {
         val lines = text.lines()
+        val macros = collectMacros(lines)
+        val expressionVariables = collectExpressionVariables(lines)
+        var lastFieldOffset: Int? = null
         var currentSection = ""
         var currentPage: Int? = null
         var signature: String? = null
@@ -55,8 +58,11 @@ object IniParser {
                                 rawDefinition = value,
                                 section = currentSection,
                                 page = currentPage,
+                                macros = macros,
+                                lastOffset = lastFieldOffset,
                             )?.let { field ->
                                 fields += field
+                                field.offset?.let { lastFieldOffset = it }
                                 field.shape?.takeIf { it.isTable }?.let { shape ->
                                     field.offset?.let { offset ->
                                         tables += IniTableDefinition(
@@ -87,6 +93,8 @@ object IniParser {
                                 rawDefinition = value,
                                 section = currentSection,
                                 page = currentPage,
+                                macros = macros,
+                                lastOffset = null,
                             )?.let { field ->
                                 outputChannels += IniOutputChannelDefinition(
                                     name = field.name,
@@ -121,6 +129,7 @@ object IniParser {
             tableDefinitions = tables,
             outputChannels = outputChannels,
             fields = fields,
+            expressionVariables = expressionVariables,
         )
     }
 
@@ -142,6 +151,8 @@ object IniParser {
         rawDefinition: String,
         section: String,
         page: Int?,
+        macros: Map<String, String> = emptyMap(),
+        lastOffset: Int? = null,
     ): IniFieldDefinition? {
         val tokens = splitTopLevel(rawDefinition)
         if (tokens.size < 2) {
@@ -150,12 +161,20 @@ object IniParser {
 
         val kind = parseKind(tokens[0].trim())
         val dataType = tokens[1].trim()
-        val offset = tokens.getOrNull(2)?.trim()?.toIntOrNull()
+        val offsetToken = tokens.getOrNull(2)?.trim()
+        // `lastOffset` = mesmo offset do campo anterior (ex.: afrTable sobrepõe lambdaTable).
+        val offset = offsetToken?.toIntOrNull() ?: if (offsetToken == "lastOffset") lastOffset else null
 
         if (kind == IniFieldKind.BITS) {
             val bitRange = tokens.getOrNull(3)?.let(::parseBitRange)
-            val labelTokens = tokens.drop(4)
-            val labels = if (labelTokens.size == 1 && labelTokens[0].trim().startsWith("$")) {
+            // Rótulos como `$loadSourceNames` são macros `#define`: expandir, senão o campo fica
+            // sem enumLabels e nenhum valor de MSQ consegue ser gravado nele.
+            val labelTokens = tokens.drop(4).flatMap { token ->
+                val trimmed = token.trim()
+                if (trimmed.startsWith("$")) splitTopLevel(expandMacros(trimmed, macros)) else listOf(token)
+            }
+            val unresolvedMacro = labelTokens.any { it.trim().startsWith("$") }
+            val labels = if (unresolvedMacro) {
                 null
             } else {
                 labelTokens.map(::cleanValueToken).ifEmpty { null }
@@ -191,6 +210,8 @@ object IniParser {
             units = tokens.getOrNull(unitsIndex)?.let(::cleanValueToken),
             scale = tokens.getOrNull(scaleIndex)?.trim()?.toDoubleOrNull(),
             translate = tokens.getOrNull(translateIndex)?.trim()?.toDoubleOrNull(),
+            scaleExpr = tokens.getOrNull(scaleIndex)?.let(::expressionBody),
+            translateExpr = tokens.getOrNull(translateIndex)?.let(::expressionBody),
             digits = tokens.getOrNull(digitsIndex)?.trim()?.toIntOrNull(),
             section = section,
             page = page,
@@ -204,6 +225,55 @@ object IniParser {
         val lo = pieces.getOrNull(0)?.trim()?.toIntOrNull() ?: return null
         val hi = pieces.getOrNull(1)?.trim()?.toIntOrNull() ?: lo
         return lo to hi
+    }
+
+    /** Corpo de um token `{ expr }`, ou null se o token não é uma expressão entre chaves. */
+    private fun expressionBody(token: String): String? {
+        val trimmed = token.trim()
+        if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null
+        return trimmed.removePrefix("{").removeSuffix("}").trim().ifEmpty { null }
+    }
+
+    /** Coleta `nome = { expr }` (ex.: `fuelLoadRes = { ... }`), usadas como `{fuelLoadRes}` em escalas. */
+    private fun collectExpressionVariables(lines: List<String>): Map<String, String> {
+        val variables = LinkedHashMap<String, String>()
+        val regex = Regex("^\\s*(\\w+)\\s*=\\s*\\{(.*)\\}\\s*$")
+        lines.forEach { raw ->
+            val match = regex.find(stripSemicolonComment(raw)) ?: return@forEach
+            variables[match.groupValues[1]] = match.groupValues[2].trim()
+        }
+        return variables
+    }
+
+    /** Coleta `#define nome = valor` (valores podem referenciar outras macros via `$outra`). */
+    private fun collectMacros(lines: List<String>): Map<String, String> {
+        val macros = LinkedHashMap<String, String>()
+        val defineRegex = Regex("^\\s*#define\\s+(\\w+)\\s*=\\s*(.*)$")
+        lines.forEach { raw ->
+            val match = defineRegex.find(stripSemicolonComment(raw)) ?: return@forEach
+            macros[match.groupValues[1]] = match.groupValues[2].trim()
+        }
+        return macros
+    }
+
+    /** Remove só comentários `;` (fora de aspas); `#` aqui é diretiva, não comentário. */
+    private fun stripSemicolonComment(line: String): String {
+        var inQuotes = false
+        for (index in line.indices) {
+            val char = line[index]
+            if (char == '"') inQuotes = !inQuotes else if (char == ';' && !inQuotes) return line.substring(0, index)
+        }
+        return line
+    }
+
+    /** Expande `$nome` recursivamente (com limite de profundidade contra ciclos). */
+    private fun expandMacros(value: String, macros: Map<String, String>, depth: Int = 0): String {
+        if (depth > 8 || !value.contains('$')) return value
+        val refRegex = Regex("\\$(\\w+)")
+        return refRegex.replace(value) { match ->
+            val body = macros[match.groupValues[1]] ?: return@replace match.value
+            expandMacros(body, macros, depth + 1)
+        }
     }
 
     private fun parseAssignment(line: String): Pair<String, String>? {

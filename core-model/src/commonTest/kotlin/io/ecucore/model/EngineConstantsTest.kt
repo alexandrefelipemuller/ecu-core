@@ -472,7 +472,7 @@ class EngineConstantsTest {
         assertEquals(VeTable.LoadType.TPS, alpha.fuelTableLoadType())
         assertEquals(IgnitionTable.LoadType.TPS, alpha.ignitionTableLoadType())
         assertEquals(AfrTable.LoadType.TPS, alpha.afrTableLoadType(isLegacyFormat = true))
-        assertEquals(AfrTable.LoadType.MAP, alpha.afrTableLoadType(isLegacyFormat = false))
+        assertEquals(AfrTable.LoadType.TPS, alpha.afrTableLoadType(isLegacyFormat = false))
         assertEquals(AfrTable.LoadType.MAP, sd.afrTableLoadType(isLegacyFormat = true))
     }
 

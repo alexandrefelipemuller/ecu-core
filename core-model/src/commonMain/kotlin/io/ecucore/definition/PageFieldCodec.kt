@@ -21,15 +21,25 @@ data class DecodedField(
  */
 object PageFieldCodec {
 
-    fun decodePage(definition: IniDefinition, page: Int, bytes: ByteArray): List<DecodedField> {
+    fun decodePage(definition: IniDefinition, page: Int, bytes: ByteArray): List<DecodedField> =
+        decodePage(definition, page, bytes, ExpressionContext(definition, mapOf(page to bytes)))
+
+    private fun decodePage(
+        definition: IniDefinition,
+        page: Int,
+        bytes: ByteArray,
+        context: ExpressionContext,
+    ): List<DecodedField> {
         return definition.fields
             .filter { it.page == page && it.offset != null }
-            .mapNotNull { field -> decodeField(field, bytes) }
+            .mapNotNull { field -> decodeField(field, bytes, context) }
     }
 
     /** Decodes every page present in [pageBytes] (keyed by page number) into named field values. */
     fun decodeAllPages(definition: IniDefinition, pageBytes: Map<Int, ByteArray>): List<Pair<Int, List<DecodedField>>> =
-        pageBytes.keys.sorted().map { page -> page to decodePage(definition, page, pageBytes.getValue(page)) }
+        ExpressionContext(definition, pageBytes).let { context ->
+            pageBytes.keys.sorted().map { page -> page to decodePage(definition, page, pageBytes.getValue(page), context) }
+        }
 
     /**
      * Applies every `<constant>` from a parsed [MsqDocument] onto the matching page bytes in
@@ -37,22 +47,40 @@ object PageFieldCodec {
      * [pageBytes], or whose name doesn't match a field of [definition] on that page, are skipped.
      */
     fun applyMsqDocument(definition: IniDefinition, doc: MsqDocument, pageBytes: Map<Int, ByteArray>) {
-        doc.pages.forEach { msqPage ->
-            val bytes = pageBytes[msqPage.number] ?: return@forEach
-            msqPage.constants.forEach { constant ->
-                val field = definition.fields.firstOrNull { it.name == constant.name && it.page == msqPage.number }
-                    ?: return@forEach
-                encodeField(field, parseMsqValue(field, constant.rawText), bytes)
+        val context = ExpressionContext(definition, pageBytes)
+        // Duas fases: campos de escala fixa primeiro (inclui `algorithm` & cia.), depois os de
+        // escala dinâmica `{expr}`, que dependem do valor já gravado dos primeiros.
+        for (dynamicPhase in listOf(false, true)) {
+            doc.pages.forEach { msqPage ->
+                val bytes = pageBytes[msqPage.number] ?: return@forEach
+                msqPage.constants.forEach { constant ->
+                    val field = pickField(definition, msqPage.number, constant) ?: return@forEach
+                    val isDynamic = field.scaleExpr != null || field.translateExpr != null
+                    if (isDynamic != dynamicPhase) return@forEach
+                    encodeField(field, parseMsqValue(field, constant.rawText), bytes, context)
+                }
             }
         }
     }
 
-    fun decodeField(field: IniFieldDefinition, bytes: ByteArray): DecodedField? {
+    /**
+     * Um mesmo nome pode ter variantes condicionais no .ini (`#if CELSIUS`, `#if pressure_bar`):
+     * escolhe a que casa com as unidades gravadas no MSQ; sem informação, a primeira.
+     */
+    private fun pickField(definition: IniDefinition, page: Int, constant: MsqConstant): IniFieldDefinition? {
+        val candidates = definition.fields.filter { it.name == constant.name && it.page == page }
+        if (candidates.size <= 1) return candidates.firstOrNull()
+        val units = constant.units?.trim()
+        return candidates.firstOrNull { units != null && it.units?.trim().equals(units, ignoreCase = true) }
+            ?: candidates.first()
+    }
+
+    fun decodeField(field: IniFieldDefinition, bytes: ByteArray, context: ExpressionContext? = null): DecodedField? {
         val offset = field.offset ?: return null
         return when (field.kind) {
             IniFieldKind.SCALAR -> {
                 val raw = readRaw(bytes, offset, field.dataType) ?: return null
-                DecodedField(field, FieldValue.Numeric(applyScale(raw, field)))
+                DecodedField(field, FieldValue.Numeric(applyScale(raw, field, context)))
             }
 
             IniFieldKind.ARRAY -> {
@@ -60,7 +88,7 @@ object PageFieldCodec {
                 val size = typeSize(field.dataType)
                 val values = (0 until shape.totalSize).map { index ->
                     val raw = readRaw(bytes, offset + index * size, field.dataType) ?: return null
-                    applyScale(raw, field)
+                    applyScale(raw, field, context)
                 }
                 DecodedField(field, FieldValue.Table(shape.rows, shape.columns, values))
             }
@@ -83,19 +111,19 @@ object PageFieldCodec {
         }
     }
 
-    fun encodeField(field: IniFieldDefinition, value: FieldValue, bytes: ByteArray) {
+    fun encodeField(field: IniFieldDefinition, value: FieldValue, bytes: ByteArray, context: ExpressionContext? = null) {
         val offset = field.offset ?: return
         when (field.kind) {
             IniFieldKind.SCALAR -> {
                 val numeric = (value as? FieldValue.Numeric)?.value ?: return
-                writeRaw(bytes, offset, field.dataType, unapplyScale(numeric, field))
+                writeRaw(bytes, offset, field.dataType, unapplyScale(numeric, field, context))
             }
 
             IniFieldKind.ARRAY -> {
                 val table = value as? FieldValue.Table ?: return
                 val size = typeSize(field.dataType)
                 table.values.forEachIndexed { index, entry ->
-                    writeRaw(bytes, offset + index * size, field.dataType, unapplyScale(entry, field))
+                    writeRaw(bytes, offset + index * size, field.dataType, unapplyScale(entry, field, context))
                 }
             }
 
@@ -104,7 +132,9 @@ object PageFieldCodec {
                 val hi = field.bitHigh ?: lo
                 val mask = (1 shl (hi - lo + 1)) - 1
                 val bitsValue = when (value) {
-                    is FieldValue.Label -> field.enumLabels?.indexOf(value.value)?.takeIf { it >= 0 } ?: return
+                    // Rótulo fora da lista (p.ex. "63" num campo de pino): vale o número bruto.
+                    is FieldValue.Label -> field.enumLabels?.indexOf(value.value)?.takeIf { it >= 0 }
+                        ?: value.value.trim().toIntOrNull() ?: return
                     is FieldValue.Numeric -> value.value.roundToLong().toInt()
                     is FieldValue.Table -> return
                 }
@@ -174,16 +204,41 @@ object PageFieldCodec {
         }
     }
 
-    private fun applyScale(raw: Long, field: IniFieldDefinition): Double {
-        val scale = field.scale ?: 1.0
-        val translate = field.translate ?: 0.0
+    private fun applyScale(raw: Long, field: IniFieldDefinition, context: ExpressionContext?): Double {
+        val scale = context?.evaluate(field.scaleExpr) ?: field.scale ?: 1.0
+        val translate = context?.evaluate(field.translateExpr) ?: field.translate ?: 0.0
         return round((raw + translate) * scale * 1000.0) / 1000.0
     }
 
-    private fun unapplyScale(value: Double, field: IniFieldDefinition): Double {
-        val scale = field.scale ?: 1.0
-        val translate = field.translate ?: 0.0
+    private fun unapplyScale(value: Double, field: IniFieldDefinition, context: ExpressionContext?): Double {
+        val scale = context?.evaluate(field.scaleExpr) ?: field.scale ?: 1.0
+        val translate = context?.evaluate(field.translateExpr) ?: field.translate ?: 0.0
         if (scale == 0.0) return 0.0
         return (value / scale) - translate
+    }
+}
+
+/**
+ * Resolve identificadores de expressões de escala (`algorithm`, `stoich`, `fuelLoadRes`…)
+ * contra os bytes de página atuais e as variáveis de expressão do .ini.
+ */
+class ExpressionContext(private val definition: IniDefinition, private val pageBytes: Map<Int, ByteArray>) {
+    fun evaluate(expression: String?, depth: Int = 0): Double? {
+        if (expression == null || depth > 6) return null
+        return IniExpression(expression) { name -> resolve(name, depth) }.evaluate()
+    }
+
+    private fun resolve(name: String, depth: Int): Double? {
+        definition.expressionVariables[name]?.let { return evaluate(it, depth + 1) }
+        val field = definition.fields.firstOrNull { it.name == name && it.page != null && pageBytes.containsKey(it.page) }
+            ?: return null
+        val bytes = pageBytes.getValue(field.page!!)
+        val decoded = PageFieldCodec.decodeField(field, bytes, this) ?: return null
+        return when (val value = decoded.value) {
+            is FieldValue.Numeric -> value.value
+            // Em campos de enumeração a expressão compara pelo ÍNDICE do rótulo (algorithm == 0).
+            is FieldValue.Label -> field.enumLabels?.indexOf(value.value)?.takeIf { it >= 0 }?.toDouble()
+            is FieldValue.Table -> null
+        }
     }
 }

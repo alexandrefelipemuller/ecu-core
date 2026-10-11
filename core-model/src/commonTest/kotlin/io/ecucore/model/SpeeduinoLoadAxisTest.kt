@@ -46,7 +46,7 @@ class SpeeduinoLoadAxisTest {
     }
 
     @Test
-    fun `afr table stays map on modern speeduino even with alpha n`() {
+    fun `afr table follows alpha n on modern speeduino`() {
         val constants = EngineConstants(
             reqFuel = 8.0f,
             algorithm = Algorithm.ALPHA_N,
@@ -60,7 +60,7 @@ class SpeeduinoLoadAxisTest {
             mapSampleMethod = MapSampleMethod.CYCLE_AVERAGE,
         )
 
-        assertEquals(AfrTable.LoadType.MAP, constants.afrTableLoadType())
+        assertEquals(AfrTable.LoadType.TPS, constants.afrTableLoadType())
         assertEquals(AfrTable.LoadType.TPS, constants.afrTableLoadType(isLegacyFormat = true))
     }
 }

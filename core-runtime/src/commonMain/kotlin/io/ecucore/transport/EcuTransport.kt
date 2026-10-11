@@ -46,6 +46,22 @@ interface EcuTransport {
 
     fun getFirmwareInfoCached(): FirmwareInfo?
 
+    /** Descarta respostas atrasadas do canal (frame defasado). Default no-op. */
+    suspend fun drainStaleResponses() {}
+
+    /**
+     * Declara uma operação crítica (reset de fábrica) como dona exclusiva da ECU: o live
+     * stream não é reiniciado enquanto ativo. Sempre pareado com [endExclusiveAccess].
+     */
+    fun beginExclusiveAccess(reason: String) {}
+
+    fun endExclusiveAccess() {}
+
+    fun isExclusiveAccessActive(): Boolean = false
+
+    /** Executa [block] segurando o canal do começo ao fim (sequência indivisível). */
+    suspend fun <T> withEcuIoLock(block: suspend () -> T): T = block()
+
     fun getEcuFamily(): EcuFamily
 
     fun getEcuCapabilities(): EcuCapabilities?

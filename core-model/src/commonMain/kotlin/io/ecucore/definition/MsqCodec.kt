@@ -152,10 +152,17 @@ object MsqCodec {
                 name = attr("name", attrsRaw) ?: "",
                 units = attr("units", attrsRaw),
                 digits = attr("digits", attrsRaw)?.toIntOrNull(),
-                rawText = match.groupValues[2].trim(),
+                rawText = xmlUnescape(match.groupValues[2].trim()),
             )
         }.toList()
     }
+
+    private fun xmlUnescape(value: String): String = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 
     private fun attr(name: String, source: String): String? =
         Regex("$name=\"([^\"]*)\"").find(source)?.groupValues?.get(1)

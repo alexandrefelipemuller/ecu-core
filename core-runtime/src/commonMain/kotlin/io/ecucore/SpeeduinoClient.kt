@@ -74,6 +74,8 @@ import io.ecucore.tables.TableDomainFacade
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import io.ecucore.shared.MonotonicClock
 import io.ecucore.shared.WallClock
 import io.ecucore.shared.formatDecimal
@@ -224,6 +226,60 @@ class SpeeduinoClient(
     private var cachedEngineConstants: EngineConstants? = null
     private var pinLayoutInfo: PinLayoutInfo? = null
     private val connectMutex = Mutex()
+
+    // Serializa OPERAÇÕES LÓGICAS no canal (write+burn+releitura de uma página), não
+    // frames isolados. Sem isso o live stream ou a sincronização podiam intercalar um
+    // comando entre o write e o burn da mesma página.
+    private val ioMutex = Mutex()
+
+    // Modo exclusivo (reset de fábrica): o live stream não volta sozinho enquanto ativo.
+    @Volatile
+    private var exclusiveAccessReason: String? = null
+
+    /** Marca "esta coroutine já é dona do canal", tornando [withEcuIo] reentrante. */
+    private class EcuIoOwner : AbstractCoroutineContextElement(EcuIoOwner) {
+        companion object Key : CoroutineContext.Key<EcuIoOwner>
+    }
+
+    private suspend fun <T> withEcuIo(block: suspend () -> T): T {
+        if (currentCoroutineContext()[EcuIoOwner] != null) return block()
+        return ioMutex.withLock { withContext(EcuIoOwner()) { block() } }
+    }
+
+    /** Como [withEcuIo], mas desiste (null) se o canal está ocupado. Usado pelo live stream. */
+    private suspend fun <T> withEcuIoOrNull(block: suspend () -> T): T? {
+        if (currentCoroutineContext()[EcuIoOwner] != null) return block()
+        if (!ioMutex.tryLock()) return null
+        return try {
+            withContext(EcuIoOwner()) { block() }
+        } finally {
+            ioMutex.unlock()
+        }
+    }
+
+    override suspend fun <T> withEcuIoLock(block: suspend () -> T): T = withEcuIo(block)
+
+    override suspend fun drainStaleResponses() {
+        withEcuIo {
+            runCatching { connection.clearInputBuffer() }
+            delay(FIRMWARE_HANDSHAKE_DRAIN_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+        }
+    }
+
+    override fun beginExclusiveAccess(reason: String) {
+        exclusiveAccessReason = reason
+        Logger.w(TAG, "Acesso exclusivo à ECU adquirido por: $reason")
+        stopLiveDataStream()
+    }
+
+    override fun endExclusiveAccess() {
+        val reason = exclusiveAccessReason
+        exclusiveAccessReason = null
+        if (reason != null) Logger.w(TAG, "Acesso exclusivo à ECU liberado (era: $reason)")
+    }
+
+    override fun isExclusiveAccessActive(): Boolean = exclusiveAccessReason != null
     private var liveDataSampleCounter = 0
     private var consecutiveFaultyLiveDataSamples = 0
     private var manualFirmwareProfile: String? = null
@@ -1029,7 +1085,9 @@ class SpeeduinoClient(
         return readPage(pageNum.toInt() and 0xFF, offset, length)
     }
 
-    suspend fun readConfigChunk(pageId: Int, offset: Int, length: Int): ByteArray {
+    suspend fun readConfigChunk(pageId: Int, offset: Int, length: Int): ByteArray = withEcuIo { readConfigChunkUnlocked(pageId, offset, length) }
+
+    private suspend fun readConfigChunkUnlocked(pageId: Int, offset: Int, length: Int): ByteArray {
         val pageLabel = formatPageId(pageId)
         val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
         val readMode = resolveConfigReadMode(family)
@@ -1199,7 +1257,9 @@ class SpeeduinoClient(
     /**
      * Lê página completa em blocos (para páginas grandes)
      */
-    override suspend fun readFullPage(pageNum: Int, pageSize: Int, blockSize: Int): ByteArray = withContext(Dispatchers.IO) {
+    override suspend fun readFullPage(pageNum: Int, pageSize: Int, blockSize: Int): ByteArray = withEcuIo { readFullPageUnlocked(pageNum, pageSize, blockSize) }
+
+    private suspend fun readFullPageUnlocked(pageNum: Int, pageSize: Int, blockSize: Int): ByteArray = withContext(Dispatchers.IO) {
         val pageLabel = formatPageId(pageNum)
         val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
         val readMode = resolveConfigReadMode(family)
@@ -1930,7 +1990,9 @@ class SpeeduinoClient(
     /**
      * Grava uma página completa de configuração (backup/restore)
      */
-    override suspend fun writeRawPage(pageNum: Int, data: ByteArray) {
+    override suspend fun writeRawPage(pageNum: Int, data: ByteArray) = withEcuIo { writeRawPageUnlocked(pageNum, data) }
+
+    private suspend fun writeRawPageUnlocked(pageNum: Int, data: ByteArray) {
         ensureWritable("writeRawPage")
         if (ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE) {
             writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
@@ -1978,7 +2040,9 @@ class SpeeduinoClient(
     /**
      * Grava uma página completa sem executar burn (para restauração em lote).
      */
-    override suspend fun writeRawPageWithoutBurn(pageNum: Int, data: ByteArray) {
+    override suspend fun writeRawPageWithoutBurn(pageNum: Int, data: ByteArray) = withEcuIo { writeRawPageWithoutBurnUnlocked(pageNum, data) }
+
+    private suspend fun writeRawPageWithoutBurnUnlocked(pageNum: Int, data: ByteArray) {
         ensureWritable("writeRawPageWithoutBurn")
         if (ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE) {
             writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
@@ -2022,7 +2086,9 @@ class SpeeduinoClient(
      * Grava uma pagina em blocos menores para contornar timeouts de recepcao
      * em firmwares que nao conseguem consumir um pacote legado inteiro a tempo.
      */
-    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) {
+    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) = withEcuIo { writeRawPageChunkedWithoutBurnUnlocked(pageNum, data, chunkSize, startOffset) }
+
+    private suspend fun writeRawPageChunkedWithoutBurnUnlocked(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) {
         ensureWritable("writeRawPageChunkedWithoutBurn")
         if (chunkSize <= 0) {
             throw IllegalArgumentException("chunkSize must be > 0")
@@ -2227,7 +2293,9 @@ class SpeeduinoClient(
     /**
      * Executa burn após gravações em lote.
      */
-    override suspend fun burnConfigs() {
+    override suspend fun burnConfigs() = withEcuIo { burnConfigsUnlocked() }
+
+    private suspend fun burnConfigsUnlocked() {
         ensureWritable("burnConfigs")
         if (
             firmwareInfo?.family == EcuFamily.MS2 ||
@@ -2241,7 +2309,9 @@ class SpeeduinoClient(
         Logger.d(TAG, "Burn executado após restauração em lote")
     }
 
-    override suspend fun burnLastWrittenLegacyPage() {
+    override suspend fun burnLastWrittenLegacyPage() = withEcuIo { burnLastWrittenLegacyPageUnlocked() }
+
+    private suspend fun burnLastWrittenLegacyPageUnlocked() {
         ensureWritable("burnLastWrittenLegacyPage")
         if (
             firmwareInfo?.family == EcuFamily.MS2 ||
@@ -3299,6 +3369,11 @@ class SpeeduinoClient(
             return
         }
 
+        exclusiveAccessReason?.let { reason ->
+            Logger.w(TAG, "Live data stream bloqueado: acesso exclusivo ativo ($reason)")
+            return
+        }
+
         if (firmwareInfo?.capabilities?.supportsLiveData == false) {
             Logger.w(TAG, "Live data não suportado para ${firmwareInfo?.family}")
             return
@@ -3322,7 +3397,11 @@ class SpeeduinoClient(
             var restartReason: String? = null
             while (_isStreaming && connection.isConnected()) {
                 try {
-                    val liveData = readLiveData()
+                    // Se uma operação crítica detém o canal, o stream cede a vez neste ciclo.
+                    val liveData = withEcuIoOrNull { readLiveData() } ?: run {
+                        delay(intervalMs)
+                        continue
+                    }
                     recoverableReadTimeouts = 0
                     onDataReceived(liveData)
                     packetCount++

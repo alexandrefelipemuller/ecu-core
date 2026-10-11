@@ -649,8 +649,11 @@ fun EngineConstants.ignitionTableLoadType(): IgnitionTable.LoadType {
     return if (ignitionAlgorithm == Algorithm.ALPHA_N) IgnitionTable.LoadType.TPS else IgnitionTable.LoadType.MAP
 }
 
+// loadBinsAFR shares the byte range and the `algorithm` scale of fuelLoadBins (.ini 202201+),
+// so the AFR axis is TPS whenever the fuel algorithm is Alpha-N, in either storage format.
+@Suppress("UNUSED_PARAMETER")
 fun EngineConstants.afrTableLoadType(isLegacyFormat: Boolean = false): AfrTable.LoadType {
-    return if (isLegacyFormat && algorithm == Algorithm.ALPHA_N) AfrTable.LoadType.TPS else AfrTable.LoadType.MAP
+    return if (algorithm == Algorithm.ALPHA_N) AfrTable.LoadType.TPS else AfrTable.LoadType.MAP
 }
 
 // Enums

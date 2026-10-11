@@ -32,6 +32,9 @@ data class IniFieldDefinition(
     val units: String? = null,
     val scale: Double? = null,
     val translate: Double? = null,
+    /** Escala/translate dinâmicos `{ expr }` (ex.: dependem de `algorithm`); null quando fixos. */
+    val scaleExpr: String? = null,
+    val translateExpr: String? = null,
     val digits: Int? = null,
     val bitLow: Int? = null,
     val bitHigh: Int? = null,
@@ -78,6 +81,8 @@ data class IniDefinition(
     val tableDefinitions: List<IniTableDefinition> = emptyList(),
     val outputChannels: List<IniOutputChannelDefinition> = emptyList(),
     val fields: List<IniFieldDefinition> = emptyList(),
+    /** Variáveis de expressão `nome = { expr }` (ex.: fuelLoadRes), referenciáveis por escalas dinâmicas. */
+    val expressionVariables: Map<String, String> = emptyMap(),
 )
 
 data class IniCatalogEntry(
