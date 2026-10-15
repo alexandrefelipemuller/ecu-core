@@ -170,8 +170,10 @@ data class MegaSpeedTestParams(
 
         const val MIN_DWELL_RAW = 1      // 0.1 ms
         const val MAX_DWELL_RAW = 40     // 4.0 ms
-        const val MIN_INTERVAL_RAW = 157 // ~20 ms
-        const val MAX_INTERVAL_RAW = 7812 // ~1000 ms
+        // 20 ms / 0.128 = 156.25 e 1000 ms / 0.128 = 7812.5: a tela mostra "20 a 1000 ms", então as
+        // bordas arredondadas (156 e 7813) precisam ser aceitas.
+        const val MIN_INTERVAL_RAW = 156 // ~20 ms
+        const val MAX_INTERVAL_RAW = 7813 // ~1000 ms
         const val MIN_PULSE_RAW = 300    // ~0.2 ms
         const val MAX_PULSE_RAW = 15015  // ~10 ms
         const val MAX_PULSE_COUNT = 1000
