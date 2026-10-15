@@ -419,4 +419,39 @@ class TriggerSettingsTest {
         assertFailsWith<IllegalArgumentException> { TriggerSettings.fromRusefiMainPage(ByteArray(1657), "rusefi-f407-discovery") }
         assertContentEquals(ByteArray(0), ByteArray(0))
     }
+
+    @Test
+    fun `megaspeed extra fields decode and round trip`() {
+        val d = ms2Page()
+        d[969] = 0x01; d[970] = 0x2C.toByte() // Miss_ang = 300 (30.0 graus)
+        d[1003] = 1
+        d[971] = 40; d[972] = 35
+        d[982] = 20; d[983] = 30
+        d[984] = 0b0101
+
+        val t = TriggerSettings.fromMs2PageData(d)
+        assertEquals("300", t.extraFields[TriggerSettings.MS2_MISS_ANGLE])
+        assertEquals("1", t.extraFields[TriggerSettings.MS2_TRIG_INIT])
+        assertEquals("40", t.extraFields[TriggerSettings.MS2_PRIMARY_TIME_MASK])
+        assertEquals("35", t.extraFields[TriggerSettings.MS2_PRIMARY_PERCENT_MASK])
+        assertEquals("20", t.extraFields[TriggerSettings.MS2_SECONDARY_TIME_MASK])
+        assertEquals("30", t.extraFields[TriggerSettings.MS2_SECONDARY_PERCENT_MASK])
+        assertEquals("5", t.extraFields[TriggerSettings.MS2_NOISE_FILTER_BITS])
+
+        val edited = t.copy(extraFields = t.extraFields + (TriggerSettings.MS2_TRIG_INIT to "0"))
+        val written = edited.toMs2PageData(d)
+        assertEquals(0, written[1003].toInt())
+        assertEquals(40, written[971].toInt())
+        assertEquals(0b0101, written[984].toInt() and 0x0F)
+    }
+
+    @Test
+    fun `megaspeed sem extra fields preserva os bytes originais da pagina`() {
+        val d = ms2Page().also { it[1003] = 1; it[971] = 40; it[984] = 0x0F }
+        val t = TriggerSettings.fromMs2PageData(d).copy(extraFields = emptyMap())
+        val written = t.toMs2PageData(d)
+        assertEquals(1, written[1003].toInt())
+        assertEquals(40, written[971].toInt())
+        assertEquals(0x0F, written[984].toInt())
+    }
 }

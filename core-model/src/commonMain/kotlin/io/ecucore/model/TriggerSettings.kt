@@ -56,6 +56,16 @@ data class TriggerSettings(
         const val PAGE_LENGTH: Int = 128
         const val MS2_PAGE_NUMBER: Byte = 0x04
 
+        // extraFields do MS2/MegaSpeed (page 0x04). Valores brutos da ECU, sem escala:
+        // Miss_ang é 0.1 grau/bit, ICISR_tmask/IC2ISR_tmask são 0.1 ms/bit.
+        const val MS2_MISS_ANGLE = "ms2_miss_ang"
+        const val MS2_TRIG_INIT = "ms2_trig_init"
+        const val MS2_PRIMARY_TIME_MASK = "ms2_icisr_tmask"
+        const val MS2_PRIMARY_PERCENT_MASK = "ms2_icisr_pmask"
+        const val MS2_SECONDARY_TIME_MASK = "ms2_ic2isr_tmask"
+        const val MS2_SECONDARY_PERCENT_MASK = "ms2_ic2isr_pmask"
+        const val MS2_NOISE_FILTER_BITS = "ms2_noise_filter_opts"
+
         private val TRIGGER_PATTERN_LABELS = listOf(
             "Missing Tooth",
             "Basic Distributor",
@@ -198,6 +208,15 @@ data class TriggerSettings(
                 crankingAdvanceDeg = 10,
                 fixedTimingAngleDeg = 10,
                 dwellErrorCorrectionEnabled = false,
+                extraFields = linkedMapOf(
+                    MS2_MISS_ANGLE to readU16Be(data, 969).toString(),
+                    MS2_TRIG_INIT to readU8(data, 1003).toString(),
+                    MS2_PRIMARY_TIME_MASK to readU8(data, 971).toString(),
+                    MS2_PRIMARY_PERCENT_MASK to readU8(data, 972).toString(),
+                    MS2_SECONDARY_TIME_MASK to readU8(data, 982).toString(),
+                    MS2_SECONDARY_PERCENT_MASK to readU8(data, 983).toString(),
+                    MS2_NOISE_FILTER_BITS to readBits(data, 984, 0, 3).toString(),
+                ),
                 sparkMode = sparkMode,
             )
         }
@@ -491,6 +510,16 @@ data class TriggerSettings(
             TriggerFilter.AGGRESSIVE -> 3
         }
         writeBits(data, 997, 4, 5, filterBits)
+
+        // Campos extras só são gravados se vieram preenchidos (leitura prévia); senão o byte
+        // original da página é preservado.
+        extraFields[MS2_MISS_ANGLE]?.toIntOrNull()?.let { writeU16Be(data, 969, it.coerceIn(0, 720 * 10)) }
+        extraFields[MS2_TRIG_INIT]?.toIntOrNull()?.let { writeU8(data, 1003, it.coerceIn(0, 255)) }
+        extraFields[MS2_PRIMARY_TIME_MASK]?.toIntOrNull()?.let { writeU8(data, 971, it.coerceIn(0, 255)) }
+        extraFields[MS2_PRIMARY_PERCENT_MASK]?.toIntOrNull()?.let { writeU8(data, 972, it.coerceIn(0, 90)) }
+        extraFields[MS2_SECONDARY_TIME_MASK]?.toIntOrNull()?.let { writeU8(data, 982, it.coerceIn(0, 255)) }
+        extraFields[MS2_SECONDARY_PERCENT_MASK]?.toIntOrNull()?.let { writeU8(data, 983, it.coerceIn(0, 90)) }
+        extraFields[MS2_NOISE_FILTER_BITS]?.toIntOrNull()?.let { writeBits(data, 984, 0, 3, it.coerceIn(0, 15)) }
 
         return data
     }
