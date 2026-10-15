@@ -58,6 +58,7 @@ import io.ecucore.model.RusefiF407DiscoveryDefinitions
 import io.ecucore.model.RusefiIniTableDefinitions
 import io.ecucore.model.RusefiTableDefinitions
 import io.ecucore.model.RusefiInputOutputConfig
+import io.ecucore.model.MegaSpeedIoConfig
 import io.ecucore.model.RusefiInputOutputSnapshot
 import io.ecucore.model.RusefiIniUiParsers
 import io.ecucore.model.SpeeduinoIniDefinitions
@@ -1566,6 +1567,16 @@ class SpeeduinoClient(
     }
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            // MegaSpeed reaproveita o contêiner de snapshot do rusEFI: a pinagem vem do .ini ativo.
+            val definition = activeIniDefinition
+                ?: throw UnsupportedOperationException("Pinagem MegaSpeed requer o .ini da CostaMegaSpeed carregado")
+            Logger.d(TAG, "Lendo pinagem MegaSpeed via .ini (páginas ${MegaSpeedIoConfig.REQUIRED_PAGES.joinToString { formatPageId(it) }})...")
+            val pages = MegaSpeedIoConfig.REQUIRED_PAGES.associateWith { pageId ->
+                readFullPage(pageNum = pageId, pageSize = 1024, blockSize = 256)
+            }
+            return MegaSpeedIoConfig.parse(definition, pages)
+        }
         if (firmwareInfo?.family != EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("I/O snapshot disponível apenas para rusEFI")
         }
