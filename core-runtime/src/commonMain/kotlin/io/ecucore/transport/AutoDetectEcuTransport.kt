@@ -16,6 +16,9 @@ import io.ecucore.model.PinLayoutInfo
 import io.ecucore.model.PressureCalibration
 import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
+import io.ecucore.model.MegaSpeedTestCommand
+import io.ecucore.model.MegaSpeedTestParams
+import io.ecucore.model.MegaSpeedTestStatus
 import io.ecucore.model.RusefiInputOutputSnapshot
 import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.TableDefinitions
@@ -161,6 +164,21 @@ class AutoDetectEcuTransport(
     override suspend fun readEngineConstants(): EngineConstants = selected().readEngineConstants()
 
     override suspend fun readTriggerSettings(): TriggerSettings = selected().readTriggerSettings()
+
+    override suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
+        selected().readMegaSpeedTestStatus()
+
+    override suspend fun readMegaSpeedTestParams(): MegaSpeedTestParams =
+        selected().readMegaSpeedTestParams()
+
+    override suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams) =
+        selected().writeMegaSpeedTestParams(params)
+
+    override suspend fun executeMegaSpeedTestCommand(command: MegaSpeedTestCommand) =
+        selected().executeMegaSpeedTestCommand(command)
+
+    override suspend fun emergencyStopMegaSpeedTest(): Int =
+        selected().emergencyStopMegaSpeedTest()
 
     override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView =
         selected().readMegaSpeedConfigView(view)

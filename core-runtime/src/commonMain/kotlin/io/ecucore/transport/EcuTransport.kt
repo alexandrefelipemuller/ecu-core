@@ -19,6 +19,9 @@ import io.ecucore.model.PinLayoutInfo
 import io.ecucore.model.PressureCalibration
 import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
+import io.ecucore.model.MegaSpeedTestCommand
+import io.ecucore.model.MegaSpeedTestParams
+import io.ecucore.model.MegaSpeedTestStatus
 import io.ecucore.model.RusefiInputOutputSnapshot
 import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.TableDefinitions
@@ -135,6 +138,22 @@ interface EcuTransport {
 
     suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView =
         throw UnsupportedOperationException("MegaSpeed config view not supported by this transport")
+
+    suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    suspend fun readMegaSpeedTestParams(): MegaSpeedTestParams =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams): Unit =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    suspend fun executeMegaSpeedTestCommand(command: MegaSpeedTestCommand): Unit =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    /** Desliga tudo e sai do modo de teste, best effort. Devolve quantos comandos falharam. */
+    suspend fun emergencyStopMegaSpeedTest(): Int =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
 
     suspend fun readEngineProtectionConfig(): EngineProtectionConfig =
         throw UnsupportedOperationException("Engine protection not supported by this transport")

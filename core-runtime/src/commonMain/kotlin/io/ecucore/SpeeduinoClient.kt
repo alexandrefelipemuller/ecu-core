@@ -60,6 +60,13 @@ import io.ecucore.model.RusefiTableDefinitions
 import io.ecucore.model.RusefiInputOutputConfig
 import io.ecucore.model.MegaSpeedIdleConfig
 import io.ecucore.model.MegaSpeedIoConfig
+import io.ecucore.model.MegaSpeedOutputTest
+import io.ecucore.model.MegaSpeedOutputTestGuard
+import io.ecucore.model.MegaSpeedTestCommand
+import io.ecucore.model.MegaSpeedTestDecision
+import io.ecucore.model.MegaSpeedTestKind
+import io.ecucore.model.MegaSpeedTestParams
+import io.ecucore.model.MegaSpeedTestStatus
 import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
 import io.ecucore.model.RusefiInputOutputSnapshot
@@ -1567,6 +1574,120 @@ class SpeeduinoClient(
         )
         Logger.d(TAG, "Trigger Settings recebidos: ${pageData.size} bytes")
         return TriggerSettings.fromPageData(pageData)
+    }
+
+    // ---- Teste de saídas MegaSpeed (bomba, bicos, bobinas, portas, atuador de lenta) -----------------
+    // Regras puras e testadas em MegaSpeedOutputTestGuard. Aqui só há I/O: ler o estado ANTES de cada
+    // acionamento, enviar o frame do .ini e manter o watchdog que desliga tudo se ninguém desligar.
+
+    private var megaSpeedTestWatchdog: Job? = null
+
+    /** Só para teste: substitui o prazo do watchdog para não depender de segundos reais. */
+    internal var megaSpeedTestWatchdogOverrideMs: Long? = null
+
+    private fun requireMegaSpeedTest() {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Teste de saídas disponível apenas para MegaSpeed")
+        }
+    }
+
+    override suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus {
+        requireMegaSpeedTest()
+        val live = withEcuIo { readLiveData() }
+        return MegaSpeedTestStatus.fromOutputChannels(live.rpm, live.outputChannelData)
+            ?: throw IllegalStateException("Bloco de saída sem status3: não dá para confirmar o modo de teste")
+    }
+
+    override suspend fun readMegaSpeedTestParams(): MegaSpeedTestParams {
+        requireMegaSpeedTest()
+        val bytes = readConfigChunk(MegaSpeedOutputTest.PARAMS_PAGE, 0, MegaSpeedTestParams.PARAMS_END)
+        return MegaSpeedTestParams.fromPage(bytes)
+    }
+
+    override suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams) {
+        requireMegaSpeedTest()
+        ensureWritable("writeMegaSpeedTestParams")
+        // Lê, altera só os campos do teste (preserva outros bits) e grava a faixa 2..10 em RAM, sem burn.
+        val current = readConfigChunk(MegaSpeedOutputTest.PARAMS_PAGE, 0, MegaSpeedTestParams.PARAMS_END)
+        val updated = params.applyTo(current)
+        val region = updated.copyOfRange(MegaSpeedTestParams.OFFSET_OP, MegaSpeedTestParams.PARAMS_END)
+        withEcuIo {
+            protocol.writeTable(MegaSpeedOutputTest.PARAMS_PAGE, MegaSpeedTestParams.OFFSET_OP, region, EcuFamily.MS2)
+        }
+        invalidateConfigPageCache()
+    }
+
+    override suspend fun executeMegaSpeedTestCommand(command: MegaSpeedTestCommand) {
+        requireMegaSpeedTest()
+        if (!command.isOff) {
+            ensureWritable("MegaSpeed output test: ${command.label}")
+            // Estado lido AGORA, não o de um quadro antigo do stream.
+            val status = runCatching { readMegaSpeedTestStatus() }.getOrNull()
+            val needsParams = command.kind == MegaSpeedTestKind.SPARK || command.kind == MegaSpeedTestKind.INJECTOR
+            val params = if (needsParams) runCatching { readMegaSpeedTestParams() }.getOrNull() else null
+            when (val decision = MegaSpeedOutputTestGuard.evaluate(command, status, params)) {
+                MegaSpeedTestDecision.Allowed -> Unit
+                is MegaSpeedTestDecision.Refused -> {
+                    Logger.w(TAG, "Teste de saída recusado (${command.label}): ${decision.reason}")
+                    throw MegaSpeedTestRefusedException(decision.reason)
+                }
+            }
+        }
+        sendMegaSpeedTestFrame(command)
+        if (command.isOff) {
+            // Desligar algo não cancela o watchdog (pode haver outra saída ligada); só STOP_TEST_MODE o encerra.
+            if (command == MegaSpeedTestCommand.STOP_TEST_MODE) megaSpeedTestWatchdog?.cancel()
+        } else if (command.autoOffMs > 0) {
+            armMegaSpeedTestWatchdog(command.autoOffMs)
+        }
+    }
+
+    override suspend fun emergencyStopMegaSpeedTest(): Int {
+        requireMegaSpeedTest()
+        megaSpeedTestWatchdog?.cancel()
+        return sendMegaSpeedStopAll()
+    }
+
+    /**
+     * Envia STOP_ALL sem mexer no watchdog. O próprio watchdog chama isto: cancelar o job que está
+     * executando faria o envio abortar na primeira suspensão e nada seria desligado.
+     */
+    private suspend fun sendMegaSpeedStopAll(): Int {
+        var failures = 0
+        // Tudo é tentado mesmo que um falhe; sem ensureWritable: desligar nunca é bloqueado.
+        for (command in MegaSpeedTestCommand.STOP_ALL) {
+            try {
+                sendMegaSpeedTestFrame(command)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failures++
+                Logger.e(TAG, "Falha ao enviar '${command.label}' na parada de emergência: ${e.message}")
+            }
+        }
+        return failures
+    }
+
+    private suspend fun sendMegaSpeedTestFrame(command: MegaSpeedTestCommand) {
+        Logger.d(TAG, "Teste MegaSpeed: ${command.label} (0x${command.code.toString(16)})")
+        withEcuIo {
+            protocol.writeTable(
+                tableId = MegaSpeedOutputTest.COMMAND_TABLE,
+                offset = MegaSpeedOutputTest.COMMAND_OFFSET,
+                data = command.data(),
+                family = EcuFamily.MS2,
+            )
+        }
+    }
+
+    /** Se ninguém desligar em [afterMs], desliga TUDO (cada novo acionamento rearma o prazo). */
+    private fun armMegaSpeedTestWatchdog(afterMs: Long) {
+        megaSpeedTestWatchdog?.cancel()
+        megaSpeedTestWatchdog = scope.launch {
+            delay(megaSpeedTestWatchdogOverrideMs ?: afterMs)
+            Logger.w(TAG, "Watchdog do teste de saídas expirou após ${afterMs}ms: desligando tudo")
+            runCatching { sendMegaSpeedStopAll() }
+        }
     }
 
     override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView {
