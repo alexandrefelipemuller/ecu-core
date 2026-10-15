@@ -18,6 +18,8 @@ import io.ecucore.model.PinLayoutInfo
 import io.ecucore.model.PressureCalibration
 import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
+import io.ecucore.model.MegaSpeedLogCapture
+import io.ecucore.model.MegaSpeedLoggerKind
 import io.ecucore.model.MegaSpeedTestCommand
 import io.ecucore.model.MegaSpeedTestParams
 import io.ecucore.model.MegaSpeedTestStatus
@@ -192,6 +194,9 @@ class PromotingObd2Transport(
     override suspend fun readEngineConstants(): EngineConstants = selected().readEngineConstants()
 
     override suspend fun readTriggerSettings(): TriggerSettings = selected().readTriggerSettings()
+
+    override suspend fun captureMegaSpeedLog(kind: MegaSpeedLoggerKind, timeoutMs: Long): MegaSpeedLogCapture =
+        selected().captureMegaSpeedLog(kind, timeoutMs)
 
     override suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
         selected().readMegaSpeedTestStatus()

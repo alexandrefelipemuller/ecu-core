@@ -19,6 +19,8 @@ import io.ecucore.model.PinLayoutInfo
 import io.ecucore.model.PressureCalibration
 import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
+import io.ecucore.model.MegaSpeedLogCapture
+import io.ecucore.model.MegaSpeedLoggerKind
 import io.ecucore.model.MegaSpeedTestCommand
 import io.ecucore.model.MegaSpeedTestParams
 import io.ecucore.model.MegaSpeedTestStatus
@@ -154,6 +156,13 @@ interface EcuTransport {
     /** Desliga tudo e sai do modo de teste, best effort. Devolve quantos comandos falharam. */
     suspend fun emergencyStopMegaSpeedTest(): Int =
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    /**
+     * Captura um logger de dente/gatilho/composto da MegaSpeed: arma, espera a ECU sinalizar buffer
+     * completo (status3 & 0x02) e lê. Lança [IllegalStateException] se não completar em [timeoutMs].
+     */
+    suspend fun captureMegaSpeedLog(kind: MegaSpeedLoggerKind, timeoutMs: Long = 10_000L): MegaSpeedLogCapture =
+        throw UnsupportedOperationException("MegaSpeed logger not supported by this transport")
 
     suspend fun readEngineProtectionConfig(): EngineProtectionConfig =
         throw UnsupportedOperationException("Engine protection not supported by this transport")

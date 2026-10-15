@@ -60,6 +60,10 @@ import io.ecucore.model.RusefiTableDefinitions
 import io.ecucore.model.RusefiInputOutputConfig
 import io.ecucore.model.MegaSpeedIdleConfig
 import io.ecucore.model.MegaSpeedIoConfig
+import io.ecucore.model.MegaSpeedLogCapture
+import io.ecucore.model.MegaSpeedLogDecoder
+import io.ecucore.model.MegaSpeedLiveChannels
+import io.ecucore.model.MegaSpeedLoggerKind
 import io.ecucore.model.MegaSpeedOutputTest
 import io.ecucore.model.MegaSpeedOutputTestGuard
 import io.ecucore.model.MegaSpeedTestCommand
@@ -119,6 +123,8 @@ class SpeeduinoClient(
 ) : io.ecucore.transport.EcuTransport {
     companion object {
         private const val TAG = "SpeeduinoClient"
+        /** STATUS3_DONELOG do firmware: logger de dente/gatilho/composto terminou (status3 bit 1). */
+        private const val DONELOG_BIT = 0x02
         private const val FIRMWARE_HANDSHAKE_DRAIN_DELAY_MS = 80L
         private const val FIRMWARE_HANDSHAKE_RETRY_DELAY_MS = 80L
         private const val LIVE_DATA_FAULT_REPORT_INTERVAL_MS = 30_000L
@@ -1687,6 +1693,43 @@ class SpeeduinoClient(
             delay(megaSpeedTestWatchdogOverrideMs ?: afterMs)
             Logger.w(TAG, "Watchdog do teste de saídas expirou após ${afterMs}ms: desligando tudo")
             runCatching { sendMegaSpeedStopAll() }
+        }
+    }
+
+    // ---- Loggers de dente/gatilho/composto (tabelas 0xF0..0xF3) -----------------------------------
+    // Protocolo conforme serial.c/ms3_misc.c da MS3: cada leitura de 0xF0..0xF3 zera o DONELOG e, depois
+    // de responder, limpa e REARMA a captura. Logo: 1ª leitura arma, espera status3 & 0x02, 2ª leitura
+    // devolve o buffer completo. Ler antes de DONELOG reiniciaria a captura em andamento.
+
+    /** Só para teste: intervalo entre consultas de status3 enquanto aguarda o buffer. */
+    internal var megaSpeedLogPollMs: Long = 150L
+
+    override suspend fun captureMegaSpeedLog(kind: MegaSpeedLoggerKind, timeoutMs: Long): MegaSpeedLogCapture {
+        requireMegaSpeedLogger()
+        Logger.d(TAG, "Logger MegaSpeed ${kind.label}: armando (tabela 0x${kind.table.toString(16)})...")
+        withEcuIo { protocol.readTable(kind.table, 0, MegaSpeedLogDecoder.BUFFER_SIZE, EcuFamily.MS2) }
+
+        val deadline = MonotonicClock.nowMillis() + timeoutMs
+        while (true) {
+            val block = withEcuIo { readLiveData() }.outputChannelData
+            val status3 = MegaSpeedLiveChannels.status3(block)
+                ?: throw IllegalStateException("Bloco de saída sem status3: não dá para saber se o logger terminou")
+            if (status3 and DONELOG_BIT != 0) break
+            if (MonotonicClock.nowMillis() >= deadline) {
+                throw IllegalStateException(
+                    "Logger ${kind.label} não completou em ${timeoutMs}ms (sem pulsos de rotação ou buffer não encheu)"
+                )
+            }
+            delay(megaSpeedLogPollMs)
+        }
+
+        val buffer = withEcuIo { protocol.readTable(kind.table, 0, MegaSpeedLogDecoder.BUFFER_SIZE, EcuFamily.MS2) }
+        return MegaSpeedLogDecoder.decode(kind, buffer)
+    }
+
+    private fun requireMegaSpeedLogger() {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Logger de dentes disponível apenas para MegaSpeed")
         }
     }
 

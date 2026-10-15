@@ -93,17 +93,6 @@ class IniFieldReader(
         }
     }
 
-    private fun formatFixed(value: Double, digits: Int): String {
-        if (digits == 0) return kotlin.math.round(value).toLong().toString()
-        var factor = 1.0
-        repeat(digits) { factor *= 10.0 }
-        val scaled = kotlin.math.round(value * factor).toLong()
-        val negative = scaled < 0
-        val abs = kotlin.math.abs(scaled).toString().padStart(digits + 1, '0')
-        val text = abs.substring(0, abs.length - digits) + "." + abs.substring(abs.length - digits)
-        return if (negative) "-$text" else text
-    }
-
     private fun rawAt(field: IniFieldDefinition, index: Int): Int? {
         if (!field.dataType.equals("U08", ignoreCase = true)) return null
         val pageIndex = (field.page ?: return null) - 1
