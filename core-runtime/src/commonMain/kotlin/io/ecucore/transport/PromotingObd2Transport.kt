@@ -16,6 +16,8 @@ import io.ecucore.model.IdleControlSettings
 import io.ecucore.model.IgnitionTable
 import io.ecucore.model.PinLayoutInfo
 import io.ecucore.model.PressureCalibration
+import io.ecucore.model.IniConfigView
+import io.ecucore.model.MegaSpeedConfigView
 import io.ecucore.model.RusefiInputOutputSnapshot
 import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.TableDefinitions
@@ -187,6 +189,9 @@ class PromotingObd2Transport(
     override suspend fun readEngineConstants(): EngineConstants = selected().readEngineConstants()
 
     override suspend fun readTriggerSettings(): TriggerSettings = selected().readTriggerSettings()
+
+    override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView =
+        selected().readMegaSpeedConfigView(view)
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot =
         selected().readRusefiInputOutputSnapshot()

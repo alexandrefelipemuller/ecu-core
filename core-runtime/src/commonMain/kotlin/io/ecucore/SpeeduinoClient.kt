@@ -58,7 +58,10 @@ import io.ecucore.model.RusefiF407DiscoveryDefinitions
 import io.ecucore.model.RusefiIniTableDefinitions
 import io.ecucore.model.RusefiTableDefinitions
 import io.ecucore.model.RusefiInputOutputConfig
+import io.ecucore.model.MegaSpeedIdleConfig
 import io.ecucore.model.MegaSpeedIoConfig
+import io.ecucore.model.IniConfigView
+import io.ecucore.model.MegaSpeedConfigView
 import io.ecucore.model.RusefiInputOutputSnapshot
 import io.ecucore.model.RusefiIniUiParsers
 import io.ecucore.model.SpeeduinoIniDefinitions
@@ -1564,6 +1567,21 @@ class SpeeduinoClient(
         )
         Logger.d(TAG, "Trigger Settings recebidos: ${pageData.size} bytes")
         return TriggerSettings.fromPageData(pageData)
+    }
+
+    override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed")
+        }
+        val definition = activeIniDefinition
+            ?: throw UnsupportedOperationException("Esta tela requer o .ini da CostaMegaSpeed carregado")
+        Logger.d(TAG, "Lendo $view MegaSpeed via .ini (páginas ${view.requiredPages.joinToString { formatPageId(it) }})...")
+        val pages = view.requiredPages.associateWith { pageId ->
+            readFullPage(pageNum = pageId, pageSize = 1024, blockSize = 256)
+        }
+        return when (view) {
+            MegaSpeedConfigView.IDLE -> MegaSpeedIdleConfig.parse(definition, pages)
+        }
     }
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {

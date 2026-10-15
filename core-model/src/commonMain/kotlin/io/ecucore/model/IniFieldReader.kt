@@ -48,6 +48,62 @@ class IniFieldReader(
         return label.takeIf { it.isNotEmpty() && !it.equals("INVALID", ignoreCase = true) }
     }
 
+    /**
+     * Valor em unidade do usuário de um escalar: `(raw + translate) * scale` (convenção do .ini).
+     * Suporta U08/S08/U16/S16 big-endian (MS2/MegaSpeed). Outros tipos retornam null.
+     */
+    fun scaled(name: String): Double? {
+        val field = byName[name] ?: return null
+        if (field.kind != IniFieldKind.SCALAR) return null
+        val raw = signedRaw(field) ?: return null
+        return (raw + (field.translate ?: 0.0)) * (field.scale ?: 1.0)
+    }
+
+    /** Texto para exibição: rótulo do enum para `bits`, valor escalado com unidade para escalares. */
+    fun display(name: String): String? {
+        val field = byName[name] ?: return null
+        return when (field.kind) {
+            IniFieldKind.BITS -> label(name)
+            IniFieldKind.SCALAR -> {
+                val value = scaled(name) ?: return null
+                val digits = (field.digits ?: 0).coerceIn(0, 4)
+                val number = formatFixed(value, digits)
+                val units = field.units?.trim().orEmpty()
+                if (units.isEmpty()) number else "$number $units"
+            }
+            else -> null
+        }
+    }
+
+    private fun signedRaw(field: IniFieldDefinition): Int? {
+        val pageIndex = (field.page ?: return null) - 1
+        val pageId = definition.pageDefinitions.getOrNull(pageIndex)?.resolvedId ?: return null
+        val data = pages[pageId] ?: return null
+        val offset = field.offset ?: return null
+        fun u8(i: Int) = data[i].toInt() and 0xFF
+        return when (field.dataType.uppercase()) {
+            "U08" -> if (offset in data.indices) u8(offset) else null
+            "S08" -> if (offset in data.indices) data[offset].toInt() else null
+            "U16", "S16" -> {
+                if (offset + 1 !in data.indices) return null
+                val v = (u8(offset) shl 8) or u8(offset + 1)
+                if (field.dataType.equals("S16", ignoreCase = true) && v >= 0x8000) v - 0x10000 else v
+            }
+            else -> null
+        }
+    }
+
+    private fun formatFixed(value: Double, digits: Int): String {
+        if (digits == 0) return kotlin.math.round(value).toLong().toString()
+        var factor = 1.0
+        repeat(digits) { factor *= 10.0 }
+        val scaled = kotlin.math.round(value * factor).toLong()
+        val negative = scaled < 0
+        val abs = kotlin.math.abs(scaled).toString().padStart(digits + 1, '0')
+        val text = abs.substring(0, abs.length - digits) + "." + abs.substring(abs.length - digits)
+        return if (negative) "-$text" else text
+    }
+
     private fun rawAt(field: IniFieldDefinition, index: Int): Int? {
         if (!field.dataType.equals("U08", ignoreCase = true)) return null
         val pageIndex = (field.page ?: return null) - 1

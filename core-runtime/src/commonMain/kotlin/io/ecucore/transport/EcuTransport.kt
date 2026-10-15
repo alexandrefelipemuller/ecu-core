@@ -17,6 +17,8 @@ import io.ecucore.model.IdleControlSettings
 import io.ecucore.model.IgnitionTable
 import io.ecucore.model.PinLayoutInfo
 import io.ecucore.model.PressureCalibration
+import io.ecucore.model.IniConfigView
+import io.ecucore.model.MegaSpeedConfigView
 import io.ecucore.model.RusefiInputOutputSnapshot
 import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.TableDefinitions
@@ -130,6 +132,9 @@ interface EcuTransport {
 
     suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot =
         throw UnsupportedOperationException("I/O snapshot not supported by this transport")
+
+    suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView =
+        throw UnsupportedOperationException("MegaSpeed config view not supported by this transport")
 
     suspend fun readEngineProtectionConfig(): EngineProtectionConfig =
         throw UnsupportedOperationException("Engine protection not supported by this transport")
