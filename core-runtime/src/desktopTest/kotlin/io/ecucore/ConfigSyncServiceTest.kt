@@ -48,9 +48,9 @@ class ConfigSyncServiceTest {
 
     private val allPages: Set<Byte> = ConfigManager.PAGE_SIZES.keys
 
-    private suspend fun connected(): Pair<SpeeduinoClient, ClientFakeEcu> {
+    private suspend fun connected(): Pair<EcuClient, ClientFakeEcu> {
         val ecu = ClientFakeEcu(ClientFakeEcu.Kind.SPEEDUINO_2025)
-        val client = SpeeduinoClient(ecu, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
+        val client = EcuClient(ecu, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
         client.connect()
         return client to ecu
     }

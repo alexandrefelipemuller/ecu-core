@@ -3,8 +3,8 @@ package io.ecucore.model
 /**
  * Sensores de pressão extras (óleo, combustível) em ECUs sem campo dedicado pra eles.
  *
- * O dashboard lê "oilPressure"/"fuelPressure" por nome ([SpeeduinoOutputChannels.getField]).
- * Aqui esses nomes viram aliases ([SpeeduinoOutputChannels.setSensorRoleAliases]):
+ * O dashboard lê "oilPressure"/"fuelPressure" por nome ([EcuOutputChannels.getField]).
+ * Aqui esses nomes viram aliases ([EcuOutputChannels.setSensorRoleAliases]):
  * - MS3: alias para o Generic Sensor configurado na ECU ([Ms3GenericSensors]); a ECU já entrega
  *   o valor convertido.
  * - MS2 (MS2Extra): não existe calibração de sensor genérico no firmware - a ECU só manda o ADC

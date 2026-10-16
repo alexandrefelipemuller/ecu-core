@@ -8,7 +8,7 @@ class TableValidatorTest {
 
     @Test
     fun nonMonotonicLoadBinsAreWarningsOnly() {
-        val metadata = SpeeduinoTableDefinitions.VE_TABLE_MODERN
+        val metadata = EcuTableDefinitions.VE_TABLE_MODERN
         val baseTable = VeTable.createDefault()
         val tableWithLoadIssues = baseTable.copy(
             loadBins = baseTable.loadBins.toMutableList().apply {
@@ -28,7 +28,7 @@ class TableValidatorTest {
 
     @Test
     fun nonMonotonicRpmBinsAreWarningsOnly() {
-        val metadata = SpeeduinoTableDefinitions.VE_TABLE_MODERN
+        val metadata = EcuTableDefinitions.VE_TABLE_MODERN
         val baseTable = VeTable.createDefault()
         val tableWithRpmIssues = baseTable.copy(
             rpmBins = baseTable.rpmBins.toMutableList().apply {
@@ -54,7 +54,7 @@ class TableValidatorTest {
 
     @Test
     fun veWithManyNoFuelCellsBlocksWrite() {
-        val metadata = SpeeduinoTableDefinitions.VE_TABLE_MODERN
+        val metadata = EcuTableDefinitions.VE_TABLE_MODERN
 
         val result = TableValidator(metadata).validateBeforeWrite(veWith(noFuelCells = 26))
 
@@ -64,7 +64,7 @@ class TableValidatorTest {
 
     @Test
     fun veWithFewNoFuelCellsStillWrites() {
-        val metadata = SpeeduinoTableDefinitions.VE_TABLE_MODERN
+        val metadata = EcuTableDefinitions.VE_TABLE_MODERN
 
         val result = TableValidator(metadata).validateBeforeWrite(veWith(noFuelCells = 5))
 
@@ -78,7 +78,7 @@ class TableValidatorTest {
 
     @Test
     fun afrDangerouslyLeanBlocksWrite() {
-        val metadata = SpeeduinoTableDefinitions.AFR_TABLE_MODERN
+        val metadata = EcuTableDefinitions.AFR_TABLE_MODERN
 
         val result = TableValidator(metadata).validateBeforeWrite(afrWith(raw = 185))
 
@@ -88,7 +88,7 @@ class TableValidatorTest {
 
     @Test
     fun afrModeratelyLeanOnlyWarns() {
-        val metadata = SpeeduinoTableDefinitions.AFR_TABLE_MODERN
+        val metadata = EcuTableDefinitions.AFR_TABLE_MODERN
 
         val result = TableValidator(metadata).validateBeforeWrite(afrWith(raw = 170))
 
@@ -98,7 +98,7 @@ class TableValidatorTest {
 
     @Test
     fun afrOutOfRangeBlocksWrite() {
-        val metadata = SpeeduinoTableDefinitions.AFR_TABLE_MODERN
+        val metadata = EcuTableDefinitions.AFR_TABLE_MODERN
 
         assertTrue(!TableValidator(metadata).validateBeforeWrite(afrWith(raw = 30)).isValid)
         assertTrue(!TableValidator(metadata).validateBeforeWrite(afrWith(raw = 255 + 1)).isValid)
@@ -106,7 +106,7 @@ class TableValidatorTest {
 
     @Test
     fun afrDefaultTableIsValid() {
-        val metadata = SpeeduinoTableDefinitions.AFR_TABLE_MODERN
+        val metadata = EcuTableDefinitions.AFR_TABLE_MODERN
 
         val result = TableValidator(metadata).validateBeforeWrite(AfrTable.createDefault())
 

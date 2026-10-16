@@ -2,7 +2,7 @@ package io.ecucore.transport
 
 import io.ecucore.model.Ms3GenericSensorConfig
 import io.ecucore.model.Ms3GenericSensorsSnapshot
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import io.ecucore.definition.IniDefinition
 import io.ecucore.ecu.FirmwareInfo
 import io.ecucore.model.AfrTable

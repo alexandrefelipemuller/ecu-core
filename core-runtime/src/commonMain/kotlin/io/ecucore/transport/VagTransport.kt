@@ -1,8 +1,8 @@
 package io.ecucore.transport
 
 import io.ecucore.shared.Logger
-import io.ecucore.SpeeduinoLiveData
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.EcuLiveData
+import io.ecucore.connection.IEcuConnection
 import io.ecucore.definition.IniDefinition
 import io.ecucore.ecu.FirmwareInfo
 import io.ecucore.model.AfrTable
@@ -54,8 +54,8 @@ import io.ecucore.transport.EcuTransport
  * - mapeamento heuristico dos sinais mais universais
  */
 class VagTransport(
-    private val connection: ISpeeduinoConnection,
-    private val onDataReceived: (SpeeduinoLiveData) -> Unit,
+    private val connection: IEcuConnection,
+    private val onDataReceived: (EcuLiveData) -> Unit,
     private val onConnectionStateChanged: (Boolean) -> Unit,
     private val onError: (String) -> Unit,
     private val investigationRecorder: Obd2InvestigationSink? = null,
@@ -116,7 +116,7 @@ class VagTransport(
     private var streaming = false
     private var firmwareInfo: FirmwareInfo? = null
     private var detection: DetectionResult? = null
-    private var currentLiveData = SpeeduinoLiveData(
+    private var currentLiveData = EcuLiveData(
         secl = 0,
         rpm = 0,
         coolantTemp = 0,
@@ -471,7 +471,7 @@ class VagTransport(
         )
     }
 
-    private fun mapValuesToLiveData(values: List<MeasurementValue>): SpeeduinoLiveData {
+    private fun mapValuesToLiveData(values: List<MeasurementValue>): EcuLiveData {
         var rpm = currentLiveData.rpm
         var coolant = currentLiveData.coolantTemp
         var intake = currentLiveData.intakeTemp

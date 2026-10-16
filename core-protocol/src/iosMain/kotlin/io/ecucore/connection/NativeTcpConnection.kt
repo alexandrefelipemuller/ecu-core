@@ -58,14 +58,14 @@ import platform.posix.socket
  * buffer -> synchronous receive) is deliberate: it is the same shape a future BLE connection needs
  * (GATT notifications arrive one characteristic-update callback at a time, not as a readable
  * stream), so BleConnection can reuse [ByteStreamBuffer] as-is instead of re-implementing the
- * polling/timeout contract that [SpeeduinoProtocol] relies on.
+ * polling/timeout contract that [EcuProtocol] relies on.
  */
 @OptIn(ExperimentalForeignApi::class)
 class NativeTcpConnection(
     private val host: String,
     private val port: Int,
     private val timeoutMs: Int
-) : ISpeeduinoConnection {
+) : IEcuConnection {
 
     companion object {
         private const val TAG = "NativeTcpIOS"

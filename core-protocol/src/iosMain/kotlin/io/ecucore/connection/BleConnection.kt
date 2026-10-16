@@ -27,14 +27,14 @@ import kotlin.coroutines.resumeWithException
 
 /**
  * BLE-UART bridge connection (HM-10/Nordic-UART-style modules), implementing the real
- * [ISpeeduinoConnection] contract via CoreBluetooth — unlike the desktopApp's `BleManager`
+ * [IEcuConnection] contract via CoreBluetooth — unlike the desktopApp's `BleManager`
  * (which only drives the Connection screen's scan/picker UI), this class is what
- * [io.ecucore.SpeeduinoClient] actually talks to.
+ * [io.ecucore.EcuClient] actually talks to.
  *
  * CoreBluetooth is delegate/callback-driven and BLE writes are chunked to the negotiated MTU
  * instead of being one continuous stream. [connect] bridges that with `suspendCancellableCoroutine`
  * (fine, since it's a suspend function); [send]/[receive] are plain blocking calls per
- * [ISpeeduinoConnection], so incoming notification bytes are pushed into the shared
+ * [IEcuConnection], so incoming notification bytes are pushed into the shared
  * [ByteStreamBuffer] from [peripheral]'s delegate callback and [receive] just polls it — the same
  * bridge [NativeTcpConnection] uses for its background socket-reading loop.
  */
@@ -46,7 +46,7 @@ class BleConnection(
     private val rxCharUuid: String = DEFAULT_TX_CHAR_UUID,
     private val txCharUuid: String = DEFAULT_TX_CHAR_UUID,
     private val timeoutMs: Int = 8000
-) : ISpeeduinoConnection {
+) : IEcuConnection {
 
     companion object {
         private const val TAG = "BleConnectionIOS"
@@ -289,7 +289,7 @@ class BleConnection(
     }
 
     // BLE-UART bridges wrap plain legacy Speeduino serial framing, not the CRC-based modern
-    // protocol — mirrors Android's SpeeduinoBluetoothConnection, whose classic-BT SPP link has
+    // protocol — mirrors Android's EcuBluetoothConnection, whose classic-BT SPP link has
     // the same legacy-first behavior for the same reason (no direct TCP-like framed channel).
     override fun supportsModernProtocol(): Boolean = false
     override fun supportsModernProtocolFallback(): Boolean = true

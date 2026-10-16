@@ -1,6 +1,6 @@
 package io.ecucore.telemetry
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
@@ -10,7 +10,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-private fun liveData(rpm: Int) = SpeeduinoLiveData(
+private fun liveData(rpm: Int) = EcuLiveData(
     secl = 0,
     rpm = rpm,
     coolantTemp = 80,
@@ -30,7 +30,7 @@ class LiveDataUpsamplerTest {
     @Test
     fun ingestRealSample_publishesImmediatelyWithoutWaitingForTicker() = runTest {
         val upsampler = LiveDataUpsampler(tickIntervalMs = 1_000L)
-        val collected = mutableListOf<SpeeduinoLiveData>()
+        val collected = mutableListOf<EcuLiveData>()
         val job = launch { upsampler.samples.collect { collected.add(it) } }
         runCurrent() // let the collector subscribe before we emit
 
@@ -45,7 +45,7 @@ class LiveDataUpsamplerTest {
     @Test
     fun start_emitsExtrapolatedSamplesOnTicker() = runTest {
         val upsampler = LiveDataUpsampler(tickIntervalMs = 100L)
-        val collected = mutableListOf<SpeeduinoLiveData>()
+        val collected = mutableListOf<EcuLiveData>()
         val collectJob = launch { upsampler.samples.collect { collected.add(it) } }
         runCurrent() // let the collector subscribe before we emit
 

@@ -1,0 +1,4296 @@
+package io.ecucore
+
+import kotlin.concurrent.Volatile
+
+import io.ecucore.model.Ms3GenericSensors
+import io.ecucore.model.Ms3GenericSensorConfig
+import io.ecucore.model.Ms3GenericSensorsSnapshot
+import io.ecucore.definition.IniDefinition
+import io.ecucore.definition.IniFieldKind
+import io.ecucore.ecu.FirmwareConsensus
+import io.ecucore.ecu.FirmwareHandshakeDomain
+import io.ecucore.ecu.FirmwareInfo
+import io.ecucore.shared.Logger
+import io.ecucore.cache.EcuConfigPageCache
+import io.ecucore.cache.NoopEcuConfigPageCache
+import io.ecucore.connection.ConnectionTrace
+import io.ecucore.connection.IEcuConnection
+import io.ecucore.model.FirmwareEra
+import io.ecucore.model.EngineConstants
+import io.ecucore.model.Algorithm
+import io.ecucore.model.EcuCapabilities
+import io.ecucore.model.EcuDefinition
+import io.ecucore.model.EcuDefinitionRegistry
+import io.ecucore.model.EcuFamily
+import io.ecucore.model.EcuConfigReadMode
+import io.ecucore.model.OutputField
+import io.ecucore.model.EcuOutputChannels
+import io.ecucore.model.EcuTableDefinitions
+import io.ecucore.model.EngineProtectionConfig
+import io.ecucore.model.EngineProtectionMapper
+import io.ecucore.model.ClosedLoopCorrectionConfig
+import io.ecucore.model.ClosedLoopCorrectionMapper
+import io.ecucore.model.MegaSpeedIniTableDefinitions
+import io.ecucore.model.MsExtraIniTableDefinitions
+import io.ecucore.model.Ms2TableDefinitions
+import io.ecucore.model.PinLayoutDetector
+import io.ecucore.model.PinLayoutInfo
+import io.ecucore.model.TableDefinitions
+import io.ecucore.model.TableMetadata
+import io.ecucore.model.TableValidator
+import io.ecucore.model.UnsupportedFirmwareException
+import io.ecucore.model.ConfigValidator
+import io.ecucore.model.SerializedMs2Table
+import io.ecucore.model.SerializedMs3Table
+import io.ecucore.model.SerializedRusefiTable
+import io.ecucore.model.TableChangeAnalyzer
+import io.ecucore.model.TableChangeAssessment
+import io.ecucore.model.TableChangeKind
+import io.ecucore.model.ValidationException
+import io.ecucore.model.SecondarySerialConfig
+import io.ecucore.model.IgnitionTable
+import io.ecucore.model.AfrTable
+import io.ecucore.model.DwellTable
+import io.ecucore.model.IdleControlSettings
+import io.ecucore.model.Ms3TableDefinitions
+import io.ecucore.model.PressureCalibration
+import io.ecucore.model.RusefiF407DiscoveryDefinitions
+import io.ecucore.model.RusefiIniTableDefinitions
+import io.ecucore.model.RusefiTableDefinitions
+import io.ecucore.model.RusefiInputOutputConfig
+import io.ecucore.model.MegaSpeedIdleConfig
+import io.ecucore.model.MegaSpeedProtectionConfig
+import io.ecucore.model.MegaSpeedWritableFields
+import io.ecucore.model.MegaSpeedSensorsConfig
+import io.ecucore.model.MegaSpeedIoConfig
+import io.ecucore.model.MegaSpeedLogCapture
+import io.ecucore.model.MegaSpeedLogDecoder
+import io.ecucore.model.MegaSpeedLiveChannels
+import io.ecucore.model.MegaSpeedLoggerKind
+import io.ecucore.model.MegaSpeedOutputTest
+import io.ecucore.model.MegaSpeedOutputTestGuard
+import io.ecucore.model.MegaSpeedTestCommand
+import io.ecucore.model.MegaSpeedTestDecision
+import io.ecucore.model.MegaSpeedTestKind
+import io.ecucore.model.MegaSpeedTestParams
+import io.ecucore.model.MegaSpeedTestStatus
+import io.ecucore.model.IniConfigView
+import io.ecucore.model.MegaSpeedConfigView
+import io.ecucore.model.RusefiInputOutputSnapshot
+import io.ecucore.model.RusefiIniUiParsers
+import io.ecucore.model.EcuIniDefinitions
+import io.ecucore.transport.MapSelectionSupport
+import io.ecucore.model.TpsCalibration
+import io.ecucore.model.VeTable
+import io.ecucore.model.TriggerSettings
+import io.ecucore.model.afrTableLoadType
+import io.ecucore.model.fuelTableLoadType
+import io.ecucore.model.ignitionTableLoadType
+import io.ecucore.protocol.SerialCapability
+import io.ecucore.protocol.EcuProtocol
+import io.ecucore.tables.TableDomainFacade
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import io.ecucore.shared.MonotonicClock
+import io.ecucore.shared.WallClock
+import io.ecucore.shared.formatDecimal
+import io.ecucore.shared.toHex02
+
+/**
+ * Cliente principal para comunicação com Speeduino ECU
+ *
+ * Fachada de alto nível que combina:
+ * - Camada de conexão (TCP, Bluetooth, USB, etc)
+ * - Camada de protocolo (comandos Legacy e Modern)
+ * - Stream contínuo de dados em tempo real
+ *
+ * Exemplo de uso:
+ * ```
+ * val connection = EcuTcpConnection("10.0.2.2", 5555)
+ * val client = EcuClient(connection, onDataReceived, onConnectionStateChanged, onError)
+ *
+ * client.connect()
+ * client.startLiveDataStream()
+ * ```
+ */
+class EcuClient(
+    private val connection: IEcuConnection,
+    private val onDataReceived: (EcuLiveData) -> Unit,
+    private val onConnectionStateChanged: (Boolean) -> Unit,
+    private val onError: (String) -> Unit,
+    private val pageCache: EcuConfigPageCache = NoopEcuConfigPageCache,
+    private val pageCacheTtlMs: Long = PAGE_CACHE_TTL_MS,
+) : io.ecucore.transport.EcuTransport {
+    companion object {
+        private const val TAG = "EcuClient"
+        /** STATUS3_DONELOG do firmware: logger de dente/gatilho/composto terminou (status3 bit 1). */
+        private const val DONELOG_BIT = 0x02
+        private const val FIRMWARE_HANDSHAKE_DRAIN_DELAY_MS = 80L
+        private const val FIRMWARE_HANDSHAKE_RETRY_DELAY_MS = 80L
+        private const val LIVE_DATA_FAULT_REPORT_INTERVAL_MS = 30_000L
+        private const val LIVE_DATA_FAULT_CONSECUTIVE_THRESHOLD = 3
+        private const val LIVE_DATA_FAULT_RECOVERY_INTERVAL_MS = 10_000L
+        private const val LIVE_DATA_STREAM_WARMUP_MS = 10_000L
+        private const val LIVE_STREAM_RECOVERABLE_TIMEOUT_LIMIT = 3
+        // Piso de espera entre comandos do live stream. Sem ele, quando uma leitura estoura o
+        // intervalo alvo o ticker realinha o relógio e emite o comando seguinte colado no
+        // anterior — num link Bluetooth lento isso vira uma rajada contínua sobre a ECU.
+        private const val LIVE_STREAM_MIN_COMMAND_GAP_MS = 25L
+        // Após um SERIAL_RC_CRC_ERR (0x82) a ECU ainda pode ter restos do frame corrompido no
+        // buffer serial dela; um novo comando enviado logo em seguida é concatenado a esse lixo
+        // e volta 0x82 de novo (ou 0x80 quando o "comprimento" lido do lixo nunca completa).
+        // Esperar mais que o timeout de recepção serial do firmware (~400ms) deixa a ECU
+        // descartar o frame parcial e voltar a aceitar comandos alinhados.
+        private const val LIVE_DATA_DESYNC_RESYNC_DELAY_MS = 450L
+        // Marcador estável na mensagem de erro quando o stream desiste por dessincronização
+        // persistente num link que já estava funcionando. Usado pelo app para classificar a
+        // falha como condição de link (ruído/perda de bytes), não como defeito de protocolo.
+        const val LIVE_DATA_LINK_DESYNC_MARKER = "link_desync"
+        private const val LIVE_DATA_CRC_ERR_RESPONSE = "response code = 0x82"
+        private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
+        // Gravação de tabelas de tuning (VE/Ignição/AFR): chunks pequenos reduzem a chance de
+        // perder bytes num frame grande via Bluetooth, e cada página é relida e comparada antes
+        // do burn. Um 0x82 (CRC_ERR) deixa o resto do frame chegando na ECU depois do flush dela;
+        // com legacy ainda liberado, bytes 'A'..'z' desse lixo viram comandos 'W' (escrita de 1
+        // byte na RAM) - célula corrompida sem nenhum erro visível. Só o read-back pega isso.
+        private const val TABLE_WRITE_CHUNK_SIZE = 64
+        private const val TABLE_WRITE_CHUNK_MAX_ATTEMPTS = 3
+        private const val TABLE_WRITE_VERIFY_MAX_PASSES = 2
+        private const val CONFIG_CHUNK_READ_RETRY_DELAY_MS = 40L
+        private const val RUSEFI_CONFIG_READ_CHUNK_SIZE = 64
+        private const val RUSEFI_RECONNECT_SETTLE_DELAY_MS = 3_000L
+        private const val GLOBAL_RECONNECT_SETTLE_DELAY_MS = 1_000L
+        // TTL padrão do cache de páginas de configuração: 30 dias. Seguro porque um download
+        // completo explícito ("Sincronizar") sempre invalida o cache antes de ler
+        // (ver invalidateConfigPageCache()/ConfigManager.downloadAllConfigs) — o TTL só governa
+        // leituras avulsas sob demanda (ex.: abrir uma tela de config individual).
+        const val PAGE_CACHE_TTL_MS = 30L * 24 * 60 * 60 * 1000
+        private val PARTIAL_TIMEOUT_REGEX = Regex("""Timeout: expected (\d+) bytes, received (\d+)""")
+        // Lançada por EcuProtocol.readLiveData() quando a resposta legacy vem truncada.
+        private val INCOMPLETE_LIVE_DATA_REGEX = Regex("""Resposta de live data incompleta: (\d+)/(\d+)""")
+
+        @Volatile
+        private var lastGlobalDisconnectWasActive: Boolean = false
+
+        @Volatile
+        private var lastGlobalDisconnectAtMs: Long = 0L
+    }
+
+    private val protocol = EcuProtocol(connection)
+
+    private var _isStreaming = false
+    private var streamJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Firmware info and table definitions (set after connect)
+    private var firmwareInfo: FirmwareInfo? = null
+    private var ecuDefinition: EcuDefinition? = null
+    private var tableDefinitions: TableDefinitions? = null
+    private var outputChannelFields: List<OutputField>? = null
+    private var activeIniDefinition: IniDefinition? = null
+    private var speeduinoIniCatalog: EcuIniDefinitions.Catalog? = null
+    private var megaSpeedIniCatalog: MegaSpeedIniTableDefinitions.Catalog? = null
+    private var msExtraIniCatalog: MsExtraIniTableDefinitions.Catalog? = null
+    private var rusefiIniCatalog: RusefiIniTableDefinitions.Catalog? = null
+    private var pendingRusefiVeTableReadback: VeTable? = null
+    private var pendingRusefiIgnitionTableReadback: IgnitionTable? = null
+    private val pendingSpeeduinoPageReadbacks = mutableMapOf<Int, ByteArray>()
+
+    /**
+     * Recebe [PageWriteAnomaly] quando o read-back de uma tabela diverge ou a escrita falha -
+     * inclusive quando a regravação corrige. É o único sinal de corrupção que de outra forma
+     * seria silenciosa; o app deve mandar isso pra telemetria.
+     */
+    @Volatile
+    var pageWriteAnomalyListener: ((PageWriteAnomaly) -> Unit)? = null
+
+    /**
+     * Confirmação opcional de mudanças grandes em VE/Ignição/AFR (Speeduino). Quando definido, antes
+     * de gravar o client compara a tabela nova com a da ECU; se alguma célula mudar além do limite
+     * de [TableChangeAnalyzer], o callback decide (true = prosseguir). Falso lança
+     * [TableChangeRejectedException] sem enviar nada. Nulo (padrão) = sem checagem, nem leitura extra.
+     */
+    var tableChangeGuard: (suspend (TableChangeAssessment) -> Boolean)? = null
+
+    /**
+     * Autorização opcional antes de qualquer escrita/burn (ex.: aviso de uso, veículo em movimento).
+     * Recebe o nome da operação; false cancela com [WriteNotPermittedException] antes de enviar algo.
+     * Chamada depois do modo somente leitura. Nulo (padrão) = sem checagem.
+     */
+    var writeGuard: (suspend (operation: String) -> Boolean)? = null
+
+    private suspend fun confirmTableChange(
+        kind: TableChangeKind,
+        updated: List<List<Int>>,
+        readCurrent: suspend () -> List<List<Int>>,
+    ) {
+        val guard = tableChangeGuard ?: return
+        val current = try {
+            readCurrent()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "Tabela atual ilegível; checagem de mudança grande ignorada: ${e.message}")
+            return
+        }
+        val assessment = TableChangeAnalyzer.assess(kind, current, updated)
+        if (assessment.requiresConfirmation && !guard(assessment)) {
+            throw TableChangeRejectedException(assessment)
+        }
+    }
+    private var lastDisconnectWasRusefi: Boolean = false
+    private var lastDisconnectAtMs: Long = 0L
+    private var cachedEngineConstants: EngineConstants? = null
+    private var pinLayoutInfo: PinLayoutInfo? = null
+    private val connectMutex = Mutex()
+
+    // Serializa OPERAÇÕES LÓGICAS no canal (write+burn+releitura de uma página), não
+    // frames isolados. Sem isso o live stream ou a sincronização podiam intercalar um
+    // comando entre o write e o burn da mesma página.
+    private val ioMutex = Mutex()
+
+    // Modo exclusivo (reset de fábrica): o live stream não volta sozinho enquanto ativo.
+    @Volatile
+    private var exclusiveAccessReason: String? = null
+
+    /** Marca "esta coroutine já é dona do canal", tornando [withEcuIo] reentrante. */
+    private class EcuIoOwner : AbstractCoroutineContextElement(EcuIoOwner) {
+        companion object Key : CoroutineContext.Key<EcuIoOwner>
+    }
+
+    private suspend fun <T> withEcuIo(block: suspend () -> T): T {
+        if (currentCoroutineContext()[EcuIoOwner] != null) return block()
+        return ioMutex.withLock { withContext(EcuIoOwner()) { block() } }
+    }
+
+    /** Como [withEcuIo], mas desiste (null) se o canal está ocupado. Usado pelo live stream. */
+    private suspend fun <T> withEcuIoOrNull(block: suspend () -> T): T? {
+        if (currentCoroutineContext()[EcuIoOwner] != null) return block()
+        if (!ioMutex.tryLock()) return null
+        return try {
+            withContext(EcuIoOwner()) { block() }
+        } finally {
+            ioMutex.unlock()
+        }
+    }
+
+    override suspend fun <T> withEcuIoLock(block: suspend () -> T): T = withEcuIo(block)
+
+    override suspend fun drainStaleResponses() {
+        withEcuIo {
+            runCatching { connection.clearInputBuffer() }
+            delay(FIRMWARE_HANDSHAKE_DRAIN_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+        }
+    }
+
+    override fun beginExclusiveAccess(reason: String) {
+        exclusiveAccessReason = reason
+        Logger.w(TAG, "Acesso exclusivo à ECU adquirido por: $reason")
+        stopLiveDataStream()
+    }
+
+    override fun endExclusiveAccess() {
+        val reason = exclusiveAccessReason
+        exclusiveAccessReason = null
+        if (reason != null) Logger.w(TAG, "Acesso exclusivo à ECU liberado (era: $reason)")
+    }
+
+    override fun isExclusiveAccessActive(): Boolean = exclusiveAccessReason != null
+    private var liveDataSampleCounter = 0
+    private var consecutiveFaultyLiveDataSamples = 0
+    private var manualFirmwareProfile: String? = null
+    private var readOnlySafeModeEnabled = false
+    private var lastLiveDataStreamStartedAtMs = 0L
+    private var pendingLiveDataRecoveryReason: String? = null
+    private var lastFaultRecoveryAtMs = 0L
+    @Volatile
+    private var liveDataStreamStopRequested = false
+    @Volatile
+    private var forceLegacyFirmwareHandshakeAfterModernDisconnect = false
+
+    init {
+        connection.setOnConnectionStateChanged(onConnectionStateChanged)
+        connection.setOnError(onError)
+    }
+
+    /**
+     * Conecta ao Speeduino e valida firmware
+     *
+     * @throws UnsupportedFirmwareException se firmware não for suportado
+     */
+    override suspend fun connect() {
+        connectMutex.withLock {
+            if (connection.isConnected()) {
+                Logger.d(TAG, "Conexao ja estabelecida, ignorando novo connect")
+                return
+            }
+
+            // Uma stream de live data de uma conexão anterior pode ainda estar em uma
+            // leitura/escrita USB bloqueante (I/O síncrono nativo, ex: usb-serial-for-android)
+            // quando o usuário desconecta e reconecta rápido. streamJob?.cancel() sozinho
+            // (usado em stopLiveDataStream/disconnect) só marca a coroutine como cancelada -
+            // isso não interrompe a chamada bloqueante em andamento, que só "percebe" o
+            // cancelamento no próximo ponto de suspensão, e I/O bloqueante não tem um.
+            // Resultado observado em bench (2026-08-08): a escrita antiga completa (ou falha)
+            // bem no meio do handshake da conexão nova, ambas mexendo no mesmo objeto de
+            // conexão compartilhado - corrompendo a escrita nova e derrubando a conexão nova no
+            // meio do handshake. cancelAndJoin() aqui garante que essa I/O antiga realmente
+            // terminou (com sucesso ou erro) antes de abrirmos a porta de novo.
+            streamJob?.cancelAndJoin()
+            streamJob = null
+            _isStreaming = false
+
+            // 1. Estabelecer conexão física
+            connection.connect()
+            val shouldSettleAfterRusefiDisconnect = lastDisconnectWasRusefi || lastGlobalDisconnectWasActive
+            if (shouldSettleAfterRusefiDisconnect) {
+                val settleDelayMs = (MonotonicClock.nowMillis() - maxOf(lastDisconnectAtMs, lastGlobalDisconnectAtMs)).let { elapsed ->
+                    if (elapsed < RUSEFI_RECONNECT_SETTLE_DELAY_MS) {
+                        RUSEFI_RECONNECT_SETTLE_DELAY_MS - elapsed
+                    } else if (elapsed < GLOBAL_RECONNECT_SETTLE_DELAY_MS) {
+                        GLOBAL_RECONNECT_SETTLE_DELAY_MS - elapsed
+                    } else {
+                        0L
+                    }
+                }
+                if (settleDelayMs > 0L) {
+                    Logger.d(TAG, "Aguardando $settleDelayMs ms para assentamento rusEFI após disconnect")
+                    delay(settleDelayMs)
+                }
+                lastDisconnectWasRusefi = false
+                lastGlobalDisconnectWasActive = false
+            }
+
+            // 2. Obter informações do firmware
+            // Legacy serial (USB/BT/desktop serial) fica mais estável com handshake simples
+            // como no fluxo antigo (uma assinatura válida já é suficiente).
+            val forcedLegacyHandshake = forceLegacyFirmwareHandshakeAfterModernDisconnect
+            val useLegacyHandshakeCore = shouldUseLegacyHandshakeCore()
+            val firmwareSamples: List<String>
+            val firmwareConsensus: FirmwareConsensus?
+            val detectedFirmwareSignature = if (useLegacyHandshakeCore) {
+                firmwareSamples = try {
+                    readLegacyFirmwareSignatureSamples()
+                } catch (legacyError: CancellationException) {
+                    // Nunca tratar cancelamento como "handshake falhou, tenta modern fallback":
+                    // isso deixava a coroutine seguir mandando comandos USB (protocol.getFirmwareInfo())
+                    // depois que o chamador já tinha pedido pra parar (ex.: usuário tocou em
+                    // "Cancelar conexão"), correndo em paralelo com o disconnect() síncrono do
+                    // cancelamento na mesma porta - o resultado observado era "Connection closed"
+                    // (incidente relatado em 2026-08-18). CancellationException sempre propaga.
+                    throw legacyError
+                } catch (legacyError: Exception) {
+                    if (connection.supportsModernProtocolFallback()) {
+                        Logger.w(TAG, "Legacy handshake falhou, tentando modern fallback: ${legacyError.message}")
+                        listOf(protocol.getFirmwareInfo())
+                    } else {
+                        throw legacyError
+                    }
+                }
+                firmwareConsensus = resolveFirmwareConsensus(firmwareSamples)
+                firmwareConsensus.signature
+                    ?: firmwareSamples.lastOrNull()
+                    ?: "Unknown"
+            } else {
+                firmwareSamples = readFirmwareSignatureSamples()
+                firmwareConsensus = resolveFirmwareConsensus(firmwareSamples)
+                firmwareConsensus.signature
+                    ?: firmwareSamples.lastOrNull()
+                    ?: "Unknown"
+            }
+            val effectiveFirmwareSignature = manualFirmwareProfile ?: detectedFirmwareSignature
+
+            val productString = if (forcedLegacyHandshake) {
+                Logger.w(TAG, "Pulando product string modern após queda no handshake modern anterior")
+                "Unknown"
+            } else {
+                try {
+                    protocol.getProductString()
+                } catch (e: Exception) {
+                    Logger.w(TAG, "Não foi possível obter product string: ${e.message}")
+                    "Unknown"
+                }
+            }
+
+            Logger.d(TAG, "Firmware detectado: $detectedFirmwareSignature")
+            Logger.d(TAG, "Product string: $productString")
+            if (effectiveFirmwareSignature.startsWith("rusEFI", ignoreCase = true)) {
+                drainInputBufferQuietly()
+            }
+            if (useLegacyHandshakeCore) {
+                val reason = if (forcedLegacyHandshake) {
+                    "apos queda no handshake modern anterior"
+                } else {
+                    "para transporte sem modern protocol"
+                }
+                Logger.d(TAG, "Legacy handshake core ativo $reason")
+            }
+            if (!useLegacyHandshakeCore) {
+                forceLegacyFirmwareHandshakeAfterModernDisconnect = false
+            }
+            if (manualFirmwareProfile != null) {
+                Logger.w(
+                    TAG,
+                    "⚠️ Usando perfil manual de firmware: $manualFirmwareProfile (safe mode read-only)"
+                )
+            }
+
+            // 3. Validar compatibilidade e carregar definitions
+            try {
+                if (manualFirmwareProfile == null) {
+                    validateFirmwareConsensus(firmwareConsensus, firmwareSamples)
+                }
+                val resolvedDefinition = EcuDefinitionRegistry.resolve(
+                    signature = effectiveFirmwareSignature,
+                    productString = productString
+                )
+                val definitions = resolvedDefinition.tableDefinitions
+                val era = when (resolvedDefinition.family) {
+                    EcuFamily.SPEEDUINO -> EcuTableDefinitions.detectFirmwareEra(effectiveFirmwareSignature)
+                    EcuFamily.MS2 -> FirmwareEra.MS2
+                    EcuFamily.MEGASPEED -> FirmwareEra.MS2
+                    EcuFamily.MS3 -> FirmwareEra.MS3
+                    EcuFamily.RUSEFI -> FirmwareEra.RUSEFI
+                    else -> throw UnsupportedFirmwareException("Unsupported ECU family: ${resolvedDefinition.family}")
+                }
+
+                readOnlySafeModeEnabled = manualFirmwareProfile != null
+                protocol.setSessionLegacyPreferred(
+                    resolvedDefinition.runtime.configReadMode == EcuConfigReadMode.LEGACY_PAGE
+                )
+                // A partir daqui a era do firmware manda no enquadramento, não o transporte —
+                // mas só onde temos evidência. Afirmamos `true` apenas para Speeduino 202201+,
+                // onde o .ini declara `messageEnvelopeFormat = msEnvelope_1.0` e o campo foi
+                // validado em ECU real. Todo o resto fica `null` = decide pelos flags do
+                // transporte, exatamente como antes: nunca forçamos legacy num firmware que hoje
+                // funciona em modern, porque isso seria uma mudança sem cobertura nenhuma.
+                protocol.setSessionModernEnvelope(
+                    if (resolvedDefinition.family == EcuFamily.SPEEDUINO && era.usesModernEnvelope()) {
+                        true
+                    } else {
+                        null
+                    }
+                )
+                protocol.setSessionFirmwareEra(era)
+                protocol.setSessionEcuFamily(resolvedDefinition.family)
+                protocol.setSessionSchemaId(resolvedDefinition.runtime.schemaId)
+
+                // Armazenar informações
+                ecuDefinition = resolvedDefinition
+                firmwareInfo = FirmwareInfo(
+                    signature = effectiveFirmwareSignature,
+                    productString = productString,
+                    era = era,
+                    family = resolvedDefinition.family,
+                    capabilities = resolvedDefinition.capabilities
+                )
+                tableDefinitions = definitions
+
+                // 4. Detect output channels block size and load field definitions
+                outputChannelFields = definitions?.let { loadedDefinitions ->
+                    EcuOutputChannels.getDefinition(loadedDefinitions.ochBlockSize)
+                }
+                preloadPinLayoutInfoIfPossible()
+
+                Logger.i(TAG, "✅ Firmware compatível: $effectiveFirmwareSignature (era: $era)")
+                if (definitions != null) {
+                    Logger.i(TAG, "✅ Table definitions carregadas: VE=Page${definitions.veTable.page}, Ignition=Page${definitions.ignitionTable.page}")
+                    Logger.i(TAG, "✅ Output channels: ${definitions.ochBlockSize} bytes, ${outputChannelFields?.size} fields")
+                } else {
+                    Logger.i(TAG, "ℹ️ ECU ${resolvedDefinition.family} conectada sem definitions de tuning nesta PR")
+                }
+                if (readOnlySafeModeEnabled) {
+                    Logger.w(TAG, "⚠️ Safe mode read-only habilitado (perfil manual)")
+                }
+
+                // Limpa qualquer byte tardio de consultas de firmware antes de iniciar downloads/stream.
+                // Um único clear() aqui pode rodar antes que a última resposta do handshake (ex.: a
+                // 2ª amostra de consenso da assinatura legacy) termine de chegar pela rede — os bytes
+                // dela pousam no buffer LOGO DEPOIS do clear e se misturam com a 1ª leitura de página
+                // (MS1 'V' não tem framing/length, então não há como distinguir depois). drainInputBufferQuietly
+                // dá um respiro de 50ms entre dois clears para cobrir essa janela.
+                drainInputBufferQuietly()
+
+                connection.markHandshakeSuccess()
+
+            } catch (e: UnsupportedFirmwareException) {
+                // Desconectar se firmware incompatível
+                connection.disconnect()
+                readOnlySafeModeEnabled = false
+
+                val originalMessage = e.message.orEmpty()
+                val normalizedMessage = originalMessage.lowercase()
+                val isChannelQualityError =
+                    "assinatura de firmware" in normalizedMessage ||
+                    "no readable legacy candidates" in normalizedMessage ||
+                    "invalid legacy candidates" in normalizedMessage ||
+                    "firmware signature" in normalizedMessage
+                if (isChannelQualityError) {
+                    Logger.e(TAG, originalMessage)
+                    throw e
+                }
+
+                val supportedVersions = EcuDefinitionRegistry.getSupportedFamilies()
+                val errorMessage = """
+                ❌ Firmware não suportado: $effectiveFirmwareSignature
+
+                Versões suportadas:
+                ${supportedVersions.joinToString("\n") { "  • $it" }}
+
+                Por favor, atualize o firmware da ECU ou entre em contato.
+            """.trimIndent()
+
+                Logger.e(TAG, errorMessage)
+                throw UnsupportedFirmwareException(errorMessage)
+            }
+        }
+    }
+
+    private fun shouldUseLegacyHandshakeCore(): Boolean {
+        return forceLegacyFirmwareHandshakeAfterModernDisconnect ||
+            FirmwareHandshakeDomain.shouldUseLegacyHandshakeCore(connection.supportsModernProtocol())
+    }
+
+    private suspend fun drainInputBufferQuietly() {
+        runCatching { connection.clearInputBuffer() }
+        delay(50)
+        runCatching { connection.clearInputBuffer() }
+    }
+
+    private suspend fun readFirmwareSignatureSamples(maxAttempts: Int = 4): List<String> {
+        val samples = mutableListOf<String>()
+        var lastError: Exception? = null
+
+        repeat(maxAttempts) { attempt ->
+            try {
+                drainInputBeforeFirmwareHandshake()
+                val raw = protocol.getFirmwareInfo()
+                val sanitized = FirmwareHandshakeDomain.sanitizeSignature(raw)
+                if (sanitized.equals("Unknown", ignoreCase = true) && !connection.isConnected()) {
+                    throw UnsupportedFirmwareException("Modern firmware handshake disconnected")
+                }
+                if (sanitized.isNotBlank()) {
+                    samples.add(sanitized)
+                }
+                val consensus = resolveFirmwareConsensus(samples)
+                if (consensus.signature != null && consensus.consensusHits >= 2) {
+                    return samples
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                Logger.w(TAG, "Falha ao ler assinatura de firmware (tentativa ${attempt + 1}/$maxAttempts): ${e.message}")
+                if (!connection.isConnected()) {
+                    forceLegacyFirmwareHandshakeAfterModernDisconnect = true
+                    Logger.w(TAG, "Handshake modern desconectou; próxima tentativa usará legacy-first")
+                    throw e
+                }
+            }
+
+            if (attempt < maxAttempts - 1) {
+                delay(FIRMWARE_HANDSHAKE_RETRY_DELAY_MS)
+            }
+        }
+
+        if (samples.isEmpty()) {
+            throw (lastError ?: UnsupportedFirmwareException("Unable to read firmware signature"))
+        }
+
+        return samples
+    }
+
+    private fun resolveFirmwareConsensus(samples: List<String>): FirmwareConsensus {
+        return FirmwareHandshakeDomain.resolveConsensus(samples)
+    }
+
+    private suspend fun drainInputBeforeFirmwareHandshake() {
+        runCatching { connection.clearInputBuffer() }
+        delay(FIRMWARE_HANDSHAKE_DRAIN_DELAY_MS)
+        runCatching { connection.clearInputBuffer() }
+    }
+
+    private suspend fun readLegacyFirmwareSignatureSamples(): List<String> {
+        val maxAttempts = connection.legacyFirmwareHandshakeAttempts().coerceAtLeast(3)
+        val retryDelayMs = connection.legacyFirmwareHandshakeRetryDelayMs()
+            .coerceAtLeast(FIRMWARE_HANDSHAKE_RETRY_DELAY_MS)
+        val samples = mutableListOf<String>()
+        var lastError: Exception? = null
+
+        repeat(maxAttempts) { attempt ->
+            try {
+                if (attempt > 0) {
+                    connection.prepareHandshakeRetry(attempt)
+                    Logger.w(TAG, "Retry legacy firmware handshake (${attempt + 1}/$maxAttempts)")
+                    if (retryDelayMs > 0L) {
+                        delay(retryDelayMs)
+                    }
+                }
+
+                drainInputBeforeFirmwareHandshake()
+
+                val candidates = protocol.getFirmwareInfoLegacyCandidates()
+                val selectedSample = FirmwareHandshakeDomain.selectBestCandidate(candidates)
+                ConnectionTrace.info(
+                    inferHandshakeTraceTransport(),
+                    "firmware_handshake attempt=${attempt + 1}/$maxAttempts candidates=${formatHandshakeCandidates(candidates)} selected=${selectedSample ?: "<none>"}"
+                )
+                if (!selectedSample.isNullOrBlank()) {
+                    samples += selectedSample
+                    val consensus = resolveFirmwareConsensus(samples)
+                    ConnectionTrace.info(
+                        inferHandshakeTraceTransport(),
+                        "firmware_handshake_consensus attempt=${attempt + 1}/$maxAttempts samples=${formatHandshakeCandidates(samples)} signature=${consensus.signature ?: "<none>"} hits=${consensus.consensusHits}"
+                    )
+                    if (consensus.signature != null && consensus.consensusHits >= 2) {
+                        return samples
+                    }
+                } else {
+                    val cleanedCandidates = candidates
+                        .map(FirmwareHandshakeDomain::sanitizeSignature)
+                        .filter(String::isNotBlank)
+                    val detail = if (cleanedCandidates.isEmpty()) {
+                        "no readable legacy candidates"
+                    } else {
+                        "invalid legacy candidates: ${cleanedCandidates.joinToString(" | ")}"
+                    }
+                    lastError = UnsupportedFirmwareException(detail)
+                    Logger.w(TAG, "Discarding legacy firmware sample (${attempt + 1}/$maxAttempts): $detail")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+
+        if (samples.isNotEmpty()) {
+            return samples
+        }
+
+        throw (lastError ?: UnsupportedFirmwareException("Unable to read legacy firmware signature"))
+    }
+
+    private fun inferHandshakeTraceTransport(): String {
+        val info = connection.getConnectionInfo().lowercase()
+        return when {
+            info.startsWith("bluetooth:") -> "bluetooth"
+            info.startsWith("tcp:") -> "tcp"
+            info.startsWith("usb") -> "usb"
+            else -> "handshake"
+        }
+    }
+
+    private fun formatHandshakeCandidates(values: List<String>): String {
+        return values.joinToString(" | ") { value ->
+            FirmwareHandshakeDomain.sanitizeSignature(value).take(120).ifBlank { "<blank>" }
+        }.ifBlank { "<none>" }
+    }
+    private fun validateFirmwareConsensus(
+        consensus: FirmwareConsensus,
+        samples: List<String>
+    ) {
+        try {
+            FirmwareHandshakeDomain.validateConsensus(consensus, samples)
+        } catch (error: UnsupportedFirmwareException) {
+            connection.disconnect()
+            Logger.e(TAG, error.message.orEmpty())
+            throw error
+        }
+    }
+
+    private suspend fun preloadPinLayoutInfoIfPossible() {
+        if ((firmwareInfo?.family ?: EcuFamily.UNKNOWN) != EcuFamily.SPEEDUINO) {
+            return
+        }
+        if (pinLayoutInfo != null) {
+            return
+        }
+
+        try {
+            val pageData = readPage(pageNum = 1, offset = 0, length = 16)
+            if (pageData.size >= 16) {
+                pinLayoutInfo = PinLayoutDetector.fromPage1(pageData)
+                Logger.d(
+                    TAG,
+                    "Pin layout detectado no connect: idx=${pinLayoutInfo?.index}, name=${pinLayoutInfo?.name}, mcu=${pinLayoutInfo?.mcuFamily}"
+                )
+            } else {
+                Logger.w(TAG, "Nao foi possivel detectar pin layout no connect: resposta curta (${pageData.size} bytes)")
+            }
+        } catch (e: Exception) {
+            Logger.w(TAG, "Falha ao detectar pin layout no connect: ${e.message}")
+        }
+    }
+
+    /**
+     * Obtém informações do firmware conectado
+     * @return FirmwareInfo ou null se não conectado
+     */
+    override fun getFirmwareInfoCached(): FirmwareInfo? = firmwareInfo
+
+    /**
+     * Obtém definição genérica da ECU conectada.
+     */
+    fun getEcuDefinition(): EcuDefinition? = ecuDefinition
+
+    /**
+     * Obtém a família da ECU conectada.
+     */
+    override fun getEcuFamily(): EcuFamily = firmwareInfo?.family ?: EcuFamily.UNKNOWN
+
+    /**
+     * Obtém capacidades declaradas da ECU conectada.
+     */
+    override fun getEcuCapabilities(): EcuCapabilities? = firmwareInfo?.capabilities
+
+    /**
+     * Obtém informações do pin layout detectado (Page 1).
+     */
+    override fun getPinLayoutInfoCached(): PinLayoutInfo? = pinLayoutInfo
+
+    /**
+     * Permite cachear pin layout detectado fora do fluxo padrão.
+     */
+    override fun cachePinLayoutInfo(info: PinLayoutInfo?) {
+        pinLayoutInfo = info
+    }
+
+    /**
+     * Descarta o cache persistente de páginas desta identidade de ECU. Usado antes de um
+     * download completo pedido explicitamente pelo usuário ("Sincronizar"), para garantir que
+     * ele sempre reflita o estado atual da ECU em vez de bytes em cache de até [pageCacheTtlMs].
+     */
+    override fun invalidateConfigPageCache() {
+        cacheIdentity()?.let { pageCache.invalidateIdentity(it) }
+    }
+
+    /**
+     * Obtém table definitions carregadas
+     * @return TableDefinitions ou null se não conectado
+     */
+    override fun getTableDefinitions(): TableDefinitions? = tableDefinitions
+
+    override suspend fun sendLegacyPassthrough(
+        command: ByteArray,
+        expectResponse: Boolean,
+        responseSize: Int?,
+    ): ByteArray = withContext(Dispatchers.IO) {
+        protocol.sendLegacyPassthrough(
+            command = command,
+            expectResponse = expectResponse,
+            responseSize = responseSize,
+        )
+    }
+
+    /**
+     * Obtém output channel fields carregados
+     * @return List<OutputField> ou null se não conectado
+     */
+    fun getOutputChannelFields(): List<OutputField>? = outputChannelFields
+
+    override fun applyIniDefinition(definition: IniDefinition): Boolean {
+        activeIniDefinition = definition
+
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) {
+            val catalog = EcuIniDefinitions.fromIni(definition) ?: return false
+            speeduinoIniCatalog = catalog
+            tableDefinitions = catalog.tableDefinitions
+            ecuDefinition = ecuDefinition?.copy(
+                runtime = ecuDefinition?.runtime?.copy(
+                    blockSize = definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize
+                ) ?: return false,
+                tableDefinitions = catalog.tableDefinitions,
+                pageCatalog = catalog.pageCatalog.ifEmpty { ecuDefinition?.pageCatalog ?: emptyList() },
+            )
+            outputChannelFields = catalog.outputFields.ifEmpty {
+                EcuOutputChannels.getDefinition(
+                    definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize
+                )
+            }
+            EcuOutputChannels.registerRuntimeDefinition(
+                definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize,
+                outputChannelFields ?: emptyList(),
+            )
+            Logger.i(
+                TAG,
+                "✅ Layout Speeduino aplicado via .ini: VE=${catalog.tableDefinitions.veTable.page}, " +
+                    "IGN=${catalog.tableDefinitions.ignitionTable.page}, AFR=${catalog.tableDefinitions.afrTable.page}"
+            )
+            return true
+        }
+
+        if (firmwareInfo?.family == EcuFamily.MS2 && ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            val catalog = MsExtraIniTableDefinitions.fromIni(definition) ?: return false
+            msExtraIniCatalog = catalog
+            Logger.i(
+                TAG,
+                "✅ Layout MS1/Extra aplicado via .ini: VE=${formatPageId(catalog.veTable.page)}, " +
+                    "IGN=${formatPageId(catalog.ignitionTable.page)}"
+            )
+            return true
+        }
+
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            val catalog = MegaSpeedIniTableDefinitions.fromIni(definition) ?: return false
+            megaSpeedIniCatalog = catalog
+            tableDefinitions = catalog.tableDefinitions
+            ecuDefinition = ecuDefinition?.copy(
+                runtime = ecuDefinition?.runtime?.copy(
+                    blockSize = definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize
+                ) ?: return false,
+                tableDefinitions = catalog.tableDefinitions,
+                pageCatalog = catalog.pageCatalog.ifEmpty { ecuDefinition?.pageCatalog ?: emptyList() },
+            )
+            outputChannelFields = EcuOutputChannels.getDefinition(
+                definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize
+            )
+            Logger.i(
+                TAG,
+                "✅ Layout MegaSpeed aplicado via .ini: VE=${catalog.veTable.metadata.page}, " +
+                    "IGN=${catalog.ignitionTable.metadata.page}, AFR=${catalog.afrTable.metadata.page}"
+            )
+            return true
+        }
+
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            val catalog = RusefiIniTableDefinitions.fromIni(definition) ?: return false
+            rusefiIniCatalog = catalog
+            tableDefinitions = catalog.tableDefinitions
+            ecuDefinition = ecuDefinition?.copy(
+                runtime = ecuDefinition?.runtime?.copy(
+                    blockSize = definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize
+                ) ?: return false,
+                tableDefinitions = catalog.tableDefinitions,
+                pageCatalog = catalog.pageCatalog.ifEmpty { ecuDefinition?.pageCatalog ?: emptyList() },
+            )
+            outputChannelFields = catalog.outputFields.ifEmpty {
+                EcuOutputChannels.getDefinition(
+                    definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize
+                )
+            }
+            EcuOutputChannels.registerRuntimeDefinition(
+                definition.ochBlockSize ?: catalog.tableDefinitions.ochBlockSize,
+                outputChannelFields ?: emptyList(),
+            )
+            Logger.i(
+                TAG,
+                "✅ Layout rusEFI aplicado via .ini: VE=${formatPageId(catalog.veTable.metadata.page)}, " +
+                    "IGN=${formatPageId(catalog.ignitionTable.metadata.page)}, AFR=${formatPageId(catalog.afrTable.metadata.page)}"
+            )
+            return true
+        }
+
+        return false
+    }
+
+    override fun setManualFirmwareProfile(signature: String, readOnly: Boolean) {
+        val normalized = FirmwareHandshakeDomain.normalizeManualProfile(signature)
+        manualFirmwareProfile = normalized
+        readOnlySafeModeEnabled = readOnly
+        Logger.w(TAG, "Perfil manual configurado: $normalized (readOnly=$readOnly)")
+    }
+
+    override fun clearManualFirmwareProfile() {
+        manualFirmwareProfile = null
+        readOnlySafeModeEnabled = false
+    }
+
+    fun getManualFirmwareProfile(): String? = manualFirmwareProfile
+
+    override fun isReadOnlySafeMode(): Boolean = readOnlySafeModeEnabled
+
+    /**
+     * Desconecta do Speeduino
+     */
+    override fun disconnect() {
+        lastDisconnectWasRusefi = firmwareInfo?.family == EcuFamily.RUSEFI
+        lastDisconnectAtMs = MonotonicClock.nowMillis()
+        lastGlobalDisconnectWasActive = true
+        lastGlobalDisconnectAtMs = lastDisconnectAtMs
+        stopLiveDataStream()
+        connection.disconnect()
+        protocol.setSessionLegacyPreferred(false)
+        protocol.setSessionModernEnvelope(null)
+        protocol.resetLegacyCommsLockout()
+        protocol.setSessionFirmwareEra(null)
+        protocol.setSessionEcuFamily(null)
+        protocol.setSessionSchemaId(null)
+        forceLegacyFirmwareHandshakeAfterModernDisconnect = false
+        // NÃO cancelar o scope - apenas o job do stream
+        // Isso permite reconectar e reiniciar o stream
+        firmwareInfo = null
+        ecuDefinition = null
+        tableDefinitions = null
+        outputChannelFields = null
+        activeIniDefinition = null
+        speeduinoIniCatalog = null
+        megaSpeedIniCatalog = null
+        msExtraIniCatalog = null
+        rusefiIniCatalog = null
+        pendingRusefiVeTableReadback = null
+        pendingRusefiIgnitionTableReadback = null
+        pendingSpeeduinoPageReadbacks.clear()
+        cachedEngineConstants = null
+        pinLayoutInfo = null
+        EcuOutputChannels.clearAllRuntimeDefinitions()
+    }
+
+    /**
+     * Verifica se está conectado
+     */
+    override fun isConnected(): Boolean = connection.isConnected()
+
+    /**
+     * Verifica se o stream de dados está ativo
+     */
+    override fun isStreaming(): Boolean = _isStreaming
+
+    /**
+     * Obtém informações da conexão
+     */
+    override fun getConnectionInfo(): String = connection.getConnectionInfo()
+
+    override fun getConnectionProfileTag(): String? = connection.getConnectionProfileTag()
+
+    override fun getLegacyConfigBlockSizeOverride(): Int? = connection.legacyConfigBlockSizeOverride()
+
+    // ==================== Protocol Commands ====================
+
+    /**
+     * Obtém informações do firmware (comando 'Q')
+     */
+    override suspend fun getFirmwareInfo(): String {
+        return protocol.getFirmwareInfo()
+    }
+
+    /**
+     * Obtém string do produto (comando 'S')
+     */
+    override suspend fun getProductString(): String {
+        return protocol.getProductString()
+    }
+
+    /**
+     * Obtém capacidades seriais (comando 'f')
+     */
+    override suspend fun getSerialCapability(): SerialCapability {
+        return when (getEcuFamily()) {
+            EcuFamily.SPEEDUINO -> {
+                protocol.getSerialCapability()
+            }
+            EcuFamily.RUSEFI -> {
+                // rusEFI simulator/firmware compatibility profile used by this app.
+                SerialCapability(protocolVersion = 1, blockingFactor = 1024, tableBlockingFactor = 1024)
+            }
+            EcuFamily.MS2,
+            EcuFamily.MEGASPEED,
+            EcuFamily.MS3 -> {
+                // These families may close socket on unsupported 'f' capability command.
+                // Use conservative defaults and avoid probing.
+                SerialCapability(protocolVersion = 1, blockingFactor = 256, tableBlockingFactor = 256)
+            }
+            else -> {
+                SerialCapability(protocolVersion = 1, blockingFactor = 256, tableBlockingFactor = 256)
+            }
+        }
+    }
+
+    /**
+     * Lê CRC32 de uma página (comando 'd')
+     */
+    suspend fun getPageCRC(pageNum: Int): Long {
+        require(pageNum in 0..0xFF) { "CRC page id fora do range legacy: ${formatPageId(pageNum)}" }
+        return protocol.getPageCRC(pageNum.toByte())
+    }
+
+    suspend fun getPageCRC(pageNum: Byte): Long {
+        return protocol.getPageCRC(pageNum)
+    }
+
+    /**
+     * Lê uma página completa (comando 'p')
+     * @param pageNum Número da página (0-15)
+     * @param offset Offset inicial
+     * @param length Tamanho a ler
+     */
+    suspend fun readPage(pageNum: Int, offset: Int, length: Int): ByteArray {
+        require(pageNum in 0..0xFF) { "Page read legacy requer id de 8 bits: ${formatPageId(pageNum)}" }
+        pendingSpeeduinoPageReadbacks.remove(pageNum)?.let { cached ->
+            if (firmwareInfo?.family == EcuFamily.SPEEDUINO && offset == 0 && length == cached.size) {
+                Logger.d(TAG, "Usando readback em cache para página ${formatPageId(pageNum)}")
+                return cached.copyOf()
+            } else {
+                pendingSpeeduinoPageReadbacks[pageNum] = cached
+            }
+        }
+        resolveMs2Alias(pageNum, offset, length)?.let { alias ->
+            return protocol.readTable(alias.pageId, alias.offset, length, getEcuFamily())
+        }
+        val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
+
+        // Cache-through persistente: serve páginas frescas do disco sem tocar na ECU.
+        val cacheIdentity = cacheIdentity()
+        if (cacheIdentity != null) {
+            pageCache.read(cacheIdentity, pageNum, offset, length, WallClock.nowEpochMillis(), pageCacheTtlMs)
+                ?.let { cached ->
+                    Logger.d(TAG, "Cache hit página ${formatPageId(pageNum)} offset=$offset length=$length")
+                    return cached
+                }
+        }
+
+        val readMode = resolveConfigReadMode(family)
+        val result = if (family == EcuFamily.SPEEDUINO && readMode == EcuConfigReadMode.MODERN_TABLE) {
+            protocol.readPage(
+                pageNum = pageNum.toByte(),
+                offset = offset,
+                length = length,
+                allowModernTransportFallback = shouldUseModernConfigReadTransport(family, readMode),
+            )
+        } else {
+            protocol.readPage(pageNum.toByte(), offset, length)
+        }
+
+        if (cacheIdentity != null && result.size == length) {
+            pageCache.store(cacheIdentity, pageNum, offset, length, result, WallClock.nowEpochMillis())
+        }
+        return result
+    }
+
+    /**
+     * Identidade do cache de páginas: assinatura de firmware + endereço de conexão.
+     * Retorna `null` (cache desabilitado) para famílias diferentes de Speeduino ou quando o firmware
+     * ainda não foi identificado.
+     */
+    private fun cacheIdentity(): String? {
+        val info = firmwareInfo ?: return null
+        if (info.family != EcuFamily.SPEEDUINO) return null
+        val signature = info.signature.takeIf { it.isNotBlank() && !it.equals("Unknown", ignoreCase = true) }
+            ?: return null
+        val address = connection.getConnectionInfo().ifBlank { "unknown" }
+        return "${info.family.name}|$signature|$address"
+    }
+
+    private fun invalidateCachedPage(pageNum: Int) {
+        cacheIdentity()?.let { pageCache.invalidatePage(it, pageNum) }
+    }
+
+    /**
+     * Grava uma página na ECU e invalida a entrada correspondente no cache persistente,
+     * garantindo que a próxima leitura reflita o novo conteúdo.
+     */
+    private suspend fun writeConfigPage(pageNum: Byte, offset: Int, data: ByteArray) {
+        protocol.writePage(pageNum = pageNum, offset = offset, data = data)
+        invalidateCachedPage(pageNum.toInt() and 0xFF)
+    }
+
+    /**
+     * Grava uma página de configuração e, em Speeduino, confere por read-back antes de o chamador
+     * fazer burn (mesma garantia das tabelas VE/Ign/AFR). Divergência persistente lança
+     * [PageWriteVerificationException]. Outras famílias mantêm a gravação simples.
+     */
+    private suspend fun writeConfigPageVerified(pageNum: Byte, offset: Int, data: ByteArray, label: String) {
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) {
+            writeSpeeduinoTableVerified(pageNum.toInt() and 0xFF, offset, data, label)
+        } else {
+            writeConfigPage(pageNum, offset, data)
+        }
+    }
+
+    suspend fun readPage(pageNum: Byte, offset: Int, length: Int): ByteArray {
+        return readPage(pageNum.toInt() and 0xFF, offset, length)
+    }
+
+    suspend fun readConfigChunk(pageId: Int, offset: Int, length: Int): ByteArray = withEcuIo { readConfigChunkUnlocked(pageId, offset, length) }
+
+    private suspend fun readConfigChunkUnlocked(pageId: Int, offset: Int, length: Int): ByteArray {
+        val pageLabel = formatPageId(pageId)
+        val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
+        val readMode = resolveConfigReadMode(family)
+        var lastError: Exception? = null
+        val shouldResyncRusEfi = family == EcuFamily.RUSEFI
+        val configReadDelayMs = maxOf(CONFIG_CHUNK_READ_RETRY_DELAY_MS, connection.legacyConfigReadDelayMs())
+        val preferModernConfigRead = shouldUseModernConfigReadTransport(family, readMode)
+
+        if (shouldResyncRusEfi) {
+            drainInputBufferQuietly()
+        }
+
+        // MS1/Extra's legacy 'V' page response has no framing/length header — it's just raw bytes
+        // read until an idle gap. On this family the retry attempt always succeeds where the first
+        // attempt fails, which points at a stray leftover byte from the (multi-round) firmware
+        // handshake still landing in the socket buffer right as the first page request goes out.
+        // Force the same pre-attempt drain used for noisy BLE links here too, on every attempt —
+        // not just connection.shouldDrainBeforeLegacyConfigRead()'s default (false for TCP).
+        val shouldDrainBeforeAttempt = readMode == EcuConfigReadMode.LEGACY_PAGE &&
+            (connection.shouldDrainBeforeLegacyConfigRead() || ecuDefinition?.runtime?.schemaId == "msextra-hr10")
+
+        repeat(CONFIG_CHUNK_READ_MAX_ATTEMPTS) { attempt ->
+            try {
+                if (shouldDrainBeforeAttempt) {
+                    runCatching { connection.clearInputBuffer() }
+                    delay(20)
+                    runCatching { connection.clearInputBuffer() }
+                }
+                if (family == EcuFamily.RUSEFI && length > RUSEFI_CONFIG_READ_CHUNK_SIZE) {
+                    return readConfigChunkChunked(pageId, offset, length, RUSEFI_CONFIG_READ_CHUNK_SIZE)
+                }
+                return if (readMode == EcuConfigReadMode.LEGACY_PAGE) {
+                    protocol.readPage(
+                        pageNum = (pageId and 0xFF).toByte(),
+                        offset = offset,
+                        length = length,
+                        allowModernTransportFallback = preferModernConfigRead,
+                    )
+                } else {
+                    when (family) {
+                        EcuFamily.MS2, EcuFamily.MEGASPEED -> protocol.readTable(pageId, offset, length, EcuFamily.MS2)
+                        EcuFamily.MS3 -> protocol.readTable(pageId, offset, length, EcuFamily.MS3)
+                        EcuFamily.RUSEFI -> protocol.readTable(pageId, offset, length, EcuFamily.RUSEFI)
+                        else -> protocol.readPage(
+                            pageNum = (pageId and 0xFF).toByte(),
+                            offset = offset,
+                            length = length,
+                            allowModernTransportFallback = preferModernConfigRead,
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                lastError = e
+                val canRetry = attempt < CONFIG_CHUNK_READ_MAX_ATTEMPTS - 1 &&
+                    (isRecoverableConfigChunkReadFailure(e) || family == EcuFamily.RUSEFI)
+                if (!canRetry) {
+                    throw Exception(
+                        "Config chunk read failed page=$pageLabel family=${family.name} offset=$offset length=$length detail=${e.message ?: "unknown"}",
+                        e
+                    )
+                }
+
+                Logger.w(
+                    TAG,
+                    "Leitura parcial/timeout recuperável em config chunk page=$pageLabel offset=$offset length=$length; " +
+                        "retry ${attempt + 2}/$CONFIG_CHUNK_READ_MAX_ATTEMPTS: ${e.message}"
+                )
+                runCatching { connection.clearInputBuffer() }
+                delay(configReadDelayMs)
+            }
+        }
+
+        val error = lastError ?: Exception("unknown")
+        throw Exception(
+            "Config chunk read failed page=$pageLabel family=${family.name} offset=$offset length=$length detail=${error.message ?: "unknown"}",
+            error
+        )
+    }
+
+    suspend fun readConfigChunk(pageId: Byte, offset: Int, length: Int): ByteArray {
+        return readConfigChunk(pageId.toInt() and 0xFF, offset, length)
+    }
+
+    private suspend fun readConfigChunkChunked(
+        pageId: Int,
+        offset: Int,
+        length: Int,
+        chunkSize: Int,
+    ): ByteArray {
+        val data = ByteArray(length)
+        var copied = 0
+        while (copied < length) {
+            val chunkOffset = offset + copied
+            val currentSize = minOf(chunkSize, length - copied)
+            val chunk = protocol.readTable(pageId, chunkOffset, currentSize, EcuFamily.RUSEFI)
+            chunk.copyInto(data, copied)
+            copied += currentSize
+            if (copied < length) {
+                delay(10)
+            }
+        }
+        return data
+    }
+
+    private fun resolveConfigReadMode(family: EcuFamily): EcuConfigReadMode {
+        val baseMode = ecuDefinition?.runtime?.configReadMode ?: EcuConfigReadMode.MODERN_TABLE
+        // Só Speeduino: o LEGACY_PAGE manda o 'p' cru, que é comando exclusivo do firmware
+        // Speeduino. MS2/Extra, MegaSpeed e MS3 não têm 'p' - a leitura delas é 'r' (table read),
+        // e em firmware newserial (ex.: "MS2Extra comms342h2") um 'p' cru é lido como o 1º byte
+        // do tamanho de um envelope: 0x7000 bytes -> a ECU responde envelope com 0x84 (out of
+        // range) e a página nunca baixa. Achado de campo 2026-09-21 via Bluetooth (MS2/Extra
+        // 3.4.3): tx `70 00 04 00 00 00 01`, rx `00 01 84 <CRC32>`, download travado e watchdog
+        // live_data_never_started. Essas famílias ficam no MODERN_TABLE -> protocol.readTable()
+        // mesmo em USB/BT (ver comentário lá sobre o gate de transporte).
+        if (
+            family == EcuFamily.SPEEDUINO &&
+            baseMode == EcuConfigReadMode.MODERN_TABLE &&
+            !connection.supportsModernConfigReads() &&
+            // Rebaixar para legacy por causa do transporte quebra firmware 202201+: a ECU lê os
+            // dois primeiros bytes como comprimento, então um 'p' cru vira "esperando 28672
+            // bytes" e ela trava. Se o firmware usa envelope, o transporte não tem voto.
+            firmwareInfo?.era?.usesModernEnvelope() != true
+        ) {
+            return EcuConfigReadMode.LEGACY_PAGE
+        }
+        return baseMode
+    }
+
+    private fun shouldUseModernConfigReadTransport(
+        family: EcuFamily,
+        readMode: EcuConfigReadMode,
+    ): Boolean {
+        return family == EcuFamily.SPEEDUINO &&
+            readMode == EcuConfigReadMode.MODERN_TABLE &&
+            firmwareInfo?.era?.isModern() == true &&
+            connection.supportsModernConfigReads()
+    }
+
+    private fun isRecoverableConfigChunkReadFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            val message = current.message.orEmpty()
+            if (message.startsWith("Timeout: no data received")) {
+                return true
+            }
+            if (message.startsWith("Timeout:", ignoreCase = true)) {
+                return true
+            }
+            val partialTimeout = PARTIAL_TIMEOUT_REGEX.find(message)
+            if (partialTimeout != null) {
+                val expectedBytes = partialTimeout.groupValues.getOrNull(1)?.toIntOrNull() ?: return true
+                val receivedBytes = partialTimeout.groupValues.getOrNull(2)?.toIntOrNull() ?: return true
+                return receivedBytes in 0 until expectedBytes
+            }
+            if (
+                message.contains("short legacy page response", ignoreCase = true) ||
+                message.contains("short modern page response", ignoreCase = true) ||
+                message.contains("short table response", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    /**
+     * Lê página completa em blocos (para páginas grandes)
+     */
+    override suspend fun readFullPage(pageNum: Int, pageSize: Int, blockSize: Int): ByteArray = withEcuIo { readFullPageUnlocked(pageNum, pageSize, blockSize) }
+
+    private suspend fun readFullPageUnlocked(pageNum: Int, pageSize: Int, blockSize: Int): ByteArray = withContext(Dispatchers.IO) {
+        val pageLabel = formatPageId(pageNum)
+        val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
+        val readMode = resolveConfigReadMode(family)
+        if (readMode == EcuConfigReadMode.LEGACY_PAGE && connection.useWholePageLegacyConfigReads()) {
+            return@withContext try {
+                readConfigChunk(pageNum, 0, pageSize)
+            } catch (e: Exception) {
+                throw Exception(
+                    "Full page read failed page=$pageLabel pageSize=$pageSize blockSize=$blockSize chunk=1/1 offset=0 length=$pageSize detail=${e.message ?: "unknown"}",
+                    e
+                )
+            }
+        }
+
+        val pageData = ByteArray(pageSize)
+        var offset = 0
+        val interChunkDelayMs = maxOf(10L, connection.legacyConfigReadDelayMs())
+
+        while (offset < pageSize) {
+            val chunkSize = minOf(blockSize, pageSize - offset)
+            val chunkStart = offset
+            val chunkIndex = (chunkStart / blockSize) + 1
+            val totalChunks = (pageSize + blockSize - 1) / blockSize
+            val chunk = try {
+                readConfigChunk(pageNum, chunkStart, chunkSize)
+            } catch (e: Exception) {
+                throw Exception(
+                    "Full page read failed page=$pageLabel pageSize=$pageSize blockSize=$blockSize chunk=$chunkIndex/$totalChunks offset=$chunkStart length=$chunkSize detail=${e.message ?: "unknown"}",
+                    e
+                )
+            }
+            if (chunk.isEmpty()) {
+                throw IllegalStateException(
+                    "Full page read returned empty chunk page=$pageLabel chunk=$chunkIndex/$totalChunks offset=$chunkStart length=$chunkSize"
+                )
+            }
+
+            if (chunk.size < chunkSize) {
+                throw IllegalStateException(
+                    "Short page chunk page=$pageLabel chunk=$chunkIndex/$totalChunks offset=$chunkStart expected=$chunkSize received=${chunk.size}"
+                )
+            }
+
+            chunk.copyInto(pageData, offset, endIndex = chunkSize)
+            offset += chunkSize
+
+            // Small delay to avoid overwhelming the ECU
+            if (offset < pageSize) {
+                delay(interChunkDelayMs)
+            }
+        }
+
+        pageData
+    }
+
+    suspend fun readFullPage(pageNum: Byte, pageSize: Int, blockSize: Int): ByteArray {
+        return readFullPage(pageNum.toInt() and 0xFF, pageSize, blockSize)
+    }
+
+    override fun getEcuPageCatalog() = ecuDefinition?.pageCatalog ?: emptyList()
+
+    /**
+     * Lê Engine Constants (Page 1 - 128 bytes)
+     */
+    override suspend fun readEngineConstants(): EngineConstants {
+        val rusefiSchemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val constants = when {
+            // MS1/Extra is classified as EcuFamily.MS2 (era MS2) but its legacy page 4 is a small,
+            // whole-page-only read (~189 bytes on real hardware/the fake ECU) — not the 1024-byte,
+            // 4x256-chunk page real MS2/MS3 expose. Requesting the MS2 chunk size against it throws
+            // ("MS1 page response too short") on the very first chunk and kills the connection.
+            // MS1 engine-constants parsing isn't implemented yet, so bail out cleanly instead.
+            ecuDefinition?.runtime?.schemaId == "msextra-hr10" ->
+                throw UnsupportedOperationException("Engine Constants MS1/Extra ainda não mapeados nesta versão")
+
+            firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED || firmwareInfo?.family == EcuFamily.MS3 -> {
+                Logger.d(TAG, "Lendo Engine Constants MS2/MS3 (Page 0x04)...")
+                val pageData = readFullPage(pageNum = 0x04, pageSize = 1024, blockSize = 256)
+                Logger.d(TAG, "Page 0x04 recebida: ${pageData.size} bytes")
+                EngineConstants.fromMs2Page1(pageData)
+            }
+
+            firmwareInfo?.family == EcuFamily.RUSEFI -> {
+                activeIniDefinition?.let { definition ->
+                    val length = RusefiIniUiParsers.requiredBytesForEngine(definition)
+                    Logger.d(TAG, "Lendo Engine Constants rusEFI via .ini (Page 0x0000 chunk 0..${length - 1})...")
+                    val pageData = readConfigChunk(pageId = 0x0000, offset = 0, length = length)
+                    RusefiIniUiParsers.parseEngineConstants(definition, pageData)
+                } ?: run {
+                    Logger.d(TAG, "Lendo Engine Constants rusEFI (Page 0x0000 chunk 0..555)...")
+                    val pageData = readConfigChunk(pageId = 0x0000, offset = 0, length = 556)
+                    EngineConstants.fromRusefiMainPage(pageData, rusefiSchemaId)
+                }
+            }
+
+            else -> {
+                Logger.d(TAG, "Lendo Engine Constants (Page 1)...")
+                val pageData = readPage(pageNum = 1, offset = 0, length = 128)
+                Logger.d(TAG, "Page 1 recebida: ${pageData.size} bytes")
+                pinLayoutInfo = PinLayoutDetector.fromPage1(pageData)
+                EngineConstants.fromPage1(pageData)
+            }
+        }
+
+        cachedEngineConstants = constants
+        return constants
+    }
+
+    /**
+     * Lê calibração de pressão (MAP/Baro/EMAP) em Page 1.
+     */
+    override suspend fun readPressureCalibration(): PressureCalibration = withContext(Dispatchers.IO) {
+        val pageData = readPage(pageNum = 1, offset = 0, length = 128)
+        PressureCalibration(
+            mapMin = readS8(pageData, 46),
+            mapMax = readU16(pageData, 47),
+            baroMin = readS8(pageData, 64),
+            baroMax = readU16(pageData, 65),
+            emapMin = readS8(pageData, 67),
+            emapMax = readU16(pageData, 68)
+        )
+    }
+
+    /**
+     * Grava calibração de pressão (MAP/Baro/EMAP) em Page 1 + burn.
+     */
+    override suspend fun writePressureCalibration(calibration: PressureCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
+        ensureWritable("writePressureCalibration")
+        requireSpeeduinoLayout("writePressureCalibration")
+        ConfigValidator.requireValid(ConfigValidator.validatePressureCalibration(calibration))
+        val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+        writeS8(basePage, 46, calibration.mapMin)
+        writeU16(basePage, 47, calibration.mapMax)
+        writeS8(basePage, 64, calibration.baroMin)
+        writeU16(basePage, 65, calibration.baroMax)
+        writeS8(basePage, 67, calibration.emapMin)
+        writeU16(basePage, 68, calibration.emapMax)
+        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "Pressure Calibration")
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+        }
+    }
+
+    /**
+     * Lê calibração de TPS em Page 1.
+     */
+    override suspend fun readTpsCalibration(): TpsCalibration = withContext(Dispatchers.IO) {
+        val pageData = readPage(pageNum = 1, offset = 0, length = 128)
+        TpsCalibration(
+            tpsMin = readU8(pageData, 44),
+            tpsMax = readU8(pageData, 45)
+        )
+    }
+
+    /**
+     * Grava calibração de TPS em Page 1 + burn.
+     */
+    override suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
+        ensureWritable("writeTpsCalibration")
+        requireSpeeduinoLayout("writeTpsCalibration")
+        ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
+        val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+        writeU8(basePage, 44, calibration.tpsMin)
+        writeU8(basePage, 45, calibration.tpsMax)
+        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "TPS Calibration")
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+        }
+    }
+
+    /**
+     * Lê os 16 Generic Sensor Inputs da MS3 (tabela 0x05). Ver [Ms3GenericSensors].
+     */
+    override suspend fun readMs3GenericSensors(): Ms3GenericSensorsSnapshot = withContext(Dispatchers.IO) {
+        val signature = requireMs3Signature("readMs3GenericSensors")
+        val generation = Ms3GenericSensors.generationFor(signature)
+        val page = readFullPage(
+            pageNum = Ms3GenericSensors.TABLE_ID,
+            pageSize = Ms3GenericSensors.PAGE_SIZE,
+            blockSize = 256,
+        )
+        Ms3GenericSensorsSnapshot(
+            generation = generation,
+            boardInputs = Ms3GenericSensors.boardInputs(signature),
+            sensors = Ms3GenericSensors.parse(page, generation),
+        )
+    }
+
+    /**
+     * Grava um slot de Generic Sensor da MS3 (read-modify-write da tabela 0x05) + burn.
+     *
+     * Só o trecho dos campos de sensores genéricos (662..773) vai pro fio - o resto da página
+     * (idle, flex, ...) nunca é reenviado, então um byte lido errado ali não tem como ser gravado.
+     */
+    override suspend fun writeMs3GenericSensor(config: Ms3GenericSensorConfig, burn: Boolean) = withContext(Dispatchers.IO) {
+        ensureWritable("writeMs3GenericSensor")
+        val signature = requireMs3Signature("writeMs3GenericSensor")
+        val generation = Ms3GenericSensors.generationFor(signature)
+        val basePage = readFullPage(
+            pageNum = Ms3GenericSensors.TABLE_ID,
+            pageSize = Ms3GenericSensors.PAGE_SIZE,
+            blockSize = 256,
+        )
+        val updated = Ms3GenericSensors.apply(basePage, config, generation)
+        val span = Ms3GenericSensors.CONFIG_SPAN
+        protocol.writeTable(
+            tableId = Ms3GenericSensors.TABLE_ID,
+            offset = span.first,
+            data = updated.copyOfRange(span.first, span.last + 1),
+            family = EcuFamily.MS3,
+        )
+        if (burn) {
+            delay(300)
+            protocol.burnTable(Ms3GenericSensors.TABLE_ID, EcuFamily.MS3)
+        }
+        Logger.d(TAG, "Sensor genérico MS3 #${config.index} gravado (source=${config.source} trans=${config.transform})")
+    }
+
+    private fun requireMs3Signature(operation: String): String {
+        val info = firmwareInfo ?: throw IllegalStateException("$operation: ECU não conectada")
+        if (info.family != EcuFamily.MS3) {
+            throw UnsupportedOperationException("$operation: disponível apenas para MS3 (conectado: ${info.family})")
+        }
+        return info.signature
+    }
+
+    /**
+     * Lê as configurações básicas de controle de marcha lenta do Speeduino.
+     */
+    override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
+        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
+            throw UnsupportedOperationException("Controle de marcha lenta simplificado disponível apenas para Speeduino")
+        }
+        val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
+        val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
+        IdleControlSettings.fromPage4(basePage).copy(
+            idleTargetRpm = IdleControlSettings.readTargetRpmFromPage7(targetPage),
+        )
+    }
+
+    /**
+     * Grava as configurações básicas de controle de marcha lenta no Speeduino.
+     */
+    override suspend fun writeIdleControlSettings(settings: IdleControlSettings, burn: Boolean) = withContext(Dispatchers.IO) {
+        ensureWritable("writeIdleControlSettings")
+        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
+            throw UnsupportedOperationException("Controle de marcha lenta simplificado disponível apenas para Speeduino")
+        }
+        val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
+        val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
+        val page4Data = settings.applyToPage4(basePage)
+        val page7Data = settings.applyTargetRpmToPage7(targetPage)
+        writeConfigPageVerified(IdleControlSettings.PAGE_NUMBER.toByte(), 0, page4Data, "Idle Control (Page 4)")
+        writeConfigPageVerified(IdleControlSettings.TARGET_PAGE_NUMBER.toByte(), 0, page7Data, "Idle Target (Page 7)")
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+        }
+    }
+
+    /**
+     * Lê Trigger Settings (Page 4 - 128 bytes)
+     */
+    override suspend fun readTriggerSettings(): TriggerSettings {
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            activeIniDefinition?.let { definition ->
+                val length = RusefiIniUiParsers.requiredBytesForTrigger(definition)
+                Logger.d(TAG, "Lendo Trigger Settings rusEFI via .ini (Page 0x0000 chunk 0..${length - 1})...")
+                val pageData = readConfigChunk(pageId = 0x0000, offset = 0, length = length)
+                return RusefiIniUiParsers.parseTriggerSettings(definition, pageData)
+            }
+            val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+            val isF407Discovery = schemaId == "rusefi-f407-discovery"
+            val chunkOffset = if (isF407Discovery) 484 else 488
+            val paddedSize = if (isF407Discovery) 1658 else 1686
+            val length = paddedSize - chunkOffset
+            Logger.d(TAG, "Lendo Trigger Settings rusEFI (Page 0x0000 chunk $chunkOffset..${paddedSize - 1})...")
+            val pageData = readConfigChunk(pageId = 0x0000, offset = chunkOffset, length = length)
+            val padded = ByteArray(paddedSize)
+            pageData.copyInto(padded, destinationOffset = chunkOffset)
+            return TriggerSettings.fromRusefiMainPage(padded, schemaId)
+        }
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            Logger.d(TAG, "Lendo Trigger Settings MS2 (Page 0x04)...")
+            val pageData = readFullPage(
+                pageNum = TriggerSettings.MS2_PAGE_NUMBER,
+                pageSize = 1024,
+                blockSize = 256
+            )
+            Logger.d(TAG, "Trigger Settings MS2 recebidos: ${pageData.size} bytes")
+            return TriggerSettings.fromMs2PageData(pageData)
+        }
+
+        Logger.d(TAG, "Lendo Trigger Settings (Page 4)...")
+        val pageData = readPage(
+            pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = TriggerSettings.PAGE_LENGTH
+        )
+        Logger.d(TAG, "Trigger Settings recebidos: ${pageData.size} bytes")
+        return TriggerSettings.fromPageData(pageData)
+    }
+
+    // ---- Teste de saídas MegaSpeed (bomba, bicos, bobinas, portas, atuador de lenta) -----------------
+    // Regras puras e testadas em MegaSpeedOutputTestGuard. Aqui só há I/O: ler o estado ANTES de cada
+    // acionamento, enviar o frame do .ini e manter o watchdog que desliga tudo se ninguém desligar.
+
+    private var megaSpeedTestWatchdog: Job? = null
+
+    /** Só para teste: substitui o prazo do watchdog para não depender de segundos reais. */
+    internal var megaSpeedTestWatchdogOverrideMs: Long? = null
+
+    private fun requireMegaSpeedTest() {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Teste de saídas disponível apenas para MegaSpeed")
+        }
+    }
+
+    override suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus {
+        requireMegaSpeedTest()
+        val live = withEcuIo { readLiveData() }
+        return MegaSpeedTestStatus.fromOutputChannels(live.rpm, live.outputChannelData)
+            ?: throw IllegalStateException("Bloco de saída sem status3: não dá para confirmar o modo de teste")
+    }
+
+    override suspend fun readMegaSpeedTestParams(): MegaSpeedTestParams {
+        requireMegaSpeedTest()
+        val bytes = readConfigChunk(MegaSpeedOutputTest.PARAMS_PAGE, 0, MegaSpeedTestParams.PARAMS_END)
+        return MegaSpeedTestParams.fromPage(bytes)
+    }
+
+    override suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams) {
+        requireMegaSpeedTest()
+        ensureWritable("writeMegaSpeedTestParams")
+        // Lê, altera só os campos do teste (preserva outros bits) e grava a faixa 2..10 em RAM, sem burn.
+        val current = readConfigChunk(MegaSpeedOutputTest.PARAMS_PAGE, 0, MegaSpeedTestParams.PARAMS_END)
+        val updated = params.applyTo(current)
+        val region = updated.copyOfRange(MegaSpeedTestParams.OFFSET_OP, MegaSpeedTestParams.PARAMS_END)
+        withEcuIo {
+            protocol.writeTable(MegaSpeedOutputTest.PARAMS_PAGE, MegaSpeedTestParams.OFFSET_OP, region, EcuFamily.MS2)
+        }
+        invalidateConfigPageCache()
+    }
+
+    override suspend fun executeMegaSpeedTestCommand(command: MegaSpeedTestCommand) {
+        requireMegaSpeedTest()
+        if (!command.isOff) {
+            ensureWritable("MegaSpeed output test: ${command.label}")
+            // Estado lido AGORA, não o de um quadro antigo do stream.
+            val status = runCatching { readMegaSpeedTestStatus() }.getOrNull()
+            val needsParams = command.kind == MegaSpeedTestKind.SPARK || command.kind == MegaSpeedTestKind.INJECTOR
+            val params = if (needsParams) runCatching { readMegaSpeedTestParams() }.getOrNull() else null
+            when (val decision = MegaSpeedOutputTestGuard.evaluate(command, status, params)) {
+                MegaSpeedTestDecision.Allowed -> Unit
+                is MegaSpeedTestDecision.Refused -> {
+                    Logger.w(TAG, "Teste de saída recusado (${command.label}): ${decision.reason}")
+                    throw MegaSpeedTestRefusedException(decision.reason)
+                }
+            }
+        }
+        sendMegaSpeedTestFrame(command)
+        if (command.isOff) {
+            // Desligar algo não cancela o watchdog (pode haver outra saída ligada); só STOP_TEST_MODE o encerra.
+            if (command == MegaSpeedTestCommand.STOP_TEST_MODE) megaSpeedTestWatchdog?.cancel()
+        } else if (command.autoOffMs > 0) {
+            armMegaSpeedTestWatchdog(command.autoOffMs)
+        }
+    }
+
+    override suspend fun emergencyStopMegaSpeedTest(): Int {
+        requireMegaSpeedTest()
+        megaSpeedTestWatchdog?.cancel()
+        return sendMegaSpeedStopAll()
+    }
+
+    /**
+     * Envia STOP_ALL sem mexer no watchdog. O próprio watchdog chama isto: cancelar o job que está
+     * executando faria o envio abortar na primeira suspensão e nada seria desligado.
+     */
+    private suspend fun sendMegaSpeedStopAll(): Int {
+        var failures = 0
+        // Tudo é tentado mesmo que um falhe; sem ensureWritable: desligar nunca é bloqueado.
+        for (command in MegaSpeedTestCommand.STOP_ALL) {
+            try {
+                sendMegaSpeedTestFrame(command)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failures++
+                Logger.e(TAG, "Falha ao enviar '${command.label}' na parada de emergência: ${e.message}")
+            }
+        }
+        return failures
+    }
+
+    private suspend fun sendMegaSpeedTestFrame(command: MegaSpeedTestCommand) {
+        Logger.d(TAG, "Teste MegaSpeed: ${command.label} (0x${command.code.toString(16)})")
+        withEcuIo {
+            protocol.writeTable(
+                tableId = MegaSpeedOutputTest.COMMAND_TABLE,
+                offset = MegaSpeedOutputTest.COMMAND_OFFSET,
+                data = command.data(),
+                family = EcuFamily.MS2,
+            )
+        }
+    }
+
+    /** Se ninguém desligar em [afterMs], desliga TUDO (cada novo acionamento rearma o prazo). */
+    private fun armMegaSpeedTestWatchdog(afterMs: Long) {
+        megaSpeedTestWatchdog?.cancel()
+        megaSpeedTestWatchdog = scope.launch {
+            delay(megaSpeedTestWatchdogOverrideMs ?: afterMs)
+            Logger.w(TAG, "Watchdog do teste de saídas expirou após ${afterMs}ms: desligando tudo")
+            runCatching { sendMegaSpeedStopAll() }
+        }
+    }
+
+    // ---- Loggers de dente/gatilho/composto (tabelas 0xF0..0xF3) -----------------------------------
+    // Protocolo conforme serial.c/ms3_misc.c da MS3: cada leitura de 0xF0..0xF3 zera o DONELOG e, depois
+    // de responder, limpa e REARMA a captura. Logo: 1ª leitura arma, espera status3 & 0x02, 2ª leitura
+    // devolve o buffer completo. Ler antes de DONELOG reiniciaria a captura em andamento.
+
+    /** Só para teste: intervalo entre consultas de status3 enquanto aguarda o buffer. */
+    internal var megaSpeedLogPollMs: Long = 150L
+
+    override suspend fun captureMegaSpeedLog(kind: MegaSpeedLoggerKind, timeoutMs: Long): MegaSpeedLogCapture {
+        requireMegaSpeedLogger()
+        Logger.d(TAG, "Logger MegaSpeed ${kind.label}: armando (tabela 0x${kind.table.toString(16)})...")
+        withEcuIo { protocol.readTable(kind.table, 0, MegaSpeedLogDecoder.BUFFER_SIZE, EcuFamily.MS2) }
+
+        val deadline = MonotonicClock.nowMillis() + timeoutMs
+        while (true) {
+            val block = withEcuIo { readLiveData() }.outputChannelData
+            val status3 = MegaSpeedLiveChannels.status3(block)
+                ?: throw IllegalStateException("Bloco de saída sem status3: não dá para saber se o logger terminou")
+            if (status3 and DONELOG_BIT != 0) break
+            if (MonotonicClock.nowMillis() >= deadline) {
+                throw IllegalStateException(
+                    "Logger ${kind.label} não completou em ${timeoutMs}ms (sem pulsos de rotação ou buffer não encheu)"
+                )
+            }
+            delay(megaSpeedLogPollMs)
+        }
+
+        val buffer = withEcuIo { protocol.readTable(kind.table, 0, MegaSpeedLogDecoder.BUFFER_SIZE, EcuFamily.MS2) }
+        return MegaSpeedLogDecoder.decode(kind, buffer)
+    }
+
+    private fun requireMegaSpeedLogger() {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Logger de dentes disponível apenas para MegaSpeed")
+        }
+    }
+
+    override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed")
+        }
+        val definition = activeIniDefinition
+            ?: throw UnsupportedOperationException("Esta tela requer o .ini da CostaMegaSpeed carregado")
+        Logger.d(TAG, "Lendo $view MegaSpeed via .ini (páginas ${view.requiredPages.joinToString { formatPageId(it) }})...")
+        val pages = view.requiredPages.associateWith { pageId ->
+            readFullPage(pageNum = pageId, pageSize = 1024, blockSize = 256)
+        }
+        return when (view) {
+            MegaSpeedConfigView.IDLE -> MegaSpeedIdleConfig.parse(definition, pages)
+            MegaSpeedConfigView.PROTECTION -> MegaSpeedProtectionConfig.parse(definition, pages)
+            MegaSpeedConfigView.SENSORS -> MegaSpeedSensorsConfig.parse(definition, pages)
+        }
+    }
+
+    /** Campo escalar de 16 bits big-endian do .ini ativo, com a página resolvida para o ID real na ECU. */
+    private class MegaSpeedScalar(val pageId: Int, val offset: Int, val signed: Boolean, val scale: Double, val translate: Double)
+
+    private fun megaSpeedScalar(name: String): MegaSpeedScalar {
+        if (MegaSpeedWritableFields.byName(name) == null) {
+            throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $name")
+        }
+        val definition = activeIniDefinition
+            ?: throw UnsupportedOperationException("Esta operação requer o .ini da CostaMegaSpeed carregado")
+        val field = definition.fields.firstOrNull { it.section.equals("Constants", true) && it.name == name }
+            ?: throw UnsupportedOperationException("Campo $name ausente no .ini")
+        val type = field.dataType.uppercase()
+        require(field.kind == io.ecucore.definition.IniFieldKind.SCALAR && (type == "S16" || type == "U16")) {
+            "Campo $name não é escalar de 16 bits ($type)"
+        }
+        val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
+            ?: throw UnsupportedOperationException("Página do campo $name não resolvida")
+        val scale = field.scale ?: 1.0
+        require(scale > 0.0) { "Escala inválida para $name" }
+        return MegaSpeedScalar(pageId, field.offset ?: error("Campo $name sem offset"), type == "S16", scale, field.translate ?: 0.0)
+    }
+
+    private fun requireMegaSpeedForFieldAccess() {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed")
+        }
+    }
+
+    override suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> {
+        requireMegaSpeedForFieldAccess()
+        return fields.associateWith { name ->
+            val f = megaSpeedScalar(name)
+            val bytes = readConfigChunk(f.pageId, f.offset, 2)
+            var raw = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+            if (f.signed && raw >= 0x8000) raw -= 0x10000
+            (raw + f.translate) * f.scale
+        }
+    }
+
+    override suspend fun writeMegaSpeedConfigField(field: String, value: Double) {
+        ensureWritable("writeMegaSpeedConfigField")
+        requireMegaSpeedForFieldAccess()
+        val spec = MegaSpeedWritableFields.byName(field)
+            ?: throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $field")
+        require(value.isFinite() && value >= spec.min && value <= spec.max) {
+            "${spec.label}: valor ${value} fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
+        }
+        val f = megaSpeedScalar(field)
+        val raw = kotlin.math.round(value / f.scale - f.translate).toInt()
+        val range = if (f.signed) -32768..32767 else 0..65535
+        require(raw in range) { "${spec.label}: valor fora do alcance do campo" }
+        val newBytes = byteArrayOf(((raw shr 8) and 0xFF).toByte(), (raw and 0xFF).toByte())
+        val current = readConfigChunk(f.pageId, f.offset, 2)
+        // Igual ao TunerStudio: só os bytes que mudaram vão para a ECU.
+        val first = (0..1).firstOrNull { current[it] != newBytes[it] }
+        if (first == null) {
+            Logger.d(TAG, "MegaSpeed $field já está em $value; nada a gravar")
+            return
+        }
+        val last = (1 downTo 0).first { current[it] != newBytes[it] }
+        val data = newBytes.copyOfRange(first, last + 1)
+        Logger.d(TAG, "Gravando MegaSpeed $field=$value (raw=$raw) tabela=0x${f.pageId.toString(16)} off=${f.offset + first} len=${data.size}")
+        writeMsTableVerified(
+            TableRegions(listOf(TableRegion(f.pageId, f.offset + first, data)), setOf(f.pageId)),
+            "MegaSpeed $field",
+        )
+    }
+
+    override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            // MegaSpeed reaproveita o contêiner de snapshot do rusEFI: a pinagem vem do .ini ativo.
+            val definition = activeIniDefinition
+                ?: throw UnsupportedOperationException("Pinagem MegaSpeed requer o .ini da CostaMegaSpeed carregado")
+            Logger.d(TAG, "Lendo pinagem MegaSpeed via .ini (páginas ${MegaSpeedIoConfig.REQUIRED_PAGES.joinToString { formatPageId(it) }})...")
+            val pages = MegaSpeedIoConfig.REQUIRED_PAGES.associateWith { pageId ->
+                readFullPage(pageNum = pageId, pageSize = 1024, blockSize = 256)
+            }
+            return MegaSpeedIoConfig.parse(definition, pages)
+        }
+        if (firmwareInfo?.family != EcuFamily.RUSEFI) {
+            throw UnsupportedOperationException("I/O snapshot disponível apenas para rusEFI")
+        }
+        activeIniDefinition?.let { definition ->
+            val length = RusefiIniUiParsers.requiredBytesForInputOutput(definition)
+            Logger.d(TAG, "Lendo rusEFI Input/Output snapshot via .ini (Page 0x0000 chunk 0..${length - 1})...")
+            val pageData = readConfigChunk(pageId = 0x0000, offset = 0, length = length)
+            return RusefiIniUiParsers.parseInputOutputSnapshot(definition, pageData)
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        val chunkOffset = if (isF407Discovery) 52 else 56
+        val paddedSize = if (isF407Discovery) 1640 else 1668
+        val length = paddedSize - chunkOffset
+        Logger.d(TAG, "Lendo rusEFI Input/Output snapshot (Page 0x0000 chunk $chunkOffset..${paddedSize - 1})...")
+        val pageData = readConfigChunk(pageId = 0x0000, offset = chunkOffset, length = length)
+        val padded = ByteArray(paddedSize)
+        pageData.copyInto(padded, destinationOffset = chunkOffset)
+        return RusefiInputOutputConfig.fromMainPage(padded, schemaId)
+    }
+
+    /**
+     * Lê configuração do Secondary Serial (Page 9, offset 0)
+     */
+    override suspend fun readSecondarySerialConfig(): SecondarySerialConfig = withContext(Dispatchers.IO) {
+        Logger.d(TAG, "Lendo Secondary Serial Config (Page 9)...")
+        val data = readPage(
+            pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
+            offset = SecondarySerialConfig.OFFSET,
+            length = 1
+        )
+        val value = data.firstOrNull()?.toInt()?.and(0xFF) ?: 0
+        SecondarySerialConfig.fromByte(value)
+    }
+
+    /**
+     * Lê Engine Protection/Limiters (Page 6)
+     */
+    override suspend fun readEngineProtectionConfig(): EngineProtectionConfig {
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            throw UnsupportedOperationException("Engine Protection rusEFI ainda não mapeado nesta versão")
+        }
+        Logger.d(TAG, "Lendo Engine Protection (Page 6)...")
+        val pageData = readPage(
+            pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = EngineProtectionMapper.PAGE_SIZE
+        )
+        val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
+        val base = EngineProtectionMapper.fromPage(pageData, era)
+        if (!era.isModern()) return base
+        // Rev-limiter fields (valet mode) live in pages 1, 4 and 9; a failure here must not break the page 6 read.
+        return runCatching {
+            val page1 = readPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, 0, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE)
+            val page4 = readPage(EngineProtectionMapper.RPM_PAGE_NUMBER, 0, EngineProtectionMapper.RPM_PAGE_SIZE)
+            val page9 = readPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 0, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE)
+            EngineProtectionMapper.withRevLimiterPages(base, page1, page4, page9)
+        }.getOrElse {
+            Logger.w(TAG, "Rev limiter pages (1/4/9) unavailable: ${it.message}")
+            base
+        }
+    }
+
+    /**
+     * Lê correções AFR/O2 em malha fechada (Page 6)
+     */
+    override suspend fun readClosedLoopCorrectionConfig(): ClosedLoopCorrectionConfig {
+        val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
+        if (!ClosedLoopCorrectionMapper.isSupported(era)) {
+            throw UnsupportedOperationException("Correcoes AFR/O2 requerem firmware Speeduino moderno")
+        }
+        Logger.d(TAG, "Lendo Closed Loop Corrections (Page 6)...")
+        val pageData = readPage(
+            pageNum = ClosedLoopCorrectionMapper.PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = ClosedLoopCorrectionMapper.PAGE_SIZE
+        )
+        return ClosedLoopCorrectionMapper.fromPage(pageData, era)
+    }
+
+    /**
+     * Grava Engine Protection/Limiters (Page 6) + Burn
+     */
+    override suspend fun writeEngineProtectionConfig(config: EngineProtectionConfig, burn: Boolean) {
+        ensureWritable("writeEngineProtectionConfig")
+        requireSpeeduinoLayout("writeEngineProtectionConfig")
+        ConfigValidator.requireValid(ConfigValidator.validateEngineProtection(config))
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            throw UnsupportedOperationException("Engine Protection rusEFI ainda não mapeado nesta versão")
+        }
+        Logger.d(TAG, "Gravando Engine Protection (Page 6)...")
+        val basePage = readPage(
+            pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = EngineProtectionMapper.PAGE_SIZE
+        )
+        val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
+        val updatedData = EngineProtectionMapper.applyToPage(basePage, config, era)
+        writeConfigPageVerified(
+            pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
+            offset = 0,
+            data = updatedData,
+            label = "Engine Protection",
+        )
+        // Pages 1/4/9 are only touched when the config carries a rev limiter read from the ECU.
+        if (era.isModern() && config.hardRevLimitRpm > 0) {
+            writeRevLimiterPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage1(it, config)
+            }
+            writeRevLimiterPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage4(it, config)
+            }
+            writeRevLimiterPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage9(it, config)
+            }
+        }
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+            Logger.d(TAG, "Engine Protection gravado e burn executado")
+        } else {
+            Logger.d(TAG, "Engine Protection gravado (sem burn)")
+        }
+    }
+
+    private suspend fun writeRevLimiterPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
+        val updated = transform(readPage(pageNum = pageNum, offset = 0, length = size))
+        writeConfigPageVerified(pageNum = pageNum.toByte(), offset = 0, data = updated, label = "Engine Protection page $pageNum")
+        if (burn) {
+            delay(200)
+            protocol.burnConfig()
+        }
+    }
+
+    /**
+     * Grava correções AFR/O2 em malha fechada (Page 6) + Burn
+     */
+    override suspend fun writeClosedLoopCorrectionConfig(config: ClosedLoopCorrectionConfig, burn: Boolean) {
+        ensureWritable("writeClosedLoopCorrectionConfig")
+        val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
+        if (!ClosedLoopCorrectionMapper.isSupported(era)) {
+            throw UnsupportedOperationException("Correcoes AFR/O2 requerem firmware Speeduino moderno")
+        }
+        Logger.d(TAG, "Gravando Closed Loop Corrections (Page 6)...")
+        val basePage = readPage(
+            pageNum = ClosedLoopCorrectionMapper.PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = ClosedLoopCorrectionMapper.PAGE_SIZE
+        )
+        val updatedData = ClosedLoopCorrectionMapper.applyToPage(basePage, config, era)
+        writeConfigPageVerified(
+            pageNum = ClosedLoopCorrectionMapper.PAGE_NUMBER.toByte(),
+            offset = 0,
+            data = updatedData,
+            label = "Closed Loop Corrections",
+        )
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+            Logger.d(TAG, "Closed Loop Corrections gravadas e burn executado")
+        } else {
+            Logger.d(TAG, "Closed Loop Corrections gravadas (sem burn)")
+        }
+    }
+
+    /**
+     * Grava Trigger Settings (Page 4) + Burn
+     */
+    override suspend fun writeTriggerSettings(settings: TriggerSettings, burn: Boolean) {
+        ensureWritable("writeTriggerSettings")
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            throw UnsupportedOperationException("Trigger Settings rusEFI ainda não mapeados nesta versão")
+        }
+        val isMs2Trigger = firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED
+        ConfigValidator.requireValid(ConfigValidator.validateTrigger(settings, ms2 = isMs2Trigger))
+        if (isMs2Trigger) {
+            Logger.d(TAG, "Gravando Trigger Settings MS2 (Page 0x04)...")
+            val basePage = readFullPage(
+                pageNum = TriggerSettings.MS2_PAGE_NUMBER,
+                pageSize = 1024,
+                blockSize = 256
+            )
+            val updatedData = settings.toMs2PageData(basePage)
+            val changed = updatedData.indices.filter { it >= basePage.size || updatedData[it] != basePage[it] }.toSet()
+            val tableId = TriggerSettings.MS2_PAGE_NUMBER.toInt() and 0xFF
+            writeMsTableVerified(
+                TableRegions(
+                    listOf(TableRegion(tableId, 0, updatedData)),
+                    if (burn) setOf(tableId) else emptySet(),
+                    verifyOnly = changed,
+                ),
+                "Trigger Settings MS2",
+            )
+            if (burn) {
+                Logger.d(TAG, "Trigger Settings MS2 gravados e burn executado")
+            } else {
+                Logger.d(TAG, "Trigger Settings MS2 gravados (sem burn)")
+            }
+            return
+        }
+
+        Logger.d(TAG, "Gravando Trigger Settings (Page 4)...")
+        val basePage = readPage(
+            pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = TriggerSettings.PAGE_LENGTH
+        )
+        val updatedData = settings.toPageData(basePage)
+        writeConfigPageVerified(
+            pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
+            offset = 0,
+            data = updatedData,
+            label = "Trigger Settings",
+        )
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+            Logger.d(TAG, "Trigger Settings gravados e burn executado")
+        } else {
+            Logger.d(TAG, "Trigger Settings gravados (sem burn)")
+        }
+    }
+
+    /**
+     * Grava configuração do Secondary Serial (Page 9, offset 0) + Burn
+     */
+    override suspend fun writeSecondarySerialConfig(config: SecondarySerialConfig, burn: Boolean) = withContext(Dispatchers.IO) {
+        ensureWritable("writeSecondarySerialConfig")
+        requireSpeeduinoLayout("writeSecondarySerialConfig")
+        Logger.d(TAG, "Gravando Secondary Serial Config (Page 9)...")
+        val baseData = readPage(
+            pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
+            offset = SecondarySerialConfig.OFFSET,
+            length = 1
+        )
+        val original = baseData.firstOrNull()?.toInt()?.and(0xFF) ?: 0
+        val updated = config.applyToByte(original)
+
+        writeConfigPageVerified(
+            pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
+            offset = SecondarySerialConfig.OFFSET,
+            data = byteArrayOf(updated.toByte()),
+            label = "Secondary Serial",
+        )
+
+        if (burn) {
+            delay(300)
+            protocol.burnConfig()
+            Logger.d(TAG, "Secondary Serial Config gravado e burn executado")
+        } else {
+            Logger.d(TAG, "Secondary Serial Config gravado (sem burn)")
+        }
+    }
+
+    /**
+     * Lê VE Table usando definitions dinâmicas
+     *
+     * IMPORTANT: Uses dynamic page number based on firmware version!
+     * - Legacy (2016): Page 1
+     * - Modern (2020+): Page 2
+     *
+     * Format:
+     * - Modern firmware (288 bytes): VE values first, axes stored as single-byte bins
+     * - Legacy firmware (304 bytes): RPM bins (U16) + load bins precede the table
+     *
+     * @throws IllegalStateException if not connected
+     */
+    override suspend fun readVeTable(mapIndex: Int): VeTable {
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            val catalog = msExtraIniCatalog
+                ?: throw UnsupportedOperationException(
+                    "VE Table MS1/Extra requer uma definição .ini carregada (Configurações > Definição .ini)"
+                )
+            val layout = catalog.veTable
+            val pageSize = ecuDefinition?.pageCatalog?.firstOrNull { it.id == layout.page }?.size ?: 189
+            Logger.d(TAG, "Lendo VE Table MS1/Extra via .ini (Page ${formatPageId(layout.page)}, $pageSize bytes)...")
+            val pageData = readPage(pageNum = layout.page, offset = 0, length = pageSize)
+            val loadType = if (layout.loadField.name.startsWith("tpsBins", ignoreCase = true)) {
+                VeTable.LoadType.TPS
+            } else {
+                VeTable.LoadType.MAP
+            }
+            return MsExtraIniTableDefinitions.decodeVeTable(layout, pageData, loadType)
+        }
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            return readMs2VeTable()
+        }
+        if (firmwareInfo?.family == EcuFamily.MS3) {
+            return readMs3VeTable()
+        }
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            return readRusefiVeTable()
+        }
+
+        val defs = tableDefinitions
+            ?: throw IllegalStateException("Not connected! Call connect() first.")
+
+        val fallbackMetadata = defs.veTable
+        val metadata = if (mapIndex == 1) {
+            fallbackMetadata
+        } else {
+            resolveSpeeduinoTableMetadata(
+                tableNames = listOf("veTable$mapIndex"),
+                fallback = fallbackMetadata,
+                displayName = "VE Table $mapIndex"
+            )
+        }
+
+        Logger.d(
+            TAG,
+            "Lendo VE Table $mapIndex (Page ${metadata.page}, offset ${metadata.offset}, ${metadata.totalSize} bytes)..."
+        )
+        val pageData = readPage(
+            pageNum = metadata.page.toByte(),
+            offset = metadata.offset,
+            length = metadata.totalSize
+        )
+        Logger.d(TAG, "VE Table $mapIndex recebida: ${pageData.size} bytes")
+
+        val storageFormat = VeTable.StorageFormat.fromTotalSize(metadata.totalSize)
+        val loadType = resolveVeLoadType(mapIndex)
+        return VeTable.fromPageData(pageData, storageFormat, loadType)
+    }
+
+    /**
+     * Lê Ignition Table usando definitions dinâmicas
+     *
+     * IMPORTANT: Uses dynamic page number based on firmware version!
+     * - All versions: Page 3 (stable across all versions)
+     *
+     * Format:
+     * - Modern firmware (288 bytes): table first, axes compacted em 1 byte
+     * - Legacy firmware (304 bytes): axes antes da tabela, com RPM em U16
+     *
+     * @throws IllegalStateException if not connected
+     */
+    override suspend fun readIgnitionTable(mapIndex: Int): IgnitionTable {
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            val catalog = msExtraIniCatalog
+                ?: throw UnsupportedOperationException(
+                    "Ignition Table MS1/Extra requer uma definição .ini carregada (Configurações > Definição .ini)"
+                )
+            val layout = catalog.ignitionTable
+            val pageSize = ecuDefinition?.pageCatalog?.firstOrNull { it.id == layout.page }?.size ?: 189
+            Logger.d(TAG, "Lendo Ignition Table MS1/Extra via .ini (Page ${formatPageId(layout.page)}, $pageSize bytes)...")
+            val pageData = readPage(pageNum = layout.page, offset = 0, length = pageSize)
+            val loadType = if (layout.loadField.name.startsWith("tpsBins", ignoreCase = true)) {
+                IgnitionTable.LoadType.TPS
+            } else {
+                IgnitionTable.LoadType.MAP
+            }
+            return MsExtraIniTableDefinitions.decodeIgnitionTable(layout, pageData, loadType)
+        }
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            return readMs2IgnitionTable()
+        }
+        if (firmwareInfo?.family == EcuFamily.MS3) {
+            return readMs3IgnitionTable()
+        }
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            return readRusefiIgnitionTable()
+        }
+
+        val defs = tableDefinitions
+            ?: throw IllegalStateException("Not connected! Call connect() first.")
+
+        val fallbackMetadata = defs.ignitionTable
+        val metadata = if (mapIndex == 1) {
+            fallbackMetadata
+        } else {
+            resolveSpeeduinoTableMetadata(
+                tableNames = listOf("advTable$mapIndex"),
+                fallback = fallbackMetadata,
+                displayName = "Ignition Table $mapIndex"
+            )
+        }
+
+        Logger.d(
+            TAG,
+            "Lendo Ignition Table $mapIndex (Page ${metadata.page}, offset ${metadata.offset}, ${metadata.totalSize} bytes)..."
+        )
+        val pageData = readPage(
+            pageNum = metadata.page.toByte(),
+            offset = metadata.offset,
+            length = metadata.totalSize
+        )
+        Logger.d(TAG, "Ignition Table $mapIndex recebida: ${pageData.size} bytes")
+
+        val storageFormat = IgnitionTable.StorageFormat.fromTotalSize(metadata.totalSize)
+        val loadType = resolveIgnitionLoadType(mapIndex)
+        return IgnitionTable.fromPageData(pageData, storageFormat, loadType)
+    }
+
+    /**
+     * Lê Dwell Table (Page 12)
+     *
+     * A dwell map do Speeduino é pequena (4x4) e usa o mesmo eixo de carga da ignição.
+     */
+    override suspend fun readDwellTable(): DwellTable {
+        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
+            throw UnsupportedOperationException("Dwell Table only supported on Speeduino")
+        }
+        val loadType = resolveIgnitionLoadType()
+        Logger.d(TAG, "Lendo Dwell Table (Page 12, 192 bytes)...")
+        val pageData = readPage(
+            pageNum = 12,
+            offset = 0,
+            length = DwellTable.StorageFormat.PAGE_12_192.totalSize
+        )
+        Logger.d(TAG, "Dwell Table recebida: ${pageData.size} bytes")
+        return DwellTable.fromPageData(pageData, loadType = loadType)
+    }
+
+    /**
+     * Grava Engine Constants (Page 1 - 128 bytes) + Burn
+     */
+    override suspend fun writeEngineConstants(engineConstants: EngineConstants) {
+        ensureWritable("writeEngineConstants")
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            throw UnsupportedOperationException("Engine Constants rusEFI ainda não mapeados nesta versão")
+        }
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            throw UnsupportedOperationException("Engine Constants MS1/Extra ainda não mapeados nesta versão")
+        }
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED || firmwareInfo?.family == EcuFamily.MS3) {
+            Logger.d(TAG, "Gravando Engine Constants MS2/MS3 (Page 0x04)...")
+            val basePage = readFullPage(pageNum = 0x04, pageSize = 1024, blockSize = 256)
+            val pageData = engineConstants.applyToMs2Page1(basePage)
+            val changed = pageData.indices.filter { it >= basePage.size || pageData[it] != basePage[it] }.toSet()
+            writeMsTableVerified(
+                TableRegions(listOf(TableRegion(0x04, 0, pageData)), setOf(0x04), verifyOnly = changed),
+                "Engine Constants (MS page 0x04)",
+            )
+            Logger.d(TAG, "Page 0x04 gravada com sucesso")
+        } else {
+            Logger.d(TAG, "Gravando Engine Constants (Page 1)...")
+
+            // Preserve existing settings on Page 1 and update only known fields
+            val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+            val pageData = engineConstants.applyToPage1(basePage)
+            Logger.d(TAG, "Page 1 serializada: ${pageData.size} bytes")
+
+            // Write to ECU
+            writeConfigPageVerified(pageNum = 1, offset = 0, data = pageData, label = "Engine Constants (Page 1)")
+            Logger.d(TAG, "Page 1 gravada com sucesso")
+
+            // Burn to EEPROM
+            protocol.burnConfig()
+            Logger.d(TAG, "Burn executado com sucesso")
+        }
+        cachedEngineConstants = engineConstants
+    }
+
+    /**
+     * Grava uma página completa de configuração (backup/restore)
+     */
+    override suspend fun writeRawPage(pageNum: Int, data: ByteArray) = withEcuIo { writeRawPageUnlocked(pageNum, data) }
+
+    private suspend fun writeRawPageUnlocked(pageNum: Int, data: ByteArray) {
+        ensureWritable("writeRawPage")
+        if (ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE) {
+            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            settleAfterConfigWrite()
+            protocol.burnConfig()
+            Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup e burn executado")
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO && isModernTablePage(pageNum, data.size)) {
+            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            pendingSpeeduinoPageReadbacks[pageNum] = data.copyOf()
+            settleAfterConfigWrite()
+            protocol.burnConfig()
+            delay(150)
+            runCatching { connection.clearInputBuffer() }
+            Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup e burn executado")
+            return
+        }
+        if (
+            firmwareInfo?.family == EcuFamily.MS2 ||
+            firmwareInfo?.family == EcuFamily.MEGASPEED ||
+            firmwareInfo?.family == EcuFamily.MS3 ||
+            firmwareInfo?.family == EcuFamily.RUSEFI
+        ) {
+            val alias = resolveMs2Alias(pageNum, 0, data.size)
+            val tableId = alias?.pageId ?: pageNum
+            val tableOffset = alias?.offset ?: 0
+            protocol.writeTable(tableId = tableId, offset = tableOffset, data = data, family = getEcuFamily())
+            settleAfterConfigWrite()
+            burnTableIfSupported(tableId = tableId, family = getEcuFamily())
+        } else {
+            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            settleAfterConfigWrite()
+            protocol.burnConfig()
+        }
+        delay(150)
+        runCatching { connection.clearInputBuffer() }
+        Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup e burn executado")
+    }
+
+    suspend fun writeRawPage(pageNum: Byte, data: ByteArray) {
+        writeRawPage(pageNum.toInt() and 0xFF, data)
+    }
+
+    /**
+     * Grava uma página completa sem executar burn (para restauração em lote).
+     */
+    override suspend fun writeRawPageWithoutBurn(pageNum: Int, data: ByteArray) = withEcuIo { writeRawPageWithoutBurnUnlocked(pageNum, data) }
+
+    private suspend fun writeRawPageWithoutBurnUnlocked(pageNum: Int, data: ByteArray) {
+        ensureWritable("writeRawPageWithoutBurn")
+        if (ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE) {
+            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            settleAfterConfigWrite()
+            Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup (sem burn)")
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO && isModernTablePage(pageNum, data.size)) {
+            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            settleAfterConfigWrite()
+            Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup (sem burn)")
+            return
+        }
+        if (
+            firmwareInfo?.family == EcuFamily.MS2 ||
+            firmwareInfo?.family == EcuFamily.MEGASPEED ||
+            firmwareInfo?.family == EcuFamily.MS3 ||
+            firmwareInfo?.family == EcuFamily.RUSEFI
+        ) {
+            val alias = resolveMs2Alias(pageNum, 0, data.size)
+            val tableId = alias?.pageId ?: pageNum
+            val tableOffset = alias?.offset ?: 0
+            protocol.writeTable(tableId = tableId, offset = tableOffset, data = data, family = getEcuFamily())
+        } else {
+            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+        }
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO && isModernTablePage(pageNum, data.size)) {
+            pendingSpeeduinoPageReadbacks[pageNum] = data.copyOf()
+        }
+        settleAfterConfigWrite()
+        delay(150)
+        runCatching { connection.clearInputBuffer() }
+        Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup (sem burn)")
+    }
+
+    suspend fun writeRawPageWithoutBurn(pageNum: Byte, data: ByteArray) {
+        writeRawPageWithoutBurn(pageNum.toInt() and 0xFF, data)
+    }
+
+    /**
+     * Grava uma pagina em blocos menores para contornar timeouts de recepcao
+     * em firmwares que nao conseguem consumir um pacote legado inteiro a tempo.
+     */
+    override suspend fun writeRawPageChunkedWithoutBurn(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) = withEcuIo { writeRawPageChunkedWithoutBurnUnlocked(pageNum, data, chunkSize, startOffset) }
+
+    private suspend fun writeRawPageChunkedWithoutBurnUnlocked(pageNum: Int, data: ByteArray, chunkSize: Int, startOffset: Int) {
+        ensureWritable("writeRawPageChunkedWithoutBurn")
+        if (chunkSize <= 0) {
+            throw IllegalArgumentException("chunkSize must be > 0")
+        }
+        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
+            writeRawPageWithoutBurn(pageNum, data)
+            return
+        }
+
+        writePageChunksWithRetry(pageNum, data, chunkSize, startOffset)
+        settleAfterConfigWrite()
+        delay(150)
+        runCatching { connection.clearInputBuffer() }
+        Logger.d(TAG, "Pagina ${formatPageId(pageNum)} gravada em chunks sem burn")
+    }
+
+    /** @return erros de chunks que falharam mas foram recuperados por retry (vazio = limpo). */
+    private suspend fun writePageChunksWithRetry(
+        pageNum: Int,
+        data: ByteArray,
+        chunkSize: Int,
+        startOffset: Int,
+    ): List<Exception> {
+        val recoveredErrors = mutableListOf<Exception>()
+        var offset = startOffset
+        val end0 = startOffset + data.size
+        var chunkIndex = 0
+        while (offset < end0) {
+            val end = minOf(offset + chunkSize, end0)
+            val chunk = data.copyOfRange(offset - startOffset, end - startOffset)
+            chunkIndex++
+            Logger.d(TAG, "Gravando pagina ${formatPageId(pageNum)} em chunk #$chunkIndex offset=$offset size=${chunk.size}")
+            var attempt = 0
+            while (true) {
+                attempt++
+                try {
+                    writeConfigPage(pageNum = pageNum.toByte(), offset = offset, data = chunk)
+                    break
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (attempt >= TABLE_WRITE_CHUNK_MAX_ATTEMPTS) throw e
+                    recoveredErrors += e
+                    Logger.w(TAG, "Chunk #$chunkIndex da pagina ${formatPageId(pageNum)} falhou (tentativa $attempt): ${e.message}; retentando")
+                    runCatching { connection.abortPendingRead() }
+                    delay(pageWriteRetryDelayMs(e, attempt))
+                    runCatching { connection.clearInputBuffer() }
+                }
+            }
+            offset = end
+            if (offset < end0) {
+                delay(60)
+            }
+        }
+        return recoveredErrors
+    }
+
+    /**
+     * Frame rejeitado (0x82/0x80): espera mais que o timeout serial do firmware (~400ms) para a
+     * ECU descartar o resto do frame antes do próximo comando - retentar em 250ms concatenaria o
+     * frame novo ao lixo e voltaria a falhar.
+     */
+    internal fun pageWriteRetryDelayMs(error: Exception, attempt: Int): Long {
+        val base = 250L * attempt
+        val frameRejected = (error as? EcuProtocol.PageWriteRejectedException)?.isFrameRejected == true ||
+            isLiveDataLinkDesync(error)
+        return if (frameRejected) maxOf(base, LIVE_DATA_DESYNC_RESYNC_DELAY_MS) else base
+    }
+
+    /**
+     * Grava uma tabela de tuning Speeduino em chunks e confirma por read-back byte a byte antes
+     * de liberar o burn. Divergência = regrava a região inteira (corrige também bytes que a ECU
+     * escreveu a partir de lixo do link); persistindo, lança [PageWriteVerificationException]
+     * e o chamador NÃO faz burn - a EEPROM continua com a tabela anterior, íntegra.
+     */
+    private suspend fun writeSpeeduinoTableVerified(pageNum: Int, offset: Int, data: ByteArray, label: String) {
+        // Imagem anterior da região, para restaurar a RAM se a gravação não puder ser confirmada.
+        val original = captureSpeeduinoRegion(pageNum, offset, data.size)
+        var mismatches: List<Int> = emptyList()
+        var lastWriteError: Exception? = null
+        var retriedWriteError: Exception? = null
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        fun report(recovered: Boolean) = anomalies.forEach { anomaly ->
+            val event = anomaly.copy(recovered = recovered)
+            ConnectionTrace.info(
+                "page_write",
+                "anomaly page=${event.pageId} pass=${event.pass} mismatches=${event.mismatchedOffsets.size} recovered=$recovered"
+            )
+            runCatching { pageWriteAnomalyListener?.invoke(event) }
+        }
+        for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
+            try {
+                val retried = writePageChunksWithRetry(pageNum, data, TABLE_WRITE_CHUNK_SIZE, offset)
+                // Chunk rejeitado e recuperado no retry: o retry pode ter sobrescrito o lixo, mas
+                // 0x82 no link continua sendo sinal que precisa chegar na telemetria.
+                lastWriteError = null
+                retriedWriteError = retried.lastOrNull()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Mesmo com a escrita falhando, relê: a RAM da ECU pode ter sido alterada pelo
+                // lixo do frame rejeitado e o usuário precisa saber se ela diverge da tela.
+                lastWriteError = e
+                retriedWriteError = null
+                Logger.w(TAG, "$label: escrita falhou no passe $pass: ${e.message}")
+            }
+            delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+            invalidateCachedPage(pageNum)
+            pendingSpeeduinoPageReadbacks.remove(pageNum)
+            val readBack = readPage(pageNum, offset, data.size)
+            invalidateCachedPage(pageNum)
+            mismatches = data.indices.filter { i -> i >= readBack.size || readBack[i] != data[i] }
+            val passError = lastWriteError ?: retriedWriteError
+            if (mismatches.isNotEmpty() || passError != null) {
+                val shown = mismatches.take(16)
+                anomalies += PageWriteAnomaly(
+                    pageId = pageNum,
+                    label = label,
+                    pass = pass,
+                    mismatchedOffsets = mismatches,
+                    expected = shown.map { data[it].toInt() and 0xFF },
+                    actual = shown.map { readBack.getOrNull(it)?.toInt()?.and(0xFF) ?: -1 },
+                    writeErrorMessage = passError?.message,
+                    writeResponseCode = (passError as? EcuProtocol.PageWriteRejectedException)?.responseCode,
+                    recovered = false,
+                )
+            }
+            if (mismatches.isEmpty() && lastWriteError == null) {
+                Logger.d(TAG, "$label: read-back confere (${data.size} bytes, passe $pass)")
+                report(recovered = true)
+                return
+            }
+            if (mismatches.isEmpty()) {
+                // Bytes certos na RAM apesar do erro (ex.: ACK perdido na volta): pode seguir.
+                Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${lastWriteError?.message})")
+                report(recovered = true)
+                return
+            }
+            Logger.w(
+                TAG,
+                "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass " +
+                    "(offsets ${mismatches.take(8).joinToString()}); regravando"
+            )
+        }
+        // Não confirmou: devolve a RAM ao valor anterior (o burn nunca aconteceu, então a EEPROM
+        // já está íntegra). Sem a imagem anterior, ou se nem a restauração confirmar, avisa.
+        val rolledBack = original != null && original.size == data.size &&
+            rollbackSpeeduinoRegion(pageNum, offset, original, label)
+        report(recovered = false)
+        throw PageWriteVerificationException(
+            pageId = pageNum,
+            label = label,
+            mismatchedOffsets = mismatches,
+            cause = lastWriteError,
+            rolledBack = rolledBack,
+        )
+    }
+
+    /** Lê a região atual da ECU antes de sobrescrevê-la; `null` se não foi possível. */
+    private suspend fun captureSpeeduinoRegion(pageNum: Int, offset: Int, length: Int): ByteArray? {
+        return try {
+            invalidateCachedPage(pageNum)
+            pendingSpeeduinoPageReadbacks.remove(pageNum)
+            val bytes = readPage(pageNum, offset, length)
+            invalidateCachedPage(pageNum)
+            bytes.takeIf { it.size == length }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "Região anterior ilegível (página $pageNum); sem rollback automático: ${e.message}")
+            null
+        }
+    }
+
+    /** Regrava [original] e confere por read-back. Nunca faz burn. */
+    private suspend fun rollbackSpeeduinoRegion(pageNum: Int, offset: Int, original: ByteArray, label: String): Boolean {
+        return try {
+            Logger.w(TAG, "$label: gravação não confirmada; restaurando o valor anterior na RAM")
+            writePageChunksWithRetry(pageNum, original, TABLE_WRITE_CHUNK_SIZE, offset)
+            delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+            invalidateCachedPage(pageNum)
+            pendingSpeeduinoPageReadbacks.remove(pageNum)
+            val readBack = readPage(pageNum, offset, original.size)
+            invalidateCachedPage(pageNum)
+            val restored = readBack.size >= original.size && original.indices.all { readBack[it] == original[it] }
+            Logger.w(TAG, "$label: rollback ${if (restored) "confirmado" else "NÃO confirmado"}")
+            restored
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "$label: rollback falhou: ${e.message}")
+            false
+        }
+    }
+
+    suspend fun writeRawPageChunkedWithoutBurn(pageNum: Byte, data: ByteArray, chunkSize: Int = 64, startOffset: Int = 0) {
+        writeRawPageChunkedWithoutBurn(pageNum.toInt() and 0xFF, data, chunkSize, startOffset)
+    }
+
+    /**
+     * Executa burn após gravações em lote.
+     */
+    override suspend fun burnConfigs() = withEcuIo { burnConfigsUnlocked() }
+
+    private suspend fun burnConfigsUnlocked() {
+        ensureWritable("burnConfigs")
+        if (
+            firmwareInfo?.family == EcuFamily.MS2 ||
+            firmwareInfo?.family == EcuFamily.MEGASPEED ||
+            firmwareInfo?.family == EcuFamily.MS3 ||
+            firmwareInfo?.family == EcuFamily.RUSEFI
+        ) {
+            throw IllegalStateException("${firmwareInfo?.family} requires page-specific burn; use table-specific write helpers.")
+        }
+        protocol.burnConfig()
+        Logger.d(TAG, "Burn executado após restauração em lote")
+    }
+
+    override suspend fun burnLastWrittenLegacyPage() = withEcuIo { burnLastWrittenLegacyPageUnlocked() }
+
+    private suspend fun burnLastWrittenLegacyPageUnlocked() {
+        ensureWritable("burnLastWrittenLegacyPage")
+        if (
+            firmwareInfo?.family == EcuFamily.MS2 ||
+            firmwareInfo?.family == EcuFamily.MEGASPEED ||
+            firmwareInfo?.family == EcuFamily.MS3 ||
+            firmwareInfo?.family == EcuFamily.RUSEFI
+        ) {
+            throw IllegalStateException("${firmwareInfo?.family} requires table-specific burn.")
+        }
+        protocol.burnConfig()
+        Logger.d(TAG, "Burn legacy executado para a última página gravada")
+    }
+
+    /**
+     * Grava VE Table (Page 1 - offset 0, 304 bytes) + Burn
+     *
+     * IMPORTANT: This method validates the table before writing.
+     * If validation fails, it throws ValidationException.
+     *
+     * @param veTable VE Table to write
+     * @throws ValidationException if table has critical errors
+     */
+    override suspend fun writeVeTable(veTable: VeTable, mapIndex: Int) {
+        ensureWritable("writeVeTable")
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            writeMs2VeTable(veTable)
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.MS3) {
+            writeMs3VeTable(veTable)
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            writeRusefiVeTable(veTable)
+            return
+        }
+        val defs = tableDefinitions
+            ?: throw IllegalStateException("Not connected! Call connect() first.")
+        val metadata = if (mapIndex == 1) {
+            defs.veTable
+        } else {
+            resolveSpeeduinoTableMetadata(
+                tableNames = listOf("veTable$mapIndex"),
+                fallback = defs.veTable,
+                displayName = "VE Table $mapIndex"
+            )
+        }
+        Logger.d(TAG, "Gravando VE Table $mapIndex (Page ${metadata.page})...")
+
+        val pageData = TableDomainFacade.prepareVeWrite(metadata, veTable).data
+        Logger.d(TAG, "VE Table serializada: ${pageData.size} bytes")
+
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(mapIndex).values }
+
+        // Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
+        writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "VE Table $mapIndex")
+        Logger.d(TAG, "VE Table $mapIndex gravada e conferida na Page ${metadata.page}")
+
+        // Burn to EEPROM (também demora - grava na flash/EEPROM)
+        protocol.burnConfig()
+        Logger.d(TAG, "✅ Burn executado com sucesso!")
+    }
+
+    /**
+     * Grava Ignition Table (Page 3 - offset 0, 304 bytes) + Burn
+     *
+     * CRITICAL: This method validates the table before writing.
+     * Dangerous ignition advance values (>45°) will cause validation to FAIL.
+     *
+     * @param ignitionTable Ignition Table to write
+     * @throws ValidationException if table has critical errors (esp. dangerous advance)
+     */
+    override suspend fun writeIgnitionTable(ignitionTable: IgnitionTable, mapIndex: Int) {
+        ensureWritable("writeIgnitionTable")
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            writeMs2IgnitionTable(ignitionTable)
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.MS3) {
+            writeMs3IgnitionTable(ignitionTable)
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            writeRusefiIgnitionTable(ignitionTable)
+            return
+        }
+        val defs = tableDefinitions
+            ?: throw IllegalStateException("Not connected! Call connect() first.")
+        val metadata = if (mapIndex == 1) {
+            defs.ignitionTable
+        } else {
+            resolveSpeeduinoTableMetadata(
+                tableNames = listOf("advTable$mapIndex"),
+                fallback = defs.ignitionTable,
+                displayName = "Ignition Table $mapIndex"
+            )
+        }
+        Logger.d(TAG, "Gravando Ignition Table $mapIndex (Page ${metadata.page})...")
+
+        val pageData = TableDomainFacade.prepareIgnitionWrite(metadata, ignitionTable).data
+        Logger.d(TAG, "Ignition Table serializada: ${pageData.size} bytes")
+
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(mapIndex).values }
+
+        // 3. Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
+        writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "Ignition Table $mapIndex")
+        Logger.d(TAG, "Ignition Table gravada e conferida")
+
+        // 5. Burn to EEPROM
+        protocol.burnConfig()
+        Logger.d(TAG, "✅ Burn executado com sucesso!")
+    }
+
+    /**
+     * Grava Dwell Table (Page 12 - 192 bytes) + Burn
+     */
+    override suspend fun writeDwellTable(dwellTable: DwellTable) {
+        ensureWritable("writeDwellTable")
+        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
+            throw UnsupportedOperationException("Dwell Table only supported on Speeduino")
+        }
+        Logger.d(TAG, "Gravando Dwell Table (Page 12)...")
+
+        val pageData = dwellTable.toByteArray()
+        Logger.d(TAG, "Dwell Table serializada: ${pageData.size} bytes")
+
+        writeConfigPageVerified(pageNum = 12.toByte(), offset = 0, data = pageData, label = "Dwell Table")
+        Logger.d(TAG, "Dwell Table enviada")
+
+        delay(1000)
+        Logger.d(TAG, "Aguardou 1s para processamento do write")
+
+        protocol.burnConfig()
+        Logger.d(TAG, "✅ Burn executado com sucesso!")
+    }
+
+    /**
+     * Lê AFR Target Table usando definitions dinâmicas
+     *
+     * IMPORTANT: Uses dynamic page number based on firmware version!
+     * - All versions: Page 5 (stable across all versions)
+     *
+     * Format:
+     * - Modern firmware (288 bytes): valores primeiro, eixos compactados
+     * - Legacy firmware (304 bytes): eixos de 16 bits antes dos valores
+     *
+     * @throws IllegalStateException if not connected
+     */
+    override suspend fun readAfrTable(): AfrTable {
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
+            throw UnsupportedOperationException("AFR Table MS1/Extra ainda não mapeada nesta versão")
+        }
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            return readMs2AfrTable()
+        }
+        if (firmwareInfo?.family == EcuFamily.MS3) {
+            return readMs3AfrTable()
+        }
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            return readRusefiAfrTable()
+        }
+
+        val defs = tableDefinitions
+            ?: throw IllegalStateException("Not connected! Call connect() first.")
+
+        val metadata = defs.afrTable
+
+        Logger.d(TAG, "Lendo AFR Table (Page ${metadata.page}, offset ${metadata.offset}, ${metadata.totalSize} bytes)...")
+        val pageData = readPage(
+            pageNum = metadata.page.toByte(),
+            offset = metadata.offset,
+            length = metadata.totalSize
+        )
+        Logger.d(TAG, "AFR Table recebida: ${pageData.size} bytes")
+
+        val storageFormat = AfrTable.StorageFormat.fromTotalSize(metadata.totalSize)
+        val loadType = resolveAfrLoadType(isLegacyFormat = storageFormat == AfrTable.StorageFormat.LEGACY_304)
+        return AfrTable.fromPageData(pageData, storageFormat, loadType)
+    }
+
+    private suspend fun readMs3VeTable(): VeTable {
+        val loadType = if (isMapLoad()) VeTable.LoadType.MAP else VeTable.LoadType.TPS
+        val layout = Ms3TableDefinitions.VE_TABLE_1
+        Logger.d(
+            TAG,
+            "Lendo MS3 VE Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
+        )
+        val valuesData = readConfigChunk(
+            pageId = layout.metadata.page.toByte(),
+            offset = layout.metadata.offset,
+            length = layout.metadata.totalSize
+        )
+        val rpmAxisData = readConfigChunk(
+            pageId = layout.rpmAxis.tableId.toByte(),
+            offset = layout.rpmAxis.offset,
+            length = layout.rpmAxis.count * 2
+        )
+        val loadAxisData = readConfigChunk(
+            pageId = layout.loadAxis.tableId.toByte(),
+            offset = layout.loadAxis.offset,
+            length = layout.loadAxis.count * 2
+        )
+        return Ms3TableDefinitions.parseVeTable(
+            valuesData = valuesData,
+            rpmAxisData = rpmAxisData,
+            loadAxisData = loadAxisData,
+            loadType = loadType
+        )
+    }
+
+    private suspend fun readMs2VeTable(): VeTable {
+        val loadType = if (isMapLoad()) VeTable.LoadType.MAP else VeTable.LoadType.TPS
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            megaSpeedIniCatalog?.let { catalog ->
+                Logger.d(TAG, "Lendo MegaSpeed VE Table 1 via .ini (${formatPageId(catalog.veTable.metadata.page)})...")
+                val valuesData = readConfigChunk(catalog.veTable.metadata.page, catalog.veTable.metadata.offset, catalog.veTable.metadata.totalSize)
+                val rpmAxisData = readConfigChunk(catalog.veTable.rpmAxis.pageId, catalog.veTable.rpmAxis.offset, catalog.veTable.rpmAxis.count * 2)
+                val loadAxisData = readConfigChunk(catalog.veTable.loadAxis.pageId, catalog.veTable.loadAxis.offset, catalog.veTable.loadAxis.count * 2)
+                return MegaSpeedIniTableDefinitions.parseVeTable(catalog.veTable, valuesData, rpmAxisData, loadAxisData, loadType)
+            }
+        }
+        val layout = Ms2TableDefinitions.VE_TABLE_1
+        Logger.d(
+            TAG,
+            "Lendo MS2 VE Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
+        )
+        val valuesData = readConfigChunk(
+            pageId = layout.metadata.page.toByte(),
+            offset = layout.metadata.offset,
+            length = layout.metadata.totalSize
+        )
+        val rpmAxisData = readConfigChunk(
+            pageId = layout.rpmAxis.tableId.toByte(),
+            offset = layout.rpmAxis.offset,
+            length = layout.rpmAxis.count * 2
+        )
+        val loadAxisData = readConfigChunk(
+            pageId = layout.loadAxis.tableId.toByte(),
+            offset = layout.loadAxis.offset,
+            length = layout.loadAxis.count * 2
+        )
+        return Ms2TableDefinitions.parseVeTable(
+            valuesData = valuesData,
+            rpmAxisData = rpmAxisData,
+            loadAxisData = loadAxisData,
+            loadType = loadType
+        )
+    }
+
+    private suspend fun readMs3IgnitionTable(): IgnitionTable {
+        val loadType = if (isMapLoad()) IgnitionTable.LoadType.MAP else IgnitionTable.LoadType.TPS
+        val layout = Ms3TableDefinitions.IGNITION_TABLE_1
+        Logger.d(
+            TAG,
+            "Lendo MS3 Ignition Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
+        )
+        val valuesData = readConfigChunk(
+            pageId = layout.metadata.page.toByte(),
+            offset = layout.metadata.offset,
+            length = layout.metadata.totalSize
+        )
+        val rpmAxisData = readConfigChunk(
+            pageId = layout.rpmAxis.tableId.toByte(),
+            offset = layout.rpmAxis.offset,
+            length = layout.rpmAxis.count * 2
+        )
+        val loadAxisData = readConfigChunk(
+            pageId = layout.loadAxis.tableId.toByte(),
+            offset = layout.loadAxis.offset,
+            length = layout.loadAxis.count * 2
+        )
+        return Ms3TableDefinitions.parseIgnitionTable(
+            valuesData = valuesData,
+            rpmAxisData = rpmAxisData,
+            loadAxisData = loadAxisData,
+            loadType = loadType
+        )
+    }
+
+    private suspend fun readMs2IgnitionTable(): IgnitionTable {
+        val loadType = if (isMapLoad()) IgnitionTable.LoadType.MAP else IgnitionTable.LoadType.TPS
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            megaSpeedIniCatalog?.let { catalog ->
+                Logger.d(TAG, "Lendo MegaSpeed Ignition Table 1 via .ini (${formatPageId(catalog.ignitionTable.metadata.page)})...")
+                val valuesData = readConfigChunk(catalog.ignitionTable.metadata.page, catalog.ignitionTable.metadata.offset, catalog.ignitionTable.metadata.totalSize)
+                val rpmAxisData = readConfigChunk(catalog.ignitionTable.rpmAxis.pageId, catalog.ignitionTable.rpmAxis.offset, catalog.ignitionTable.rpmAxis.count * 2)
+                val loadAxisData = readConfigChunk(catalog.ignitionTable.loadAxis.pageId, catalog.ignitionTable.loadAxis.offset, catalog.ignitionTable.loadAxis.count * 2)
+                return MegaSpeedIniTableDefinitions.parseIgnitionTable(catalog.ignitionTable, valuesData, rpmAxisData, loadAxisData, loadType)
+            }
+        }
+        val layout = Ms2TableDefinitions.IGNITION_TABLE_1
+        Logger.d(
+            TAG,
+            "Lendo MS2 Ignition Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
+        )
+        val valuesData = readConfigChunk(
+            pageId = layout.metadata.page.toByte(),
+            offset = layout.metadata.offset,
+            length = layout.metadata.totalSize
+        )
+        val rpmAxisData = readConfigChunk(
+            pageId = layout.rpmAxis.tableId.toByte(),
+            offset = layout.rpmAxis.offset,
+            length = layout.rpmAxis.count * 2
+        )
+        val loadAxisData = readConfigChunk(
+            pageId = layout.loadAxis.tableId.toByte(),
+            offset = layout.loadAxis.offset,
+            length = layout.loadAxis.count * 2
+        )
+        return Ms2TableDefinitions.parseIgnitionTable(
+            valuesData = valuesData,
+            rpmAxisData = rpmAxisData,
+            loadAxisData = loadAxisData,
+            loadType = loadType
+        )
+    }
+
+    private suspend fun readMs3AfrTable(): AfrTable {
+        val loadType = if (isMapLoad()) AfrTable.LoadType.MAP else AfrTable.LoadType.TPS
+        val layout = Ms3TableDefinitions.AFR_TABLE_1
+        Logger.d(
+            TAG,
+            "Lendo MS3 AFR Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
+        )
+        val valuesData = readConfigChunk(
+            pageId = layout.metadata.page.toByte(),
+            offset = layout.metadata.offset,
+            length = layout.metadata.totalSize
+        )
+        val rpmAxisData = readConfigChunk(
+            pageId = layout.rpmAxis.tableId.toByte(),
+            offset = layout.rpmAxis.offset,
+            length = layout.rpmAxis.count * 2
+        )
+        val loadAxisData = readConfigChunk(
+            pageId = layout.loadAxis.tableId.toByte(),
+            offset = layout.loadAxis.offset,
+            length = layout.loadAxis.count * 2
+        )
+        return Ms3TableDefinitions.parseAfrTable(
+            valuesData = valuesData,
+            rpmAxisData = rpmAxisData,
+            loadAxisData = loadAxisData,
+            loadType = loadType
+        )
+    }
+
+    private suspend fun readMs2AfrTable(): AfrTable {
+        val loadType = if (isMapLoad()) AfrTable.LoadType.MAP else AfrTable.LoadType.TPS
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            megaSpeedIniCatalog?.let { catalog ->
+                Logger.d(TAG, "Lendo MegaSpeed AFR Table 1 via .ini (${formatPageId(catalog.afrTable.metadata.page)})...")
+                val valuesData = readConfigChunk(catalog.afrTable.metadata.page, catalog.afrTable.metadata.offset, catalog.afrTable.metadata.totalSize)
+                val rpmAxisData = readConfigChunk(catalog.afrTable.rpmAxis.pageId, catalog.afrTable.rpmAxis.offset, catalog.afrTable.rpmAxis.count * 2)
+                val loadAxisData = readConfigChunk(catalog.afrTable.loadAxis.pageId, catalog.afrTable.loadAxis.offset, catalog.afrTable.loadAxis.count * 2)
+                return MegaSpeedIniTableDefinitions.parseAfrTable(catalog.afrTable, valuesData, rpmAxisData, loadAxisData, loadType)
+            }
+        }
+        val layout = Ms2TableDefinitions.AFR_TABLE_1
+        Logger.d(
+            TAG,
+            "Lendo MS2 AFR Table 1 (table 0x${layout.metadata.page.toString(16).uppercase()}, ${layout.metadata.totalSize} bytes)..."
+        )
+        val valuesData = readConfigChunk(
+            pageId = layout.metadata.page.toByte(),
+            offset = layout.metadata.offset,
+            length = layout.metadata.totalSize
+        )
+        val rpmAxisData = readConfigChunk(
+            pageId = layout.rpmAxis.tableId.toByte(),
+            offset = layout.rpmAxis.offset,
+            length = layout.rpmAxis.count * 2
+        )
+        val loadAxisData = readConfigChunk(
+            pageId = layout.loadAxis.tableId.toByte(),
+            offset = layout.loadAxis.offset,
+            length = layout.loadAxis.count * 2
+        )
+        return Ms2TableDefinitions.parseAfrTable(
+            valuesData = valuesData,
+            rpmAxisData = rpmAxisData,
+            loadAxisData = loadAxisData,
+            loadType = loadType
+        )
+    }
+
+    private suspend fun readRusefiVeTable(): VeTable {
+        val loadType = if (isMapLoad()) VeTable.LoadType.MAP else VeTable.LoadType.TPS
+        drainInputBufferQuietly()
+        pendingRusefiVeTableReadback?.let { cached ->
+            pendingRusefiVeTableReadback = null
+            Logger.d(TAG, "Retornando rusEFI VE Table 1 em cache após write recente")
+            return cached
+        }
+        rusefiIniCatalog?.let { catalog ->
+            Logger.d(TAG, "Lendo rusEFI VE Table 1 via .ini (${formatPageId(catalog.veTable.metadata.page)})...")
+            val valuesData = readConfigChunk(catalog.veTable.metadata.page, catalog.veTable.metadata.offset, catalog.veTable.metadata.totalSize)
+            val rpmAxisData = readConfigChunk(catalog.veTable.rpmAxis.tableId, catalog.veTable.rpmAxis.offset, catalog.veTable.rpmAxis.count * 2)
+            val loadAxisData = readConfigChunk(catalog.veTable.loadAxis.tableId, catalog.veTable.loadAxis.offset, catalog.veTable.loadAxis.count * 2)
+            return RusefiTableDefinitions.parseVeTableWithLayout(catalog.veTable, valuesData, rpmAxisData, loadAxisData, loadType = loadType)
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        val layout = if (isF407Discovery) RusefiF407DiscoveryDefinitions.VE_TABLE_1 else RusefiTableDefinitions.VE_TABLE_1
+        Logger.d(TAG, "Lendo rusEFI VE Table 1 (${formatPageId(layout.metadata.page)})...")
+        val valuesData = readConfigChunk(layout.metadata.page, layout.metadata.offset, layout.metadata.totalSize)
+        val rpmAxisData = readConfigChunk(layout.rpmAxis.tableId, layout.rpmAxis.offset, layout.rpmAxis.count * 2)
+        val loadAxisData = readConfigChunk(layout.loadAxis.tableId, layout.loadAxis.offset, layout.loadAxis.count * 2)
+        return if (isF407Discovery) {
+            RusefiF407DiscoveryDefinitions.parseVeTable(valuesData, rpmAxisData, loadAxisData)
+        } else {
+            RusefiTableDefinitions.parseVeTable(valuesData, rpmAxisData, loadAxisData, loadType = loadType)
+        }
+    }
+
+    private suspend fun readRusefiIgnitionTable(): IgnitionTable {
+        val loadType = if (isMapLoad()) IgnitionTable.LoadType.MAP else IgnitionTable.LoadType.TPS
+        drainInputBufferQuietly()
+        pendingRusefiIgnitionTableReadback?.let { cached ->
+            pendingRusefiIgnitionTableReadback = null
+            Logger.d(TAG, "Retornando rusEFI Ignition Table 1 em cache após write recente")
+            return cached
+        }
+        rusefiIniCatalog?.let { catalog ->
+            Logger.d(TAG, "Lendo rusEFI Ignition Table 1 via .ini (${formatPageId(catalog.ignitionTable.metadata.page)})...")
+            val valuesData = readConfigChunk(catalog.ignitionTable.metadata.page, catalog.ignitionTable.metadata.offset, catalog.ignitionTable.metadata.totalSize)
+            val rpmAxisData = readConfigChunk(catalog.ignitionTable.rpmAxis.tableId, catalog.ignitionTable.rpmAxis.offset, catalog.ignitionTable.rpmAxis.count * 2)
+            val loadAxisData = readConfigChunk(catalog.ignitionTable.loadAxis.tableId, catalog.ignitionTable.loadAxis.offset, catalog.ignitionTable.loadAxis.count * 2)
+            return RusefiTableDefinitions.parseIgnitionTableWithLayout(catalog.ignitionTable, valuesData, rpmAxisData, loadAxisData, loadType = loadType)
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        val layout = if (isF407Discovery) RusefiF407DiscoveryDefinitions.IGNITION_TABLE_1 else RusefiTableDefinitions.IGNITION_TABLE_1
+        Logger.d(TAG, "Lendo rusEFI Ignition Table 1 (${formatPageId(layout.metadata.page)})...")
+        val valuesData = readConfigChunk(layout.metadata.page, layout.metadata.offset, layout.metadata.totalSize)
+        val rpmAxisData = readConfigChunk(layout.rpmAxis.tableId, layout.rpmAxis.offset, layout.rpmAxis.count * 2)
+        val loadAxisData = readConfigChunk(layout.loadAxis.tableId, layout.loadAxis.offset, layout.loadAxis.count * 2)
+        return if (isF407Discovery) {
+            RusefiF407DiscoveryDefinitions.parseIgnitionTable(valuesData, rpmAxisData, loadAxisData)
+        } else {
+            RusefiTableDefinitions.parseIgnitionTable(valuesData, rpmAxisData, loadAxisData, loadType = loadType)
+        }
+    }
+
+    private suspend fun readRusefiAfrTable(): AfrTable {
+        val loadType = if (isMapLoad()) AfrTable.LoadType.MAP else AfrTable.LoadType.TPS
+        drainInputBufferQuietly()
+        rusefiIniCatalog?.let { catalog ->
+            Logger.d(TAG, "Lendo rusEFI AFR Table 1 via .ini (${formatPageId(catalog.afrTable.metadata.page)})...")
+            val valuesData = readConfigChunk(catalog.afrTable.metadata.page, catalog.afrTable.metadata.offset, catalog.afrTable.metadata.totalSize)
+            val rpmAxisData = readConfigChunk(catalog.afrTable.rpmAxis.tableId, catalog.afrTable.rpmAxis.offset, catalog.afrTable.rpmAxis.count * 2)
+            val loadAxisData = readConfigChunk(catalog.afrTable.loadAxis.tableId, catalog.afrTable.loadAxis.offset, catalog.afrTable.loadAxis.count * 2)
+            return RusefiTableDefinitions.parseAfrTableWithLayout(catalog.afrTable, valuesData, rpmAxisData, loadAxisData, loadType = loadType)
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        val layout = if (isF407Discovery) RusefiF407DiscoveryDefinitions.AFR_TABLE_1 else RusefiTableDefinitions.AFR_TABLE_1
+        Logger.d(TAG, "Lendo rusEFI AFR Table 1 (${formatPageId(layout.metadata.page)})...")
+        val valuesData = readConfigChunk(layout.metadata.page, layout.metadata.offset, layout.metadata.totalSize)
+        val rpmAxisData = readConfigChunk(layout.rpmAxis.tableId, layout.rpmAxis.offset, layout.rpmAxis.count * 2)
+        val loadAxisData = readConfigChunk(layout.loadAxis.tableId, layout.loadAxis.offset, layout.loadAxis.count * 2)
+        return if (isF407Discovery) {
+            RusefiF407DiscoveryDefinitions.parseAfrTable(valuesData, rpmAxisData, loadAxisData)
+        } else {
+            RusefiTableDefinitions.parseAfrTable(valuesData, rpmAxisData, loadAxisData, loadType = loadType)
+        }
+    }
+
+    /**
+     * Grava AFR Target Table (Page 5 - offset 0, 304 bytes) + Burn
+     *
+     * Note: AFR Table doesn't require as strict validation as Ignition,
+     * but extreme values (too rich/lean) will generate warnings.
+     *
+     * @param afrTable AFR Target Table to write
+     * @throws IllegalStateException if not connected
+     */
+    override suspend fun writeAfrTable(afrTable: AfrTable) {
+        ensureWritable("writeAfrTable")
+        if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            writeMs2AfrTable(afrTable)
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.MS3) {
+            writeMs3AfrTable(afrTable)
+            return
+        }
+        if (firmwareInfo?.family == EcuFamily.RUSEFI) {
+            writeRusefiAfrTable(afrTable)
+            return
+        }
+        val defs = tableDefinitions
+            ?: throw IllegalStateException("Not connected! Call connect() first.")
+
+        val metadata = defs.afrTable
+
+        Logger.d(TAG, "Gravando AFR Table (Page ${metadata.page})...")
+
+        val pageData = TableDomainFacade.prepareAfrWrite(metadata, afrTable).data
+        Logger.d(TAG, "AFR Table serializada: ${pageData.size} bytes")
+
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+
+        // Grava em chunks e confere por read-back; só faz burn se a RAM bater com a tabela.
+        writeSpeeduinoTableVerified(metadata.page, metadata.offset, pageData, "AFR Table")
+        Logger.d(TAG, "AFR Table gravada e conferida na Page ${metadata.page}")
+
+        // Burn to EEPROM
+        protocol.burnConfig()
+        Logger.d(TAG, "✅ Burn executado com sucesso!")
+    }
+
+    // ---- Escrita verificada de tabelas MS2/MS3/MegaSpeed/rusEFI --------------------------------------------------
+
+    private class TableRegion(val tableId: Int, val offset: Int, val data: ByteArray)
+
+    /**
+     * [verifyOnly]: índices (no dado concatenado) que o read-back deve conferir. `null` = todos.
+     * Usado em páginas de configuração inteiras, onde a ECU pode recalcular campos que não
+     * fazem parte da alteração (conferir tudo geraria falso erro).
+     */
+    private class TableRegions(
+        val list: List<TableRegion>,
+        val burnTableIds: Set<Int>,
+        val verifyOnly: Set<Int>? = null,
+    )
+
+    private fun SerializedMs2Table.toRegions() = TableRegions(
+        listOf(
+            TableRegion(valuesTableId, valuesOffset, valuesData),
+            TableRegion(rpmAxisTableId, rpmAxisOffset, rpmAxisData),
+            TableRegion(loadAxisTableId, loadAxisOffset, loadAxisData),
+        ),
+        burnTableIds,
+    )
+
+    private fun SerializedMs3Table.toRegions() = TableRegions(
+        listOf(
+            TableRegion(valuesTableId, valuesOffset, valuesData),
+            TableRegion(rpmAxisTableId, rpmAxisOffset, rpmAxisData),
+            TableRegion(loadAxisTableId, loadAxisOffset, loadAxisData),
+        ),
+        burnTableIds,
+    )
+
+    private fun SerializedRusefiTable.toRegions() = TableRegions(
+        listOf(
+            TableRegion(valuesTableId, valuesOffset, valuesData),
+            TableRegion(rpmAxisTableId, rpmAxisOffset, rpmAxisData),
+            TableRegion(loadAxisTableId, loadAxisOffset, loadAxisData),
+        ),
+        burnTableIds,
+    )
+
+    private suspend fun writeMsTableVerified(regions: TableRegions, label: String) =
+        writeRegionsVerified(
+            regions = regions,
+            label = label,
+            write = { protocol.writeTable(it.tableId.toByte(), it.offset, it.data) },
+            burn = { protocol.burnTable(it.toByte()) },
+        )
+
+    private suspend fun writeRusefiTableVerified(regions: TableRegions, label: String) =
+        writeRegionsVerified(
+            regions = regions,
+            label = label,
+            write = { protocol.writeTable(it.tableId, it.offset, it.data, EcuFamily.RUSEFI) },
+            burn = { burnTableIfSupported(it, EcuFamily.RUSEFI) },
+        )
+
+    /**
+     * Mesma garantia do Speeduino para as demais famílias: grava as regiões da tabela (valores e
+     * eixos), confere por read-back antes do burn e, se a RAM não confirmar após regravar, devolve
+     * as regiões ao valor anterior (sem burn) e lança [PageWriteVerificationException].
+     */
+    private suspend fun writeRegionsVerified(
+        regions: TableRegions,
+        label: String,
+        write: suspend (TableRegion) -> Unit,
+        burn: suspend (Int) -> Unit,
+    ) {
+        val originals = captureRegions(regions)
+        var mismatches: List<Int> = emptyList()
+        var lastError: Exception? = null
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        val expected = regions.list.fold(ByteArray(0)) { acc, r -> acc + r.data }
+        for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
+            var writeError: Exception? = null
+            try {
+                regions.list.forEach { write(it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                writeError = e
+                Logger.w(TAG, "$label: escrita falhou no passe $pass: ${e.message}")
+            }
+            delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+            runCatching { connection.clearInputBuffer() }
+            var readError: Exception? = null
+            val actual = try {
+                regions.list.fold(ByteArray(0)) { acc, r -> acc + readConfigChunk(r.tableId, r.offset, r.data.size) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                readError = e
+                null
+            }
+            lastError = readError ?: writeError
+            val checked = regions.verifyOnly?.sorted() ?: expected.indices.toList()
+            mismatches = if (actual == null) {
+                checked
+            } else {
+                checked.filter { it >= actual.size || actual[it] != expected[it] }
+            }
+            if (mismatches.isEmpty() && readError == null) {
+                if (writeError != null) {
+                    Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${writeError.message})")
+                }
+                anomalies.forEach { event ->
+                    runCatching { pageWriteAnomalyListener?.invoke(event.copy(recovered = true)) }
+                }
+                delay(300)
+                regions.burnTableIds.sorted().forEach { burn(it) }
+                return
+            }
+            val shown = mismatches.take(16)
+            anomalies += PageWriteAnomaly(
+                pageId = regions.list.first().tableId,
+                label = label,
+                pass = pass,
+                mismatchedOffsets = mismatches,
+                expected = shown.map { expected[it].toInt() and 0xFF },
+                actual = shown.map { actual?.getOrNull(it)?.toInt()?.and(0xFF) ?: -1 },
+                writeErrorMessage = lastError?.message,
+                writeResponseCode = (writeError as? EcuProtocol.PageWriteRejectedException)?.responseCode,
+                recovered = false,
+            )
+            Logger.w(TAG, "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass; regravando")
+        }
+        val rolledBack = originals != null && rollbackRegions(regions, originals, write, label)
+        anomalies.forEach { event -> runCatching { pageWriteAnomalyListener?.invoke(event) } }
+        throw PageWriteVerificationException(
+            pageId = regions.list.first().tableId,
+            label = label,
+            mismatchedOffsets = mismatches,
+            cause = lastError,
+            rolledBack = rolledBack,
+        )
+    }
+
+    private suspend fun captureRegions(regions: TableRegions): List<ByteArray>? = try {
+        regions.list.map { readConfigChunk(it.tableId, it.offset, it.data.size) }
+            .takeIf { read -> read.indices.all { read[it].size == regions.list[it].data.size } }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Logger.w(TAG, "Regiões anteriores ilegíveis; sem rollback automático: ${e.message}")
+        null
+    }
+
+    private suspend fun rollbackRegions(
+        regions: TableRegions,
+        originals: List<ByteArray>,
+        write: suspend (TableRegion) -> Unit,
+        label: String,
+    ): Boolean = try {
+        Logger.w(TAG, "$label: gravação não confirmada; restaurando o valor anterior na RAM")
+        regions.list.forEachIndexed { i, r -> write(TableRegion(r.tableId, r.offset, originals[i])) }
+        delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS)
+        runCatching { connection.clearInputBuffer() }
+        val restored = regions.list.indices.all { i ->
+            val r = regions.list[i]
+            readConfigChunk(r.tableId, r.offset, originals[i].size).contentEquals(originals[i])
+        }
+        Logger.w(TAG, "$label: rollback ${if (restored) "confirmado" else "NÃO confirmado"}")
+        restored
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Logger.w(TAG, "$label: rollback falhou: ${e.message}")
+        false
+    }
+
+    private suspend fun writeMs3VeTable(veTable: VeTable) {
+        val validationResult = TableValidator(Ms3TableDefinitions.VE_TABLE_1.metadata)
+            .validateBeforeWrite(veTable)
+        if (!validationResult.isValid) {
+            throw ValidationException(validationResult)
+        }
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
+
+        val serialized = Ms3TableDefinitions.serializeVeTable(veTable)
+        writeMsTableVerified(serialized.toRegions(), "MS3 VE Table 1")
+        Logger.d(TAG, "✅ MS3 VE Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeMs2VeTable(veTable: VeTable) {
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            megaSpeedIniCatalog?.let { catalog ->
+                val validationResult = TableValidator(catalog.veTable.metadata).validateBeforeWrite(veTable)
+                if (!validationResult.isValid) {
+                    throw ValidationException(validationResult)
+                }
+                confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
+                val serialized = MegaSpeedIniTableDefinitions.serializeVeTable(catalog.veTable, veTable)
+                writeMsTableVerified(serialized.toRegions(), "MegaSpeed VE Table 1")
+                Logger.d(TAG, "✅ MegaSpeed VE Table 1 gravada via .ini e burn executado")
+                return
+            }
+        }
+        val validationResult = TableValidator(Ms2TableDefinitions.VE_TABLE_1.metadata)
+            .validateBeforeWrite(veTable)
+        if (!validationResult.isValid) {
+            throw ValidationException(validationResult)
+        }
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
+
+        val serialized = Ms2TableDefinitions.serializeVeTable(veTable)
+        writeMsTableVerified(serialized.toRegions(), "MS2 VE Table 1")
+        Logger.d(TAG, "✅ MS2 VE Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeMs3IgnitionTable(ignitionTable: IgnitionTable) {
+        val validationResult = TableValidator(Ms3TableDefinitions.IGNITION_TABLE_1.metadata)
+            .validateBeforeWrite(ignitionTable)
+        if (!validationResult.isValid) {
+            throw ValidationException(validationResult)
+        }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+
+        val serialized = Ms3TableDefinitions.serializeIgnitionTable(ignitionTable)
+        writeMsTableVerified(serialized.toRegions(), "MS3 Ignition Table 1")
+        Logger.d(TAG, "✅ MS3 Ignition Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeMs2IgnitionTable(ignitionTable: IgnitionTable) {
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            megaSpeedIniCatalog?.let { catalog ->
+                val validationResult = TableValidator(catalog.ignitionTable.metadata).validateBeforeWrite(ignitionTable)
+                if (!validationResult.isValid) {
+                    throw ValidationException(validationResult)
+                }
+                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+                val serialized = MegaSpeedIniTableDefinitions.serializeIgnitionTable(catalog.ignitionTable, ignitionTable)
+                writeMsTableVerified(serialized.toRegions(), "MegaSpeed Ignition Table 1")
+                Logger.d(TAG, "✅ MegaSpeed Ignition Table 1 gravada via .ini e burn executado")
+                return
+            }
+        }
+        val validationResult = TableValidator(Ms2TableDefinitions.IGNITION_TABLE_1.metadata)
+            .validateBeforeWrite(ignitionTable)
+        if (!validationResult.isValid) {
+            throw ValidationException(validationResult)
+        }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+
+        val serialized = Ms2TableDefinitions.serializeIgnitionTable(ignitionTable)
+        writeMsTableVerified(serialized.toRegions(), "MS2 Ignition Table 1")
+        Logger.d(TAG, "✅ MS2 Ignition Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeMs3AfrTable(afrTable: AfrTable) {
+        ConfigValidator.requireValid(TableValidator(Ms3TableDefinitions.AFR_TABLE_1.metadata).validateBeforeWrite(afrTable))
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+        val serialized = Ms3TableDefinitions.serializeAfrTable(afrTable)
+        writeMsTableVerified(serialized.toRegions(), "MS3 AFR Table 1")
+        Logger.d(TAG, "✅ MS3 AFR Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeMs2AfrTable(afrTable: AfrTable) {
+        if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
+            megaSpeedIniCatalog?.let { catalog ->
+                ConfigValidator.requireValid(TableValidator(catalog.afrTable.metadata).validateBeforeWrite(afrTable))
+                confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+                val serialized = MegaSpeedIniTableDefinitions.serializeAfrTable(catalog.afrTable, afrTable)
+                writeMsTableVerified(serialized.toRegions(), "MegaSpeed AFR Table 1")
+                Logger.d(TAG, "✅ MegaSpeed AFR Table 1 gravada via .ini e burn executado")
+                return
+            }
+        }
+        ConfigValidator.requireValid(TableValidator(Ms2TableDefinitions.AFR_TABLE_1.metadata).validateBeforeWrite(afrTable))
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+        val serialized = Ms2TableDefinitions.serializeAfrTable(afrTable)
+        writeMsTableVerified(serialized.toRegions(), "MS2 AFR Table 1")
+        Logger.d(TAG, "✅ MS2 AFR Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeRusefiVeTable(veTable: VeTable) {
+        rusefiIniCatalog?.let { catalog ->
+            val validationResult = TableValidator(catalog.veTable.metadata).validateBeforeWrite(veTable)
+            if (!validationResult.isValid) {
+                throw ValidationException(validationResult)
+            }
+            confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
+            val serialized = RusefiTableDefinitions.serializeVeTableWithLayout(
+                layout = catalog.veTable,
+                table = veTable,
+                signedValues = false,
+                valueScale = 10,
+            )
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI VE Table 1")
+        pendingRusefiVeTableReadback = veTable.copy()
+        Logger.d(TAG, "✅ rusEFI VE Table 1 gravada via .ini e burn executado")
+        return
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        val metadata = if (isF407Discovery) RusefiF407DiscoveryDefinitions.VE_TABLE_1.metadata else RusefiTableDefinitions.VE_TABLE_1.metadata
+        val validationResult = TableValidator(metadata)
+            .validateBeforeWrite(veTable)
+        if (!validationResult.isValid) {
+            throw ValidationException(validationResult)
+        }
+        confirmTableChange(TableChangeKind.VE, veTable.values) { readVeTable(1).values }
+
+        val serialized = if (isF407Discovery) {
+            RusefiF407DiscoveryDefinitions.serializeVeTable(veTable)
+        } else {
+            RusefiTableDefinitions.serializeVeTable(veTable)
+        }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI VE Table 1")
+        pendingRusefiVeTableReadback = veTable.copy()
+        Logger.d(TAG, "✅ rusEFI VE Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeRusefiIgnitionTable(ignitionTable: IgnitionTable) {
+        rusefiIniCatalog?.let { catalog ->
+            val validationResult = TableValidator(catalog.ignitionTable.metadata).validateBeforeWrite(ignitionTable)
+            if (!validationResult.isValid) {
+                throw ValidationException(validationResult)
+            }
+            confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+            val serialized = RusefiTableDefinitions.serializeIgnitionTableWithLayout(catalog.ignitionTable, ignitionTable)
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI Ignition Table 1")
+        pendingRusefiIgnitionTableReadback = ignitionTable.copy()
+        Logger.d(TAG, "✅ rusEFI Ignition Table 1 gravada via .ini e burn executado")
+        return
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        val metadata = if (isF407Discovery) RusefiF407DiscoveryDefinitions.IGNITION_TABLE_1.metadata else RusefiTableDefinitions.IGNITION_TABLE_1.metadata
+        val validationResult = TableValidator(metadata)
+            .validateBeforeWrite(ignitionTable)
+        if (!validationResult.isValid) {
+            throw ValidationException(validationResult)
+        }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+
+        val serialized = if (isF407Discovery) {
+            RusefiF407DiscoveryDefinitions.serializeIgnitionTable(ignitionTable)
+        } else {
+            RusefiTableDefinitions.serializeIgnitionTable(ignitionTable)
+        }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI Ignition Table 1")
+        pendingRusefiIgnitionTableReadback = ignitionTable.copy()
+        Logger.d(TAG, "✅ rusEFI Ignition Table 1 gravada e burn executado")
+    }
+
+    private suspend fun writeRusefiAfrTable(afrTable: AfrTable) {
+        rusefiIniCatalog?.let { catalog ->
+            ConfigValidator.requireValid(TableValidator(catalog.afrTable.metadata).validateBeforeWrite(afrTable))
+            confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+            val serialized = RusefiTableDefinitions.serializeAfrTableWithLayout(catalog.afrTable, afrTable)
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI AFR Table 1")
+        Logger.d(TAG, "✅ rusEFI AFR Table 1 gravada via .ini e burn executado")
+        return
+        }
+        val schemaId = ecuDefinition?.runtime?.schemaId ?: "rusefi-main"
+        val isF407Discovery = schemaId == "rusefi-f407-discovery"
+        ConfigValidator.requireValid(TableValidator((if (isF407Discovery) RusefiF407DiscoveryDefinitions.AFR_TABLE_1.metadata else RusefiTableDefinitions.AFR_TABLE_1.metadata)).validateBeforeWrite(afrTable))
+        confirmTableChange(TableChangeKind.AFR, afrTable.values) { readAfrTable().values }
+        val serialized = if (isF407Discovery) {
+            RusefiF407DiscoveryDefinitions.serializeAfrTable(afrTable)
+        } else {
+            RusefiTableDefinitions.serializeAfrTable(afrTable)
+        }
+        writeRusefiTableVerified(serialized.toRegions(), "rusEFI AFR Table 1")
+        Logger.d(TAG, "✅ rusEFI AFR Table 1 gravada e burn executado")
+    }
+
+    /**
+     * Lê dados em tempo real
+     * Em conexões legacy-first (USB/Bluetooth), tenta Legacy primeiro e Modern como fallback.
+     * Nas demais, tenta Modern primeiro e faz fallback para Legacy.
+     */
+    suspend fun readLiveData(): EcuLiveData = withContext(Dispatchers.IO) {
+        val ecuFamily = firmwareInfo?.family ?: EcuFamily.UNKNOWN
+        val outputSize = ecuDefinition?.runtime?.liveDataBlockSize
+            ?: ecuDefinition?.runtime?.blockSize
+            ?: tableDefinitions?.ochBlockSize
+            ?: 0
+        val isModernEra = firmwareInfo?.era?.isModern() == true
+        // Firmware com envelope (202201+) não entende comando legacy solto: 'A' é lido como o
+        // byte alto de um comprimento, e a ECU trava esperando um payload gigante. Nesses casos
+        // o live data é modern, em qualquer transporte, e nunca tenta legacy primeiro.
+        val usesModernEnvelope = firmwareInfo?.era?.usesModernEnvelope() == true
+        val canTryModern = ecuFamily == EcuFamily.SPEEDUINO &&
+            (
+                usesModernEnvelope ||
+                    connection.supportsModernProtocol() ||
+                    connection.supportsModernProtocolFallback()
+                ) &&
+            outputSize > 0 &&
+            isModernEra
+        val preferLegacyFirst = connection.prefersLegacyProtocol() && !usesModernEnvelope
+        var usedModernRead = false
+
+        val data = if (ecuFamily == EcuFamily.RUSEFI) {
+            try {
+                drainInputBufferQuietly()
+                protocol.readRusefiOutputChannels(outputSize)
+            } catch (e: Exception) {
+                if (connection.isConnected()) {
+                    connection.clearInputBuffer()
+                }
+                throw e
+            }
+        } else if (canTryModern && preferLegacyFirst) {
+            try {
+                protocol.readLiveData(outputSize.takeIf { it > 0 } ?: 128)
+            } catch (legacyError: Exception) {
+                if (shouldSkipLiveDataFallback(legacyError)) {
+                    throw legacyError
+                }
+                if (isRecoverableLiveDataTimeout(legacyError)) {
+                    throw legacyError
+                }
+                if (!connection.isConnected()) {
+                    Logger.e(TAG, "Conexão perdida durante fallback para modern live data")
+                    throw Exception("Não conectado")
+                }
+
+                Logger.w(TAG, "Legacy live data falhou, tentando modern fallback: ${legacyError.message}")
+                connection.clearInputBuffer()
+                val maxAttempts = 2
+                var attempt = 0
+                var modernData: ByteArray? = null
+                var lastModernError: Exception? = null
+
+                while (attempt < maxAttempts && modernData == null) {
+                    attempt++
+                    try {
+                        modernData = protocol.readLiveDataModern(outputSize)
+                        usedModernRead = true
+                    } catch (modernError: Exception) {
+                        lastModernError = modernError
+                        Logger.w(TAG, "Modern fallback falhou (tentativa $attempt/$maxAttempts): ${modernError.message}")
+                        if (attempt < maxAttempts) {
+                            connection.clearInputBuffer()
+                            delay(liveDataRetryDelayMs(modernError))
+                        }
+                    }
+                }
+
+                modernData ?: throw Exception(
+                    "Legacy live data falhou (${legacyError.message}); modern fallback também falhou (${lastModernError?.message})"
+                )
+            }
+        } else if (canTryModern) {
+            var lastError: Exception? = null
+            val maxAttempts = 2
+            var attempt = 0
+            var modernData: ByteArray? = null
+
+            while (attempt < maxAttempts && modernData == null) {
+                attempt++
+                try {
+                    // ✅ Tenta Modern Protocol primeiro (Speeduino 2020+)
+                    modernData = protocol.readLiveDataModern(outputSize)
+                    usedModernRead = true
+                } catch (e: Exception) {
+                    if (shouldSkipLiveDataFallback(e)) {
+                        throw e
+                    }
+                    if (!connection.isConnected()) {
+                        Logger.e(TAG, "Conexão perdida durante leitura de live data")
+                        throw Exception("Não conectado")
+                    }
+
+                    lastError = e
+                    Logger.w(TAG, "Modern Protocol falhou (tentativa $attempt/$maxAttempts): ${e.message}")
+                    connection.clearInputBuffer()
+                    if (attempt < maxAttempts) {
+                        delay(liveDataRetryDelayMs(e))
+                    }
+                }
+            }
+
+            if (modernData == null && usesModernEnvelope) {
+                // Nunca cair para legacy num firmware com envelope: o 'A' solto seria lido como
+                // byte alto de um comprimento e deixaria a ECU presa esperando payload.
+                throw lastError ?: Exception("Modern live data falhou após $maxAttempts tentativas")
+            } else if (modernData == null) {
+                Logger.w(TAG, "Modern Protocol falhou após $maxAttempts tentativas, tentando Legacy: ${lastError?.message}")
+                // ⚠️ Fallback para Legacy Protocol (versões antigas)
+                protocol.readLiveData(outputSize.takeIf { it > 0 } ?: 128)
+            } else {
+                modernData
+            }
+        } else {
+            protocol.readLiveData(outputSize.takeIf { it > 0 } ?: 128)
+        }
+
+        if (outputSize > 0 && data.size != outputSize) {
+            val mode = if (canTryModern) "modern_or_fallback" else "legacy"
+            val message = "oc_mismatch family=${ecuFamily.name} mode=$mode expected=$outputSize actual=${data.size}"
+            Logger.w(TAG, "⚠ $message")
+            ConnectionTrace.info("live_data", message)
+        }
+
+        val isModernData = usedModernRead && data.size == outputSize
+        // When legacy command returns exactly ochBlockSize bytes for a known modern-era ECU,
+        // the data is still the modern OCH block — use the modern parser (not fromLegacyFrame).
+        val isModernFrameBySize = !usedModernRead &&
+            isModernEra &&
+            ecuFamily == EcuFamily.SPEEDUINO &&
+            outputSize > 0 &&
+            data.size == outputSize
+        if (isModernFrameBySize) {
+            ConnectionTrace.info("live_data", "legacy command returned modern-sized frame; using modern parser (size=$outputSize)")
+        }
+        val liveData = when {
+            ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE -> {
+                EcuLiveDataParser.fromLegacyFrame(data)
+            }
+            ecuFamily == EcuFamily.RUSEFI && data.size >= outputSize && outputSize > 0 -> {
+                RusefiLiveDataParser.fromOutputChannels(data)
+            }
+            (ecuFamily == EcuFamily.MS2 || ecuFamily == EcuFamily.MEGASPEED) && data.size >= outputSize && outputSize > 0 -> {
+                Ms2LiveDataParser.fromOutputChannels(data)
+            }
+            ecuFamily == EcuFamily.MS3 && data.size >= outputSize && outputSize > 0 -> {
+                Ms3LiveDataParser.fromOutputChannels(data)
+            }
+            isModernData || isModernFrameBySize -> {
+                parseOutputChannelsWithFallback(data)
+            }
+            else -> {
+                EcuLiveDataParser.fromLegacyFrame(data)
+            }
+        }
+        logLiveDataSample(data, liveData, isModernData || isModernFrameBySize)
+        liveData
+    }
+
+    // ==================== Live Data Streaming ====================
+
+    /**
+     * Inicia stream contínuo de dados em tempo real
+     */
+    override fun startLiveDataStream(intervalMs: Long) {
+        if (_isStreaming) {
+            Logger.w(TAG, "Stream já está ativo, ignorando nova requisição")
+            return
+        }
+
+        exclusiveAccessReason?.let { reason ->
+            Logger.w(TAG, "Live data stream bloqueado: acesso exclusivo ativo ($reason)")
+            return
+        }
+
+        if (firmwareInfo?.capabilities?.supportsLiveData == false) {
+            Logger.w(TAG, "Live data não suportado para ${firmwareInfo?.family}")
+            return
+        }
+
+        Logger.d(TAG, "Iniciando live data stream (intervalo: ${intervalMs}ms)")
+
+        // Cancelar job anterior se existir
+        streamJob?.cancel()
+        _isStreaming = true
+        liveDataStreamStopRequested = false
+        lastLiveDataStreamStartedAtMs = MonotonicClock.nowMillis()
+        consecutiveFaultyLiveDataSamples = 0
+        pendingLiveDataRecoveryReason = null
+
+        streamJob = scope.launch {
+            val intervalNs = intervalMs.coerceAtLeast(1L) * 1_000_000L
+            var nextTickNs = MonotonicClock.nowNanos()
+            var packetCount = 0
+            var recoverableReadTimeouts = 0
+            var restartReason: String? = null
+            while (_isStreaming && connection.isConnected()) {
+                try {
+                    // Se uma operação crítica detém o canal, o stream cede a vez neste ciclo.
+                    val liveData = withEcuIoOrNull { readLiveData() } ?: run {
+                        delay(intervalMs)
+                        continue
+                    }
+                    recoverableReadTimeouts = 0
+                    onDataReceived(liveData)
+                    packetCount++
+
+                    consumePendingLiveDataRecoveryReason()?.let { reason ->
+                        restartReason = reason
+                        Logger.w(TAG, "Reiniciando stream após amostras inválidas: $reason")
+                        ConnectionTrace.info("live_data", "recovering stream after $reason")
+                        connection.clearInputBuffer()
+                        break
+                    }
+
+                    // Log a cada 50 pacotes (~5 segundos com intervalo de 100ms)
+                    if (packetCount % 50 == 0) {
+                        Logger.d(TAG, "Stream ativo: $packetCount pacotes recebidos (RPM: ${liveData.rpm})")
+                    }
+
+                    nextTickNs += intervalNs
+                    val remainingNs = nextTickNs - MonotonicClock.nowNanos()
+                    if (remainingNs > 0L) {
+                        delay(remainingNs / 1_000_000L)
+                    } else {
+                        // Se a leitura ficou mais lenta que o alvo, realinha o relógio sem acumular
+                        // drift — mas sempre respeitando um gap mínimo, para nunca emitir comandos
+                        // colados uns nos outros num transporte lento.
+                        val gapMs = LIVE_STREAM_MIN_COMMAND_GAP_MS.coerceAtMost(intervalMs)
+                        delay(gapMs)
+                        nextTickNs = MonotonicClock.nowNanos()
+                    }
+                } catch (_: CancellationException) {
+                    // Stream cancelado por troca de fluxo (pause/restart/disconnect).
+                    // Isso não é erro de protocolo/transporte.
+                    break
+                } catch (e: Exception) {
+                    val isLinkDesync = isLiveDataLinkDesync(e)
+                    val isRecoverableLiveTimeout =
+                        _isStreaming &&
+                            connection.isConnected() &&
+                            (isRecoverableLiveDataTimeout(e) || isLinkDesync)
+                    if (isRecoverableLiveTimeout) {
+                        recoverableReadTimeouts++
+                        val kind = if (isLinkDesync) "recoverable_desync" else "recoverable_timeout"
+                        ConnectionTrace.info(
+                            "live_data",
+                            "$kind attempt=$recoverableReadTimeouts message=${e.message ?: "unknown"}"
+                        )
+                        Logger.w(
+                            TAG,
+                            "Falha recuperável no stream ($kind ${recoverableReadTimeouts}/${LIVE_STREAM_RECOVERABLE_TIMEOUT_LIMIT}): ${e.message}"
+                        )
+                        connection.clearInputBuffer()
+
+                        if (recoverableReadTimeouts < LIVE_STREAM_RECOVERABLE_TIMEOUT_LIMIT) {
+                            delay(maxOf(intervalMs.coerceAtLeast(25L), liveDataRetryDelayMs(e)))
+                            continue
+                        }
+
+                        Logger.e(
+                            TAG,
+                            "Falha no stream após $recoverableReadTimeouts falhas recuperáveis consecutivas"
+                        )
+                    }
+
+                    if (_isStreaming) { // Only report error if still streaming
+                        Logger.e(TAG, "Erro no stream: ${e.message}", e)
+                        if (packetCount == 0) {
+                            ConnectionTrace.error(
+                                "live_data",
+                                "stream_failed_before_first_packet message=${e.message ?: "unknown"}",
+                                e
+                            )
+                        }
+                        // Dessincronização persistente depois que o mesmo comando já tinha sido
+                        // aceito neste stream = link ruidoso (bytes perdidos/corrompidos no BT/serial),
+                        // não CRC calculado errado pelo app. Sem nenhum pacote válido, mantém a
+                        // mensagem crua: aí 0x82 pode ser defeito real de framing e deve ser reportado.
+                        val linkDesyncAfterHealthyStream = isLinkDesync && packetCount > 0
+                        val streamErrorMessage = if (linkDesyncAfterHealthyStream) {
+                            buildLinkDesyncStreamErrorMessage(recoverableReadTimeouts, e)
+                        } else {
+                            "Erro no stream: ${e.message}"
+                        }
+                        onError(streamErrorMessage)
+
+                        if (!connection.isConnected()) {
+                            Logger.w(TAG, "🔴 Conexão perdida detectada durante stream")
+                        } else if (
+                            (linkDesyncAfterHealthyStream && !liveDataStreamStopRequested) ||
+                                shouldDisconnectAfterStreamFailure(e)
+                        ) {
+                            Logger.w(
+                                TAG,
+                                "🔴 Stream falhou com socket ainda marcado como conectado; forçando disconnect"
+                            )
+                            disconnect()
+                        }
+                    }
+                    break
+                }
+            }
+            Logger.d(TAG, "Stream finalizado (total: $packetCount pacotes)")
+            _isStreaming = false
+            if (streamJob === coroutineContext[Job]) {
+                streamJob = null
+            }
+            if (restartReason != null && connection.isConnected()) {
+                delay(150)
+                startLiveDataStream(intervalMs)
+            }
+        }
+    }
+
+    // internal (não private) para permitir teste direto da classificação de erro, que decide
+    // se o stream apenas repete o comando legacy ou escala para um caminho mais agressivo.
+    internal fun isRecoverableLiveDataTimeout(error: Exception): Boolean {
+        val message = error.message ?: return false
+        if (message.startsWith("Timeout: no data received")) {
+            return true
+        }
+        // Resposta truncada é o caso comum num link Bluetooth ruidoso e tem o mesmo tratamento
+        // de um timeout parcial: limpar o buffer e repetir o comando legacy. Sem isso o erro
+        // escalava para o fallback modern, que não é seguro por aqui (ver canAttemptModernLiveData).
+        if (INCOMPLETE_LIVE_DATA_REGEX.containsMatchIn(message)) {
+            return true
+        }
+        // response code 0x80 = SERIAL_RC_TIMEOUT: a ECU não conseguiu montar a resposta a
+        // tempo (ocupada processando outro pedido). Os caminhos de write/burn já tratam 0x80
+        // como "sem ACK explícito"/sucesso (ver EcuProtocol writeConfigPage/burnConfig);
+        // o read de live data devia ter a mesma leniência em vez de escalar como erro de
+        // protocolo (era a causa dos non-fatals repetidos "response code = 0x80" no Crashlytics).
+        if (message.contains("response code = 0x80", ignoreCase = true)) {
+            return true
+        }
+        val match = PARTIAL_TIMEOUT_REGEX.find(message) ?: return false
+        val received = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return false
+        return received >= 0
+    }
+
+    /**
+     * response code 0x82 = SERIAL_RC_CRC_ERR: a ECU recebeu um frame cujo CRC não bate. O frame
+     * que o app envia é sempre byte-a-byte o mesmo (e é aceito nos ciclos vizinhos), então isso
+     * indica bytes perdidos/corrompidos no caminho ou restos de um frame anterior no buffer da
+     * ECU - condição de link, recuperável esperando a ECU descartar o frame parcial.
+     */
+    internal fun isLiveDataLinkDesync(error: Exception): Boolean =
+        error.message?.contains(LIVE_DATA_CRC_ERR_RESPONSE, ignoreCase = true) == true
+
+    internal fun liveDataRetryDelayMs(error: Exception): Long =
+        if (isLiveDataLinkDesync(error)) LIVE_DATA_DESYNC_RESYNC_DELAY_MS else 25L
+
+    internal fun buildLinkDesyncStreamErrorMessage(attempts: Int, error: Exception): String =
+        "Erro no stream: comunicação instável com a ECU, dados corrompidos no link " +
+            "($LIVE_DATA_LINK_DESYNC_MARKER attempts=$attempts: ${error.message}); reconectando"
+
+    private fun shouldDisconnectAfterStreamFailure(error: Exception): Boolean {
+        if (!connection.isConnected() || liveDataStreamStopRequested) {
+            return false
+        }
+
+        var current: Throwable? = error
+        while (current != null) {
+            val message = current.message.orEmpty()
+            if (
+                message.startsWith("Timeout:", ignoreCase = true) ||
+                message.contains("Read timed out", ignoreCase = true) ||
+                message.contains("Conexão encerrada pelo remoto", ignoreCase = true) ||
+                message.contains("Connection reset", ignoreCase = true) ||
+                message.contains("Broken pipe", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    /**
+     * Para stream de dados
+     */
+    override fun stopLiveDataStream() {
+        Logger.d(TAG, "Parando live data stream...")
+        liveDataStreamStopRequested = true
+        _isStreaming = false
+        pendingLiveDataRecoveryReason = null
+        connection.abortPendingRead()
+        streamJob?.cancel()
+        streamJob = null
+    }
+
+    private suspend fun resolveEngineConstantsOrNull(): EngineConstants? {
+        return cachedEngineConstants ?: run {
+            try {
+                readEngineConstants()
+            } catch (e: Exception) {
+                Logger.w(TAG, "NÇœo foi possÇðvel ler Engine Constants para detectar loadType: ${e.message}")
+                null
+            }
+        }
+    }
+
+    override suspend fun readMapSelectionSupport(): MapSelectionSupport {
+        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
+            return MapSelectionSupport()
+        }
+        if (activeIniDefinition == null) {
+            return MapSelectionSupport()
+        }
+
+        val veMaps = mutableListOf(1)
+        val ignitionMaps = mutableListOf(1)
+
+        for (index in 2..4) {
+            val veTableExists = findIniFieldByName("veTable$index") != null
+            val veMode = readIniFieldNumericValue("fuel${index}Mode")
+            if (veTableExists && (veMode ?: 0) > 0) {
+                veMaps += index
+            }
+
+            val ignTableExists = findIniFieldByName("advTable$index") != null
+            val ignMode = readIniFieldNumericValue("spark${index}Mode")
+            if (ignTableExists && (ignMode ?: 0) > 0) {
+                ignitionMaps += index
+            }
+        }
+
+        return MapSelectionSupport(
+            veMapIndices = veMaps.distinct().sorted(),
+            ignitionMapIndices = ignitionMaps.distinct().sorted(),
+        )
+    }
+
+    private suspend fun resolveVeLoadType(mapIndex: Int = 1): VeTable.LoadType {
+        val engineConstants = resolveEngineConstantsOrNull()
+        if (mapIndex > 1) {
+            val algorithmBits = readIniFieldNumericValue("fuel${mapIndex}Algorithm")
+            return TableDomainFacade.resolveVeLoadType(engineConstants, algorithmBits)
+        }
+        return TableDomainFacade.resolveVeLoadType(engineConstants)
+    }
+
+    private suspend fun resolveIgnitionLoadType(mapIndex: Int = 1): IgnitionTable.LoadType {
+        val engineConstants = resolveEngineConstantsOrNull()
+        if (mapIndex > 1) {
+            val algorithmBits = readIniFieldNumericValue("spark${mapIndex}Algorithm")
+            return TableDomainFacade.resolveIgnitionLoadType(engineConstants, algorithmBits)
+        }
+        return TableDomainFacade.resolveIgnitionLoadType(engineConstants)
+    }
+
+    private suspend fun resolveAfrLoadType(isLegacyFormat: Boolean): AfrTable.LoadType {
+        return TableDomainFacade.resolveAfrLoadType(resolveEngineConstantsOrNull(), isLegacyFormat)
+    }
+
+    private suspend fun isMapLoad(): Boolean {
+        return TableDomainFacade.isMapLoad(resolveEngineConstantsOrNull())
+    }
+
+    private fun findIniFieldByName(name: String) =
+        activeIniDefinition?.fields?.firstOrNull { it.name.equals(name, ignoreCase = true) }
+
+    private suspend fun readIniFieldNumericValue(name: String): Int? {
+        val field = findIniFieldByName(name) ?: return null
+        val pageId = field.page ?: return null
+        val offset = field.offset ?: return null
+        val length = when (field.dataType.trim().uppercase()) {
+            "U16", "S16" -> 2
+            else -> 1
+        }
+        val data = readConfigChunk(pageId, offset, length)
+        if (data.size < length) return null
+
+        val rawValue = when (field.dataType.trim().uppercase()) {
+            "U16", "S16" -> (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8)
+            else -> data[0].toInt() and 0xFF
+        }
+
+        if (field.kind != IniFieldKind.BITS) {
+            return rawValue
+        }
+
+        val bitRange = Regex("""\[(\d+):(\d+)]""")
+            .find(field.rawDefinition)
+            ?.groupValues
+            ?.drop(1)
+            ?.mapNotNull { it.toIntOrNull() }
+            ?: return rawValue
+        if (bitRange.size != 2) return rawValue
+
+        val start = bitRange[0]
+        val end = bitRange[1]
+        if (start > end) return rawValue
+        val width = (end - start + 1).coerceAtMost(31)
+        val mask = (1 shl width) - 1
+        return (rawValue ushr start) and mask
+    }
+
+    private fun resolveSpeeduinoTableMetadata(
+        tableNames: List<String>,
+        fallback: TableMetadata,
+        displayName: String,
+    ): TableMetadata {
+        val field = tableNames.firstNotNullOfOrNull { findIniFieldByName(it) } ?: return fallback
+        val shape = field.shape
+        return TableDomainFacade.resolveSpeeduinoTableMetadata(
+            fieldDataType = field.dataType,
+            fieldPage = field.page,
+            fieldOffset = field.offset,
+            fieldRows = shape?.rows,
+            fieldColumns = shape?.columns,
+            fallback = fallback,
+            displayName = displayName,
+        )
+    }
+
+    private data class Ms2Alias(
+        val pageId: Int,
+        val offset: Int,
+    )
+
+    private fun resolveMs2Alias(pageNum: Int, offset: Int, length: Int): Ms2Alias? {
+        val family = firmwareInfo?.family ?: return null
+        if (offset != 0 || length != 288) {
+            return null
+        }
+        return when (pageNum) {
+            11 -> when (family) {
+                EcuFamily.MS3 -> Ms2Alias(pageId = 0x0C, offset = 0)
+                EcuFamily.MS2, EcuFamily.MEGASPEED -> Ms2Alias(pageId = 0x09, offset = 256)
+                else -> null
+            }
+            14 -> when (family) {
+                EcuFamily.MS3 -> Ms2Alias(pageId = 0x0D, offset = 0)
+                EcuFamily.MS2, EcuFamily.MEGASPEED -> Ms2Alias(pageId = 0x0A, offset = 288)
+                else -> null
+            }
+            else -> null
+        }
+    }
+
+    private fun isModernTablePage(pageNum: Int, length: Int): Boolean {
+        return length == 288 && pageNum in setOf(11, 14)
+    }
+
+    private suspend fun burnTableIfSupported(tableId: Int, family: EcuFamily) {
+        runCatching {
+            protocol.burnTable(tableId = tableId, family = family)
+        }.onFailure { error ->
+            val message = error.message.orEmpty()
+            val notBurnable = message.contains("0x84") ||
+                message.contains("RANGE_ERR", ignoreCase = true) ||
+                message.contains("Valor fora do range", ignoreCase = true) ||
+                message.contains("Incomplete modern response", ignoreCase = true) ||
+                message.contains("received 0 bytes", ignoreCase = true) ||
+                message.contains("sem resposta", ignoreCase = true)
+            if (family == EcuFamily.MS3 && notBurnable) {
+                Logger.w(
+                    TAG,
+                    "Ignorando burn não suportado para tabela ${formatPageId(tableId)} em MS3: $message"
+                )
+                return
+            }
+            throw error
+        }
+    }
+
+    private suspend fun settleAfterConfigWrite() {
+        delay(250)
+        runCatching { connection.clearInputBuffer() }
+    }
+
+    private fun readU8(data: ByteArray, offset: Int): Int = data[offset].toInt() and 0xFF
+
+    private fun readS8(data: ByteArray, offset: Int): Int = data[offset].toInt()
+
+    private fun readU16(data: ByteArray, offset: Int): Int {
+        val lsb = readU8(data, offset)
+        val msb = readU8(data, offset + 1)
+        return lsb or (msb shl 8)
+    }
+
+    private fun writeU8(data: ByteArray, offset: Int, value: Int) {
+        data[offset] = value.coerceIn(0, 255).toByte()
+    }
+
+    private fun writeS8(data: ByteArray, offset: Int, value: Int) {
+        data[offset] = value.coerceIn(-128, 127).toByte()
+    }
+
+    private fun writeU16(data: ByteArray, offset: Int, value: Int) {
+        val clamped = value.coerceIn(0, 65535)
+        data[offset] = (clamped and 0xFF).toByte()
+        data[offset + 1] = ((clamped shr 8) and 0xFF).toByte()
+    }
+
+    /** Estas páginas usam o layout do Speeduino; gravar em MS/rusEFI escreveria em tabelas erradas. */
+    private fun requireSpeeduinoLayout(operation: String) {
+        when (firmwareInfo?.family) {
+            EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI ->
+                throw UnsupportedOperationException("$operation usa o layout de página do Speeduino e não é suportado em ${firmwareInfo?.family}")
+            else -> Unit
+        }
+    }
+
+    private suspend fun ensureWritable(operation: String) {
+        if (readOnlySafeModeEnabled) {
+            throw IllegalStateException(
+                "Read-only safe mode enabled ($operation blocked). Disable manual firmware profile to write."
+            )
+        }
+        val guard = writeGuard ?: return
+        if (!guard(operation)) throw WriteNotPermittedException(operation)
+    }
+
+    /**
+     * Pausa stream aguardando o ciclo atual finalizar para evitar respostas pendentes.
+     */
+    override suspend fun pauseLiveDataStream(timeoutMs: Long) {
+        if (!_isStreaming) {
+            return
+        }
+
+        Logger.d(TAG, "Pausando live data stream...")
+        liveDataStreamStopRequested = true
+        _isStreaming = false
+        connection.abortPendingRead()
+
+        val job = streamJob
+        if (job != null) {
+            val finished = withTimeoutOrNull(timeoutMs) {
+                job.join()
+                true
+            } ?: false
+
+            if (!finished) {
+                Logger.w(TAG, "Timeout aguardando stream, cancelando job")
+                job.cancel()
+                withTimeoutOrNull(500) {
+                    job.join()
+                }
+            }
+        }
+
+        streamJob = null
+        pendingLiveDataRecoveryReason = null
+        connection.clearInputBuffer()
+        liveDataStreamStopRequested = false
+    }
+
+    private fun shouldSkipLiveDataFallback(error: Exception): Boolean {
+        if (liveDataStreamStopRequested) {
+            return true
+        }
+        return error.message?.contains("Read aborted", ignoreCase = true) == true
+    }
+
+    // ==================== Data Parsing ====================
+
+    private fun parseOutputChannelsWithFallback(data: ByteArray): EcuLiveData {
+        val parsed = EcuLiveDataParser.fromOutputChannels(data)
+        val score = liveDataOutOfRangeScore(parsed)
+        if (score < 2 || data[0].toInt() != 0) {
+            return parsed
+        }
+
+        val shifted = shiftOutputChannels(data)
+        val shiftedParsed = EcuLiveDataParser.fromOutputChannels(shifted)
+        val shiftedScore = liveDataOutOfRangeScore(shiftedParsed)
+
+        return if (shiftedScore < score && shiftedScore <= 1) {
+            Logger.w(TAG, "Live data parece desalinhado; aplicando shift de 1 byte (score $score -> $shiftedScore)")
+            io.ecucore.connection.ConnectionTrace.info(
+                "live_data",
+                "shifted output channels by 1 byte (score=$score->$shiftedScore)"
+            )
+            shiftedParsed
+        } else {
+            parsed
+        }
+    }
+
+    private fun shiftOutputChannels(data: ByteArray): ByteArray {
+        val shifted = ByteArray(data.size)
+        data.copyInto(shifted, 0, 1, data.size)
+        shifted[shifted.lastIndex] = 0
+        return shifted
+    }
+
+    private fun liveDataOutOfRangeScore(data: EcuLiveData): Int {
+        var score = 0
+        if (data.rpm < 0 || data.rpm > 20000) score++
+        if (data.mapPressure >= 256 && data.mapPressure % 256 == 0) score += 2
+        if (data.mapPressure > 500) score++
+        if (data.tps < 0 || data.tps > 100) score++
+        if (data.batteryVoltage < 6.0 || data.batteryVoltage > 20.0) score++
+        if (data.coolantTemp < -40 || data.coolantTemp > 170) score++
+        if (data.intakeTemp < -40 || data.intakeTemp > 170) score++
+        return score
+    }
+
+    private var lastFaultSampleAtMs = 0L
+
+    private fun logLiveDataSample(data: ByteArray, liveData: EcuLiveData, isModern: Boolean) {
+        if (!io.ecucore.connection.ConnectionTrace.enabled) {
+            return
+        }
+        val now = MonotonicClock.nowMillis()
+        val (shouldReport, score) = shouldReportLiveDataIssue(liveData)
+        if (!shouldReport || isWithinLiveDataWarmupWindow(now)) {
+            consecutiveFaultyLiveDataSamples = 0
+            return
+        }
+
+        consecutiveFaultyLiveDataSamples += 1
+        if (consecutiveFaultyLiveDataSamples < LIVE_DATA_FAULT_CONSECUTIVE_THRESHOLD) {
+            return
+        }
+
+        maybeScheduleLiveDataRecovery(now, score)
+
+        liveDataSampleCounter += 1
+        if (liveDataSampleCounter % 25 != 0) {
+            return
+        }
+        if (now - lastFaultSampleAtMs < LIVE_DATA_FAULT_REPORT_INTERVAL_MS) {
+            return
+        }
+        lastFaultSampleAtMs = now
+
+        val hex = data.joinToString(" ") { it.toHex02() }
+        val message = buildLiveDataFaultMessage(
+            data = data,
+            liveData = liveData,
+            isModern = isModern,
+            score = score,
+            hexPayload = hex,
+            faultCount = consecutiveFaultyLiveDataSamples
+        )
+        io.ecucore.connection.ConnectionTrace.info("live_data", message)
+    }
+
+    private fun isWithinLiveDataWarmupWindow(now: Long): Boolean {
+        val startedAt = lastLiveDataStreamStartedAtMs
+        return startedAt <= 0L || now - startedAt < LIVE_DATA_STREAM_WARMUP_MS
+    }
+
+    private fun maybeScheduleLiveDataRecovery(now: Long, score: Int) {
+        if (!_isStreaming || !connection.isConnected()) {
+            return
+        }
+        if (pendingLiveDataRecoveryReason != null) {
+            return
+        }
+        if (now - lastFaultRecoveryAtMs < LIVE_DATA_FAULT_RECOVERY_INTERVAL_MS) {
+            return
+        }
+        lastFaultRecoveryAtMs = now
+        pendingLiveDataRecoveryReason =
+            "faulty_sample score=$score count=$consecutiveFaultyLiveDataSamples"
+    }
+
+    private fun consumePendingLiveDataRecoveryReason(): String? {
+        val pending = pendingLiveDataRecoveryReason
+        pendingLiveDataRecoveryReason = null
+        return pending
+    }
+
+    private fun shouldReportLiveDataIssue(liveData: EcuLiveData): Pair<Boolean, Int> {
+        val score = liveDataOutOfRangeScore(liveData)
+        return Pair(score >= 3, score)
+    }
+
+    private fun buildLiveDataFaultMessage(
+        data: ByteArray,
+        liveData: EcuLiveData,
+        isModern: Boolean,
+        score: Int,
+        hexPayload: String,
+        faultCount: Int
+    ): String {
+        val batteryStr = formatDecimal(liveData.batteryVoltage, 1)
+        return buildString {
+            append("faulty sample score=$score")
+            append(" count=$faultCount")
+            append(" ${if (isModern) "modern" else "legacy"}")
+            append(" len=${data.size}")
+            append(" rpm=${liveData.rpm}")
+            append(" map=${liveData.mapPressure}")
+            append(" tps=${liveData.tps}")
+            append(" batt=$batteryStr")
+            append(" temp=${liveData.coolantTemp}/${liveData.intakeTemp}")
+            append(" bytes=$hexPayload")
+        }
+    }
+}

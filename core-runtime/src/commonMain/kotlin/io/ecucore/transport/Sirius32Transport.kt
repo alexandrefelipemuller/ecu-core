@@ -3,8 +3,8 @@ package io.ecucore.transport
 import io.ecucore.shared.Logger
 import kotlin.concurrent.Volatile
 import io.ecucore.shared.MonotonicClock
-import io.ecucore.SpeeduinoLiveData
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.EcuLiveData
+import io.ecucore.connection.IEcuConnection
 import io.ecucore.ecu.FirmwareInfo
 import io.ecucore.model.EcuCapabilities
 import io.ecucore.model.EcuFamily
@@ -39,8 +39,8 @@ import io.ecucore.transport.EcuTransport
  * ainda está em aberto.
  */
 class Sirius32Transport(
-    private val connection: ISpeeduinoConnection,
-    private val onDataReceived: (SpeeduinoLiveData) -> Unit,
+    private val connection: IEcuConnection,
+    private val onDataReceived: (EcuLiveData) -> Unit,
     private val onConnectionStateChanged: (Boolean) -> Unit,
     private val onError: (String) -> Unit,
     private val investigationRecorder: Obd2InvestigationSink? = null,
@@ -228,7 +228,7 @@ class Sirius32Transport(
         val coolantC = bytes[4] - 40
         val intakeC = bytes[5] - 40
 
-        val sample = SpeeduinoLiveData(
+        val sample = EcuLiveData(
             secl = 0,
             rpm = rpm,
             coolantTemp = coolantC,

@@ -1,6 +1,6 @@
 package io.ecucore.transport
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 
 /**
  * Generic sink for persisting OBD2/brand-diagnostic investigation sessions (raw command/response
@@ -26,7 +26,7 @@ interface Obd2InvestigationSink {
 
     fun recordSample(
         source: String,
-        sample: SpeeduinoLiveData,
+        sample: EcuLiveData,
         extras: Map<String, String> = emptyMap(),
     )
 
@@ -54,7 +54,7 @@ object NoopObd2InvestigationSink : Obd2InvestigationSink {
         elapsedMs: Long,
         extra: Map<String, String>,
     ) {}
-    override fun recordSample(source: String, sample: SpeeduinoLiveData, extras: Map<String, String>) {}
+    override fun recordSample(source: String, sample: EcuLiveData, extras: Map<String, String>) {}
     override fun recordProprietaryFrame(
         source: String,
         cycle: Long,

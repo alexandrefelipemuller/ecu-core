@@ -6,17 +6,17 @@ import platform.posix.usleep
 
 /**
  * Transport-agnostic byte queue that bridges an asynchronous byte source to
- * [ISpeeduinoConnection]'s synchronous send/receive contract.
+ * [IEcuConnection]'s synchronous send/receive contract.
  *
  * TCP delivers bytes via a background socket-reading loop; BLE delivers them one GATT
  * notification at a time via a peripheral delegate callback. Both are just "some background
  * thread occasionally has more bytes" — this buffer is the single place that turns that into the
- * blocking, exact-size (or best-effort) reads [SpeeduinoProtocol] expects, so [BleConnection] only
+ * blocking, exact-size (or best-effort) reads [EcuProtocol] expects, so [BleConnection] only
  * needs to call [append] from its notification callback and reuse [read] as-is instead of
  * re-implementing the polling/timeout contract.
  *
  * Uses [NSLock] rather than `kotlinx.coroutines.Mutex` + `runBlocking`: [append]/[read]/[clear]
- * are plain (non-suspend) functions per [ISpeeduinoConnection], and `disconnect()` — which calls
+ * are plain (non-suspend) functions per [IEcuConnection], and `disconnect()` — which calls
  * [clear] — is invoked synchronously from UI code on the main thread (e.g. a "Disconnect" button
  * tap). `runBlocking` on Kotlin/Native spins up a new event loop bound to the calling thread;
  * nesting that inside iOS's main run loop is what caused an EXC_BAD_ACCESS crash on disconnect.
@@ -62,7 +62,7 @@ class ByteStreamBuffer {
     }
 
     /**
-     * Reads bytes matching [ISpeeduinoConnection.receive]'s contract:
+     * Reads bytes matching [IEcuConnection.receive]'s contract:
      * - `length > 0`: blocks (polling) until exactly [length] bytes are available or [timeoutMs]
      *   elapses, returning whatever was accumulated so far on timeout (possibly short).
      * - `length <= 0`: returns whatever is immediately available, waiting briefly for at least

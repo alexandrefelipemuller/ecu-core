@@ -39,7 +39,7 @@ class FirmwareEraEnvelopeTest {
             "speeduino 202501" to true,
         )
         expected.forEach { (signature, usesEnvelope) ->
-            val era = SpeeduinoTableDefinitions.detectFirmwareEra(signature)
+            val era = EcuTableDefinitions.detectFirmwareEra(signature)
             assertEquals(usesEnvelope, era.usesModernEnvelope(), "$signature (era=$era)")
         }
     }

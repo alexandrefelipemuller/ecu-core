@@ -37,7 +37,7 @@ data class DashboardSignalAssessment(
 }
 
 fun assessDashboardSignal(
-    liveData: SpeeduinoLiveData,
+    liveData: EcuLiveData,
     fieldName: String,
     rawValue: Double?,
     rawUnit: String,

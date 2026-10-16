@@ -1,9 +1,9 @@
 package io.ecucore
 
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.connection.IEcuConnection
 
 /**
- * ECU falsa genérica para exercitar o [SpeeduinoClient] por família.
+ * ECU falsa genérica para exercitar o [EcuClient] por família.
  *
  * Handshake em legacy ('Q'/'S' crus, como BT/USB), leitura/gravação de páginas em memória e
  * comandos em envelope CRC32 (`p`/`M`/`B` Speeduino, `r`/`w`/`b` MS, `R`/`C`/`B`/`O` rusEFI).
@@ -17,7 +17,7 @@ internal class ClientFakeEcu(
     private val configReads: Boolean? = null,
     private val wholePageLegacy: Boolean = false,
     private val info: String = "tcp:10.0.0.5:5555",
-) : ISpeeduinoConnection {
+) : IEcuConnection {
 
     enum class Kind(val signature: String, val product: String) {
         SPEEDUINO_2025("speeduino 202501", "speeduino 202501"),

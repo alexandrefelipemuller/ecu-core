@@ -1,6 +1,6 @@
 package io.ecucore.model.logging
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -61,7 +61,7 @@ class LiveLogRecorder(
     /**
      * Registra um pacote de live data no buffer atual.
      */
-    fun record(liveData: SpeeduinoLiveData) {
+    fun record(liveData: EcuLiveData) {
         val session = synchronized(lock) { currentSession } ?: return
         if (session.stoppedAtMs != null) return
 
@@ -123,7 +123,7 @@ data class LiveLogEntry(
     val outputChannelData: ByteArray?
 ) {
     companion object {
-        fun fromLiveData(liveData: SpeeduinoLiveData, timestampMs: Long): LiveLogEntry {
+        fun fromLiveData(liveData: EcuLiveData, timestampMs: Long): LiveLogEntry {
             return LiveLogEntry(
                 timestampMs = timestampMs,
                 rpm = liveData.rpm,

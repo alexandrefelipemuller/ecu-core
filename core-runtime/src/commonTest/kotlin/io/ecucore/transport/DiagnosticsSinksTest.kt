@@ -1,6 +1,6 @@
 package io.ecucore.transport
 
-import io.ecucore.SpeeduinoLiveDataParser
+import io.ecucore.EcuLiveDataParser
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -45,7 +45,7 @@ class DiagnosticsSinksTest {
         sink.info("stage", "msg")
         sink.recordCommand("obd2", "010C", "41 0C", 100, 5)
         sink.recordCommand("obd2", "010C", "41 0C", 100, 5, mapOf("k" to "v"))
-        val sample = SpeeduinoLiveDataParser.fromLegacyFrame(ByteArray(128))
+        val sample = EcuLiveDataParser.fromLegacyFrame(ByteArray(128))
         sink.recordSample("obd2", sample)
         sink.recordSample("obd2", sample, mapOf("k" to "v"))
         sink.recordProprietaryFrame("src", 1L, "cmd", "AA BB", listOf(0xAA, 0xBB))

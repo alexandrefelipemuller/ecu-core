@@ -1,12 +1,12 @@
 package io.ecucore.protocol
 
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.connection.IEcuConnection
 import io.ecucore.model.EcuFamily
 import io.ecucore.model.FirmwareEra
 import io.ecucore.shared.Crc32Table
 
 /**
- * Conexão scriptável para cobrir o [SpeeduinoProtocol] sem hardware.
+ * Conexão scriptável para cobrir o [EcuProtocol] sem hardware.
  *
  * Cada `send()` é gravado em [sent] e passa por [onSend], que devolve os pedaços de resposta a
  * enfileirar (ou `null` = ECU muda). `receive()` entrega um pedaço inteiro por chamada;
@@ -17,7 +17,7 @@ internal class ScriptedConnection(
     var modernFallback: Boolean = false,
     var prefersLegacy: Boolean = false,
     var info: String = "fake",
-) : ISpeeduinoConnection {
+) : IEcuConnection {
     val sent = mutableListOf<ByteArray>()
     private val inbox = ArrayDeque<ByteArray>()
 
@@ -107,7 +107,7 @@ internal fun newProtocol(
     family: EcuFamily? = null,
     schema: String? = null,
     legacyPreferred: Boolean = false,
-): SpeeduinoProtocol = SpeeduinoProtocol(conn).apply {
+): EcuProtocol = EcuProtocol(conn).apply {
     setSessionModernEnvelope(env)
     setSessionFirmwareEra(era)
     setSessionEcuFamily(family)

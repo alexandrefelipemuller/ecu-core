@@ -1,12 +1,12 @@
 package io.ecucore.telemetry
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-private fun liveData(rpm: Int = 0, mapPressure: Int = 0, tps: Int = 0) = SpeeduinoLiveData(
+private fun liveData(rpm: Int = 0, mapPressure: Int = 0, tps: Int = 0) = EcuLiveData(
     secl = 0,
     rpm = rpm,
     coolantTemp = 80,

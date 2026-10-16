@@ -1,6 +1,6 @@
 package io.ecucore.telemetry
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -104,7 +104,7 @@ class LiveDataPredictorConcurrencyTest {
         failure.get()?.let { throw it }
     }
 
-    private fun liveData(rpm: Int) = SpeeduinoLiveData(
+    private fun liveData(rpm: Int) = EcuLiveData(
         secl = 0,
         rpm = rpm,
         coolantTemp = 80,

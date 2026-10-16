@@ -1,7 +1,7 @@
 package io.ecucore.model.logging
 
-import io.ecucore.SpeeduinoLiveData
-import io.ecucore.SpeeduinoLiveDataParser
+import io.ecucore.EcuLiveData
+import io.ecucore.EcuLiveDataParser
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -13,8 +13,8 @@ import kotlin.test.assertTrue
 
 class LiveLogRecorderTest {
 
-    private fun sample(rpm: Int = 1000, block: ByteArray? = null): SpeeduinoLiveData =
-        SpeeduinoLiveDataParser.fromLegacyFrame(ByteArray(128)).copy(rpm = rpm, outputChannelData = block, outputChannelBlockSize = block?.size ?: 0)
+    private fun sample(rpm: Int = 1000, block: ByteArray? = null): EcuLiveData =
+        EcuLiveDataParser.fromLegacyFrame(ByteArray(128)).copy(rpm = rpm, outputChannelData = block, outputChannelBlockSize = block?.size ?: 0)
 
     @Test
     fun `nothing is recorded before a session starts`() {

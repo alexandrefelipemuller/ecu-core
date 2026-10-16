@@ -55,7 +55,7 @@ class DashboardSignalValidationTest {
         assertEquals(DashboardAlertKind.BATTERY_OUT_OF_RANGE, assessment.alertKind)
     }
 
-    private fun sampleLiveData(rpm: Int = 900): SpeeduinoLiveData = SpeeduinoLiveData(
+    private fun sampleLiveData(rpm: Int = 900): EcuLiveData = EcuLiveData(
         secl = 0,
         rpm = rpm,
         coolantTemp = 90,

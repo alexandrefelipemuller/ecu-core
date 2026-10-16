@@ -2,8 +2,8 @@ package io.ecucore.transport
 
 import io.ecucore.shared.Logger
 import kotlin.concurrent.Volatile
-import io.ecucore.SpeeduinoLiveData
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.EcuLiveData
+import io.ecucore.connection.IEcuConnection
 import io.ecucore.definition.IniDefinition
 import io.ecucore.ecu.FirmwareInfo
 import io.ecucore.model.AfrTable
@@ -52,8 +52,8 @@ import io.ecucore.transport.PsaSessionStore
  * - stream SAE via Obd2Transport + tentativa híbrida OEM (rpm/coolant) com fallback automático
  */
 class PsaTransport(
-    private val connection: ISpeeduinoConnection,
-    private val onDataReceived: (SpeeduinoLiveData) -> Unit,
+    private val connection: IEcuConnection,
+    private val onDataReceived: (EcuLiveData) -> Unit,
     private val onConnectionStateChanged: (Boolean) -> Unit,
     private val onError: (String) -> Unit,
     private val obd2ProfileStore: Obd2ProfileStore? = null,
@@ -236,7 +236,7 @@ class PsaTransport(
     @Volatile
     private var connectedAtMs = 0L
     @Volatile
-    private var lastSaeSample: SpeeduinoLiveData? = null
+    private var lastSaeSample: EcuLiveData? = null
     @Volatile
     private var overlay: OemOverlay = OemOverlay()
     @Volatile
@@ -549,12 +549,12 @@ class PsaTransport(
     override suspend fun readPendingDtcCodes(): List<DtcCode> = obd2Delegate.readPendingDtcCodes()
     override suspend fun clearDtcCodes(): Boolean = obd2Delegate.clearDtcCodes()
 
-    private fun onDelegateData(sample: SpeeduinoLiveData) {
+    private fun onDelegateData(sample: EcuLiveData) {
         lastSaeSample = sample
         onDataReceived(applyOverlay(sample))
     }
 
-    private fun applyOverlay(sample: SpeeduinoLiveData): SpeeduinoLiveData {
+    private fun applyOverlay(sample: EcuLiveData): EcuLiveData {
         val current = overlay
         val rpm = if (current.rpmConfidence >= CONFIDENCE_MIN) current.rpm ?: sample.rpm else sample.rpm
         val coolant = if (current.coolantConfidence >= CONFIDENCE_MIN) current.coolant ?: sample.coolantTemp else sample.coolantTemp
@@ -1839,8 +1839,8 @@ class PsaTransport(
         }
     }
 
-    private fun defaultLiveData(): SpeeduinoLiveData {
-        return SpeeduinoLiveData(
+    private fun defaultLiveData(): EcuLiveData {
+        return EcuLiveData(
             secl = 0,
             rpm = 0,
             coolantTemp = 0,

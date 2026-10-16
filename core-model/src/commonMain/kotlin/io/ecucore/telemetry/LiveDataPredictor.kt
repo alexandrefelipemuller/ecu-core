@@ -1,13 +1,13 @@
 package io.ecucore.telemetry
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import io.ecucore.shared.JvmSynchronized
 import io.ecucore.shared.MonotonicClock
 import kotlin.math.exp
 import kotlin.math.pow
 
 /**
- * Campos de [SpeeduinoLiveData] elegíveis para extrapolação preditiva ("dead reckoning").
+ * Campos de [EcuLiveData] elegíveis para extrapolação preditiva ("dead reckoning").
  */
 enum class PredictedField {
     RPM,
@@ -135,7 +135,7 @@ data class PredictionAggressiveness(
 }
 
 /**
- * Extrapolação client-side ("dead reckoning") de campos de [SpeeduinoLiveData] entre amostras reais.
+ * Extrapolação client-side ("dead reckoning") de campos de [EcuLiveData] entre amostras reais.
  *
  * Nunca atrasa a publicação de uma amostra real: [onSample] deve ser chamado imediatamente ao
  * receber cada amostra do transporte, e o valor real deve ser exibido/gravado sem esperar por esta
@@ -170,11 +170,11 @@ class LiveDataPredictor(
         var initialized: Boolean = false
     }
 
-    private var lastRealSample: SpeeduinoLiveData? = null
+    private var lastRealSample: EcuLiveData? = null
     private val trackers: Map<PredictedField, FieldTracker> = configs.keys.associateWith { FieldTracker() }
 
     @JvmSynchronized
-    fun onSample(data: SpeeduinoLiveData, timestampNs: Long = MonotonicClock.nowNanos()) {
+    fun onSample(data: EcuLiveData, timestampNs: Long = MonotonicClock.nowNanos()) {
         lastRealSample = data
         for ((field, config) in configs) {
             val tracker = trackers.getValue(field)
@@ -215,7 +215,7 @@ class LiveDataPredictor(
     }
 
     @JvmSynchronized
-    fun estimateAt(nowNs: Long = MonotonicClock.nowNanos()): SpeeduinoLiveData? {
+    fun estimateAt(nowNs: Long = MonotonicClock.nowNanos()): EcuLiveData? {
         val base = lastRealSample ?: return null
         var result = base
         for ((field, config) in configs) {
@@ -257,7 +257,7 @@ class LiveDataPredictor(
         }
     }
 
-    private fun fieldValue(data: SpeeduinoLiveData, field: PredictedField): Double? = when (field) {
+    private fun fieldValue(data: EcuLiveData, field: PredictedField): Double? = when (field) {
         PredictedField.RPM -> data.rpm.toDouble()
         PredictedField.MAP_PRESSURE -> data.mapPressure.toDouble()
         PredictedField.TPS -> data.tps.toDouble()
@@ -265,7 +265,7 @@ class LiveDataPredictor(
         PredictedField.COOLANT_TEMP -> data.coolantTemp.toDouble()
     }
 
-    private fun applyFieldValue(data: SpeeduinoLiveData, field: PredictedField, value: Double): SpeeduinoLiveData = when (field) {
+    private fun applyFieldValue(data: EcuLiveData, field: PredictedField, value: Double): EcuLiveData = when (field) {
         PredictedField.RPM -> data.copy(rpm = value.toInt())
         PredictedField.MAP_PRESSURE -> data.copy(mapPressure = value.toInt())
         PredictedField.TPS -> data.copy(tps = value.toInt())

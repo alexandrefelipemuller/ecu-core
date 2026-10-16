@@ -1,11 +1,11 @@
 package io.ecucore
 
 import io.ecucore.model.OutputField
-import io.ecucore.model.SpeeduinoOutputChannels
+import io.ecucore.model.EcuOutputChannels
 import kotlin.math.roundToInt
 
 object RusefiLiveDataParser {
-    fun fromOutputChannels(data: ByteArray): SpeeduinoLiveData {
+    fun fromOutputChannels(data: ByteArray): EcuLiveData {
         val minimumSize = 64
         require(data.size >= minimumSize) {
             "rusEFI output channels incompletos: esperado $minimumSize, recebido ${data.size}"
@@ -28,7 +28,7 @@ object RusefiLiveDataParser {
         val engineStatus = if (rpm > 0) 0x01 else 0x00
         val sparkStatus = if (rpm > 0) 0x01 else 0x00
 
-        return SpeeduinoLiveData(
+        return EcuLiveData(
             secl = secl,
             rpm = rpm,
             coolantTemp = coolantTemp,
@@ -54,6 +54,6 @@ object RusefiLiveDataParser {
     }
 
     private fun findField(blockSize: Int, vararg names: String): OutputField? {
-        return names.firstNotNullOfOrNull { SpeeduinoOutputChannels.getField(blockSize, it) }
+        return names.firstNotNullOfOrNull { EcuOutputChannels.getField(blockSize, it) }
     }
 }

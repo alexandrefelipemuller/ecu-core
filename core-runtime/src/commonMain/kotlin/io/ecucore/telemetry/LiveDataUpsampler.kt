@@ -1,6 +1,6 @@
 package io.ecucore.telemetry
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import io.ecucore.shared.JvmSynchronized
 import io.ecucore.shared.MonotonicClock
 import kotlinx.coroutines.CoroutineScope
@@ -44,15 +44,15 @@ class LiveDataUpsampler(
     ) : this(LiveDataPredictor(aggressiveness), tickIntervalMs)
 
 
-    private val _samples = MutableSharedFlow<SpeeduinoLiveData>(extraBufferCapacity = SAMPLE_BUFFER_CAPACITY)
+    private val _samples = MutableSharedFlow<EcuLiveData>(extraBufferCapacity = SAMPLE_BUFFER_CAPACITY)
 
     /** Amostras reais (imediatas) intercaladas com amostras extrapoladas emitidas a cada [tickIntervalMs]. */
-    val samples: SharedFlow<SpeeduinoLiveData> = _samples
+    val samples: SharedFlow<EcuLiveData> = _samples
 
     private var tickerJob: Job? = null
 
     /** Publica a amostra real imediatamente e alimenta o preditor. Nunca atrasa a publicação. */
-    fun ingestRealSample(data: SpeeduinoLiveData, timestampNs: Long = MonotonicClock.nowNanos()) {
+    fun ingestRealSample(data: EcuLiveData, timestampNs: Long = MonotonicClock.nowNanos()) {
         predictor.onSample(data, timestampNs)
         _samples.tryEmit(data)
     }
@@ -80,7 +80,7 @@ class LiveDataUpsampler(
     }
 
     /** Consulta pontual e barata, pensada para ser chamada a cada frame de UI (60-120Hz). */
-    fun estimateAt(nowNs: Long = MonotonicClock.nowNanos()): SpeeduinoLiveData? = predictor.estimateAt(nowNs)
+    fun estimateAt(nowNs: Long = MonotonicClock.nowNanos()): EcuLiveData? = predictor.estimateAt(nowNs)
 
     fun estimateRpmAt(nowNs: Long = MonotonicClock.nowNanos()): Int = predictor.estimateRpmAt(nowNs)
 

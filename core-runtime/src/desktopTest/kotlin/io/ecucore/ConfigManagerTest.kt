@@ -75,8 +75,8 @@ class ConfigManagerTest {
 
     // ---- download ------------------------------------------------------------------------------------------
 
-    private suspend fun connectedClient(ecu: ClientFakeEcu = ClientFakeEcu(ClientFakeEcu.Kind.SPEEDUINO_2025)): SpeeduinoClient =
-        SpeeduinoClient(ecu, onDataReceived = {}, onConnectionStateChanged = {}, onError = {}).also { it.connect() }
+    private suspend fun connectedClient(ecu: ClientFakeEcu = ClientFakeEcu(ClientFakeEcu.Kind.SPEEDUINO_2025)): EcuClient =
+        EcuClient(ecu, onDataReceived = {}, onConnectionStateChanged = {}, onError = {}).also { it.connect() }
 
     @Test
     fun `downloads every page and writes info and page files`() = runBlocking<Unit> {

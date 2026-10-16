@@ -3,7 +3,7 @@ package io.ecucore
 object Ms3LiveDataParser {
     private const val OUTPUT_BLOCK_SIZE = 509
 
-    fun fromOutputChannels(data: ByteArray): SpeeduinoLiveData {
+    fun fromOutputChannels(data: ByteArray): EcuLiveData {
         require(data.size >= OUTPUT_BLOCK_SIZE) {
             "MS3 output channels incompletos: esperado $OUTPUT_BLOCK_SIZE, recebido ${data.size}"
         }
@@ -21,7 +21,7 @@ object Ms3LiveDataParser {
             val batteryVoltage = s16be(data, 26) / 10.0
             val o2 = s16be(data, 28) / 10
 
-            return SpeeduinoLiveData(
+            return EcuLiveData(
                 secl = secl,
                 rpm = rpm,
                 coolantTemp = coolantTemp,

@@ -16,7 +16,7 @@ class Ms3GenericSensorsTest {
 
     @AfterTest
     fun clearAliases() {
-        SpeeduinoOutputChannels.setSensorRoleAliases(EcuFamily.MS3, emptyList())
+        EcuOutputChannels.setSensorRoleAliases(EcuFamily.MS3, emptyList())
     }
 
     @Test
@@ -113,11 +113,11 @@ class Ms3GenericSensorsTest {
     @Test
     fun `MS3 block sizes use the MS3 output channel layout, not the MegaSpeed one`() {
         for (blockSize in listOf(509, 512)) {
-            assertEquals(226, SpeeduinoOutputChannels.getField(blockSize, "tpsADC")?.offset)
-            assertEquals(16, SpeeduinoOutputChannels.getField(blockSize, "baro")?.offset)
-            assertEquals(108, SpeeduinoOutputChannels.getField(blockSize, "sensor03")?.offset)
+            assertEquals(226, EcuOutputChannels.getField(blockSize, "tpsADC")?.offset)
+            assertEquals(16, EcuOutputChannels.getField(blockSize, "baro")?.offset)
+            assertEquals(108, EcuOutputChannels.getField(blockSize, "sensor03")?.offset)
         }
-        assertEquals(86, SpeeduinoOutputChannels.getField(212, "tpsADC")?.offset, "MS2 não muda")
+        assertEquals(86, EcuOutputChannels.getField(212, "tpsADC")?.offset, "MS2 não muda")
     }
 
     @Test
@@ -125,7 +125,7 @@ class Ms3GenericSensorsTest {
         val data = ByteArray(509)
         data[104 + 4] = 0x00; data[104 + 5] = 42 // sensor03 = 4.2
         data[104 + 6] = 0x01; data[104 + 7] = 0x2C // sensor04 = 30.0
-        SpeeduinoOutputChannels.setSensorRoleAliases(
+        EcuOutputChannels.setSensorRoleAliases(
             EcuFamily.MS3,
             listOf(
                 Ms3GenericSensors.liveField(3, name = "oilPressure", units = "bar"),
@@ -133,12 +133,12 @@ class Ms3GenericSensorsTest {
             )
         )
 
-        assertEquals(4.2, SpeeduinoOutputChannels.getField(509, "oilPressure")!!.parse(data), 1e-9)
-        assertEquals(30.0, SpeeduinoOutputChannels.getField(509, "fuelPressure")!!.parse(data), 1e-9)
-        assertNull(SpeeduinoOutputChannels.getField(130, "oilPressure")?.takeIf { it.offset == 108 }, "não vaza pra Speeduino")
+        assertEquals(4.2, EcuOutputChannels.getField(509, "oilPressure")!!.parse(data), 1e-9)
+        assertEquals(30.0, EcuOutputChannels.getField(509, "fuelPressure")!!.parse(data), 1e-9)
+        assertNull(EcuOutputChannels.getField(130, "oilPressure")?.takeIf { it.offset == 108 }, "não vaza pra Speeduino")
 
-        SpeeduinoOutputChannels.clearAllRuntimeDefinitions()
-        assertEquals("bar", SpeeduinoOutputChannels.getField(509, "oilPressure")?.units, "disconnect não apaga config do usuário")
+        EcuOutputChannels.clearAllRuntimeDefinitions()
+        assertEquals("bar", EcuOutputChannels.getField(509, "oilPressure")?.units, "disconnect não apaga config do usuário")
     }
 
     @Test
@@ -157,7 +157,7 @@ class Ms2PressureSensorAliasTest {
 
     @AfterTest
     fun clearAliases() {
-        SpeeduinoOutputChannels.setSensorRoleAliases(EcuFamily.MS2, emptyList())
+        EcuOutputChannels.setSensorRoleAliases(EcuFamily.MS2, emptyList())
     }
 
     private fun adcFrame(offset: Int, adc: Int): ByteArray = ByteArray(212).also {
@@ -180,14 +180,14 @@ class Ms2PressureSensorAliasTest {
     @Test
     fun `MS2 aliases apply to MS2 block size only`() {
         val ps10 = PressureSensorPresets.byId("ps10_bar")!!
-        SpeeduinoOutputChannels.setSensorRoleAliases(
+        EcuOutputChannels.setSensorRoleAliases(
             EcuFamily.MS2,
             listOf(Ms2AdcInputs.roleField(SensorRole.FUEL_PRESSURE, Ms2AdcInputs.input("adc7")!!, ps10.spec, "bar")),
         )
 
-        assertEquals(130, SpeeduinoOutputChannels.getField(212, "fuelPressure")?.offset)
-        assertEquals(5.0, SpeeduinoOutputChannels.getField(212, "fuelPressure")!!.parse(adcFrame(130, 512)), 0.02)
-        assertNull(SpeeduinoOutputChannels.getField(509, "fuelPressure"), "não vaza pra MS3")
+        assertEquals(130, EcuOutputChannels.getField(212, "fuelPressure")?.offset)
+        assertEquals(5.0, EcuOutputChannels.getField(212, "fuelPressure")!!.parse(adcFrame(130, 512)), 0.02)
+        assertNull(EcuOutputChannels.getField(509, "fuelPressure"), "não vaza pra MS3")
     }
 
     @Test
