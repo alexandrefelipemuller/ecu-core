@@ -30,10 +30,10 @@ Gerada com `./gradlew desktopTest jacocoAggregateReport`.
 | Classe | Cobertura | Linhas faltando |
 |---|---|---|
 | PsaTransport | 0% | 1477 |
-| SpeeduinoClient | 25% | 1406 |
+| EcuClient | 25% | 1406 |
 | Obd2Transport | 0% | 975 |
 | RenaultTransport | 0% | 524 |
-| SpeeduinoProtocol | 51% | 435 |
+| EcuProtocol | 51% | 435 |
 | VagTransport | 0% | 336 |
 | TuningAssistantAnalyzer | 0% | 310 |
 | EngineConstants$Companion | 21% | 223 |
@@ -43,13 +43,13 @@ Gerada com `./gradlew desktopTest jacocoAggregateReport`.
 | Sirius32Transport | 0% | 152 |
 | SessionTableParser | 3% | 151 |
 | Ms2TableDefinitions | 40% | 147 |
-| SpeeduinoTcpConnection | 0% | 132 |
+| EcuTcpConnection | 0% | 132 |
 | BeforeAfterLogComparator | 0% | 132 |
 | RusefiTableDefinitions | 53% | 131 |
 | PromotingObd2Transport | 0% | 114 |
 | TableValidator | 46% | 109 |
 | AutoDetectEcuTransport | 0% | 103 |
-| SpeeduinoSerialConnection | 0% | 101 |
+| EcuSerialConnection | 0% | 101 |
 | ConfigManager | 0% | 97 |
 | EcuTransport$DefaultImpls | 0% | 87 |
 | EngineConstants | 28% | 85 |

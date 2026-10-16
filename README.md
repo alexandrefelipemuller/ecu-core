@@ -16,8 +16,8 @@ core-tuning ──► core-model ◄── core-protocol ◄── core-runtime
 | Módulo | Conteúdo |
 |---|---|
 | `:core-model` | Modelos de tabela (VE/Ignition/AFR/Dwell), definitions por ECU (Speeduino/MS2/MS3/Rusefi), parsing .ini, parsers de live data, validação, BaseMapGenerator, helpers `shared/` (Logger, Crc32Table, MonotonicClock, NumberFormat) |
-| `:core-protocol` | SpeeduinoProtocol (commonMain, CRC32 puro), conexões (ISpeeduinoConnection; TCP jvm, TCP nativo/BLE ios, serial jSerialComm desktop), cache de páginas |
-| `:core-runtime` | SpeeduinoClient (commonMain, implementa EcuTransport), SessionController, sync (SessionTableParser, ConfigSyncService), transports OBD2 domain, LiveLogRecorder |
+| `:core-protocol` | EcuProtocol (commonMain, CRC32 puro), conexões (IEcuConnection; TCP jvm, TCP nativo/BLE ios, serial jSerialComm desktop), cache de páginas |
+| `:core-runtime` | EcuClient (commonMain, implementa EcuTransport), SessionController, sync (SessionTableParser, ConfigSyncService), transports OBD2 domain, LiveLogRecorder |
 | `:core-tuning` | TuningAssistantAnalyzer/Models, units/UnitSystem, BeforeAfterLogCompare |
 
 Consumidores dependem por coordenada, resolvida via composite build:
@@ -64,7 +64,7 @@ acusa qualquer vazamento no build — não desative esses targets.
    mapeamento de páginas do `EngineProtectionMapper` para um `EcuPageLayout`
    injetável com default = comportamento atual. Mudança aditiva no ecu-core; o
    TopSpeed injeta seu layout.
-3. **Factory reset OEM (`SpeeduinoProtocol`/`SpeeduinoClient`, diff ~1100 linhas)** —
+3. **Factory reset OEM (`EcuProtocol`/`EcuClient`, diff ~1100 linhas)** —
    não reconciliar por merge textual. Introduzir interface `ProtocolExtensions`
    (hooks para comandos extras) em `:core-protocol` e mover os comandos OEM do
    TopSpeed para uma implementação dessa interface no app TopSpeed.
