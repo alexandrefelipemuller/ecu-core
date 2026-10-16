@@ -132,13 +132,28 @@ class SpeeduinoTcpConnection(
                 var totalRead = 0
                 val startTime = System.currentTimeMillis()
 
+                // readAvailable() deixa no socket o timeout curto da última fatia (ex.: 250 ms);
+                // sem restaurar, esta leitura herdaria esse valor e estouraria numa ECU lenta.
+                socket?.soTimeout = timeoutMs
+
                 while (totalRead < size) {
                     val remaining = size - totalRead
                     if (verboseLogging) {
                         Logger.d(TAG, "Lendo $remaining bytes restantes (já leu $totalRead/$size)")
                     }
 
-                    val read = inputStream?.read(buffer, totalRead, remaining) ?: -1
+                    val read = try {
+                        inputStream?.read(buffer, totalRead, remaining) ?: -1
+                    } catch (e: SocketTimeoutException) {
+                        // Mesmo formato dos outros transportes, para o stream de live data tratar
+                        // como falha recuperável (repetir o comando) em vez de derrubar a conexão.
+                        ConnectionTrace.error("tcp", "timeout ao receber dados: ${e.message}", e)
+                        throw if (totalRead == 0) {
+                            Exception("Timeout: no data received")
+                        } else {
+                            Exception("Timeout: expected $size bytes, received $totalRead")
+                        }
+                    }
                     if (read == -1) {
                         Logger.w(TAG, "Stream encerrado (-1)")
                         handleError("Conexão encerrada pelo remoto", closeSocket = true)
