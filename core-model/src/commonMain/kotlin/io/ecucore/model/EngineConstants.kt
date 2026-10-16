@@ -180,6 +180,8 @@ data class EngineConstants(
             val loadStoich = readBits(data, 733, 3, 3) == 1
             val stoich = readS16Be(data, 662) * 0.1f
             val engineSize = readU16Be(data, 679)
+            // injOpen (U16 BE @566, scale 0.001 ms) - tempo morto do injetor
+            val injectorOpenTime = readU16Be(data, 566) * 0.001f
             val boardType = when (readU8(data, 740)) {
                 1 -> "MS2-X"
                 2 -> "Router"
@@ -199,7 +201,7 @@ data class EngineConstants(
                 injectorPortType = InjectorPortType.PORT,
                 numberOfInjectors = nInjectors.coerceAtLeast(1),
                 engineType = if (engineTypeOdd) EngineType.ODD_FIRE else EngineType.EVEN_FIRE,
-                injectorOpenTimeMs = 1.0f,
+                injectorOpenTimeMs = injectorOpenTime,
                 injectorDutyLimit = 85,
                 injectorCloseAngle = oddFireAngle,
                 ignitionFixedTimingEnabled = false,
@@ -601,6 +603,7 @@ data class EngineConstants(
         val data = basePage.copyOf()
 
         writeU16Be(data, 608, (reqFuel / 0.001f).toInt())
+        writeU16Be(data, 566, Math.round(injectorOpenTimeMs / 0.001f).coerceIn(0, 25500))
         writeS16Be(data, 522, (batteryVoltage / 0.1f).toInt())
         writeBits(data, 0, 0, 4, numberOfCylinders.coerceIn(1, 16))
         writeBits(data, 2, 3, 3, if (engineType == EngineType.ODD_FIRE) 1 else 0)

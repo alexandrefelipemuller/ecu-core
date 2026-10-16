@@ -14,4 +14,6 @@ data class IniConfigView(
 /** Visões de configuração suportadas para a MegaSpeed. */
 enum class MegaSpeedConfigView(val requiredPages: List<Int>) {
     IDLE(MegaSpeedIdleConfig.REQUIRED_PAGES),
+    PROTECTION(MegaSpeedProtectionConfig.REQUIRED_PAGES),
+    SENSORS(MegaSpeedSensorsConfig.REQUIRED_PAGES),
 }

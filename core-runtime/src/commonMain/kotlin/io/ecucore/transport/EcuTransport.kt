@@ -141,6 +141,14 @@ interface EcuTransport {
     suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView =
         throw UnsupportedOperationException("MegaSpeed config view not supported by this transport")
 
+    /** Valores atuais (unidade do usuário) de campos de [MegaSpeedWritableFields], lidos da ECU. */
+    suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> =
+        throw UnsupportedOperationException("MegaSpeed field read not supported by this transport")
+
+    /** Grava um campo de [MegaSpeedWritableFields] (só os bytes alterados), confere por releitura e dá burn. */
+    suspend fun writeMegaSpeedConfigField(field: String, value: Double): Unit =
+        throw UnsupportedOperationException("MegaSpeed field write not supported by this transport")
+
     suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
 

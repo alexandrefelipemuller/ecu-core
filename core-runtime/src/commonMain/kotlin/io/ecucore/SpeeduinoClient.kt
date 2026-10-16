@@ -59,6 +59,9 @@ import io.ecucore.model.RusefiIniTableDefinitions
 import io.ecucore.model.RusefiTableDefinitions
 import io.ecucore.model.RusefiInputOutputConfig
 import io.ecucore.model.MegaSpeedIdleConfig
+import io.ecucore.model.MegaSpeedProtectionConfig
+import io.ecucore.model.MegaSpeedWritableFields
+import io.ecucore.model.MegaSpeedSensorsConfig
 import io.ecucore.model.MegaSpeedIoConfig
 import io.ecucore.model.MegaSpeedLogCapture
 import io.ecucore.model.MegaSpeedLogDecoder
@@ -1745,7 +1748,77 @@ class SpeeduinoClient(
         }
         return when (view) {
             MegaSpeedConfigView.IDLE -> MegaSpeedIdleConfig.parse(definition, pages)
+            MegaSpeedConfigView.PROTECTION -> MegaSpeedProtectionConfig.parse(definition, pages)
+            MegaSpeedConfigView.SENSORS -> MegaSpeedSensorsConfig.parse(definition, pages)
         }
+    }
+
+    /** Campo escalar de 16 bits big-endian do .ini ativo, com a página resolvida para o ID real na ECU. */
+    private class MegaSpeedScalar(val pageId: Int, val offset: Int, val signed: Boolean, val scale: Double, val translate: Double)
+
+    private fun megaSpeedScalar(name: String): MegaSpeedScalar {
+        if (MegaSpeedWritableFields.byName(name) == null) {
+            throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $name")
+        }
+        val definition = activeIniDefinition
+            ?: throw UnsupportedOperationException("Esta operação requer o .ini da CostaMegaSpeed carregado")
+        val field = definition.fields.firstOrNull { it.section.equals("Constants", true) && it.name == name }
+            ?: throw UnsupportedOperationException("Campo $name ausente no .ini")
+        val type = field.dataType.uppercase()
+        require(field.kind == io.ecucore.definition.IniFieldKind.SCALAR && (type == "S16" || type == "U16")) {
+            "Campo $name não é escalar de 16 bits ($type)"
+        }
+        val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
+            ?: throw UnsupportedOperationException("Página do campo $name não resolvida")
+        val scale = field.scale ?: 1.0
+        require(scale > 0.0) { "Escala inválida para $name" }
+        return MegaSpeedScalar(pageId, field.offset ?: error("Campo $name sem offset"), type == "S16", scale, field.translate ?: 0.0)
+    }
+
+    private fun requireMegaSpeedForFieldAccess() {
+        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
+            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed")
+        }
+    }
+
+    override suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> {
+        requireMegaSpeedForFieldAccess()
+        return fields.associateWith { name ->
+            val f = megaSpeedScalar(name)
+            val bytes = readConfigChunk(f.pageId, f.offset, 2)
+            var raw = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+            if (f.signed && raw >= 0x8000) raw -= 0x10000
+            (raw + f.translate) * f.scale
+        }
+    }
+
+    override suspend fun writeMegaSpeedConfigField(field: String, value: Double) {
+        ensureWritable("writeMegaSpeedConfigField")
+        requireMegaSpeedForFieldAccess()
+        val spec = MegaSpeedWritableFields.byName(field)
+            ?: throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $field")
+        require(value.isFinite() && value >= spec.min && value <= spec.max) {
+            "${spec.label}: valor ${value} fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
+        }
+        val f = megaSpeedScalar(field)
+        val raw = kotlin.math.round(value / f.scale - f.translate).toInt()
+        val range = if (f.signed) -32768..32767 else 0..65535
+        require(raw in range) { "${spec.label}: valor fora do alcance do campo" }
+        val newBytes = byteArrayOf(((raw shr 8) and 0xFF).toByte(), (raw and 0xFF).toByte())
+        val current = readConfigChunk(f.pageId, f.offset, 2)
+        // Igual ao TunerStudio: só os bytes que mudaram vão para a ECU.
+        val first = (0..1).firstOrNull { current[it] != newBytes[it] }
+        if (first == null) {
+            Logger.d(TAG, "MegaSpeed $field já está em $value; nada a gravar")
+            return
+        }
+        val last = (1 downTo 0).first { current[it] != newBytes[it] }
+        val data = newBytes.copyOfRange(first, last + 1)
+        Logger.d(TAG, "Gravando MegaSpeed $field=$value (raw=$raw) tabela=0x${f.pageId.toString(16)} off=${f.offset + first} len=${data.size}")
+        writeMsTableVerified(
+            TableRegions(listOf(TableRegion(f.pageId, f.offset + first, data)), setOf(f.pageId)),
+            "MegaSpeed $field",
+        )
     }
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {
@@ -1808,7 +1881,18 @@ class SpeeduinoClient(
             length = EngineProtectionMapper.PAGE_SIZE
         )
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
-        return EngineProtectionMapper.fromPage(pageData, era)
+        val base = EngineProtectionMapper.fromPage(pageData, era)
+        if (!era.isModern()) return base
+        // Rev-limiter fields (valet mode) live in pages 1, 4 and 9; a failure here must not break the page 6 read.
+        return runCatching {
+            val page1 = readPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, 0, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE)
+            val page4 = readPage(EngineProtectionMapper.RPM_PAGE_NUMBER, 0, EngineProtectionMapper.RPM_PAGE_SIZE)
+            val page9 = readPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 0, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE)
+            EngineProtectionMapper.withRevLimiterPages(base, page1, page4, page9)
+        }.getOrElse {
+            Logger.w(TAG, "Rev limiter pages (1/4/9) unavailable: ${it.message}")
+            base
+        }
     }
 
     /**
@@ -1852,12 +1936,33 @@ class SpeeduinoClient(
             data = updatedData,
             label = "Engine Protection",
         )
+        // Pages 1/4/9 are only touched when the config carries a rev limiter read from the ECU.
+        if (era.isModern() && config.hardRevLimitRpm > 0) {
+            writeRevLimiterPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage1(it, config)
+            }
+            writeRevLimiterPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage4(it, config)
+            }
+            writeRevLimiterPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage9(it, config)
+            }
+        }
         if (burn) {
             delay(300)
             protocol.burnConfig()
             Logger.d(TAG, "Engine Protection gravado e burn executado")
         } else {
             Logger.d(TAG, "Engine Protection gravado (sem burn)")
+        }
+    }
+
+    private suspend fun writeRevLimiterPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
+        val updated = transform(readPage(pageNum = pageNum, offset = 0, length = size))
+        writeConfigPageVerified(pageNum = pageNum.toByte(), offset = 0, data = updated, label = "Engine Protection page $pageNum")
+        if (burn) {
+            delay(200)
+            protocol.burnConfig()
         }
     }
 

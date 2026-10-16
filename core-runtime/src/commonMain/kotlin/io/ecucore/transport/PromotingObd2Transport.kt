@@ -216,6 +216,12 @@ class PromotingObd2Transport(
     override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView =
         selected().readMegaSpeedConfigView(view)
 
+    override suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> =
+        selected().readMegaSpeedFieldValues(fields)
+
+    override suspend fun writeMegaSpeedConfigField(field: String, value: Double) =
+        selected().writeMegaSpeedConfigField(field, value)
+
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot =
         selected().readRusefiInputOutputSnapshot()
 
