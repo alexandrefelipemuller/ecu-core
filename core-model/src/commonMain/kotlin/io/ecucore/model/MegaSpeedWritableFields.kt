@@ -22,8 +22,11 @@ object MegaSpeedWritableFields {
         MegaSpeedWritableField("map0", "MAP: valor em 0 V", "kPa", -100.0, 1000.0, 1),
         MegaSpeedWritableField("mapmax", "MAP: valor em 5 V", "kPa", -100.0, 1000.0, 1),
         MegaSpeedWritableField("baro0", "Baro: valor em 0 V", "kPa", -100.0, 1000.0, 1),
+        MegaSpeedWritableField("baromax", "Baro: valor em 5 V", "kPa", -100.0, 1000.0, 1),
         MegaSpeedWritableField("batt0", "Bateria: valor mínimo", "V", 0.0, 50.0, 1),
         MegaSpeedWritableField("battmax", "Bateria: valor máximo", "V", 0.0, 60.0, 1),
+        // Limite conservador (tensão do sensor): o .ini aceita -300..3276,7 V.
+        MegaSpeedWritableField("oil0", "Pressão de óleo: tensão em 0,0 bar", "V", 0.0, 5.0, 1),
     )
 
     fun forView(view: MegaSpeedConfigView): List<MegaSpeedWritableField> = when (view) {

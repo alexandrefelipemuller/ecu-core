@@ -29,8 +29,12 @@ class EcuClientMegaSpeedFieldWriteTest {
 
         page = 1
         map0 = scalar, S16, 506, "Kpa", 0.10000, 0.00000, -100.0, 3276.7, 1
+        baromax = scalar, S16, 532, "kPa", 0.10000, 0.00000, -3276.8, 3276.7, 1
         RevLimNormal2 = scalar, S16, 656, "RPM", 1.00000, 0.00000, 0.00, 15000, 0
         IdleCtl = bits, U08, 547, [0:1], "Nenhuma", "Atuador On/Off", "Atuador PWM", "Motor de Passo"
+
+        page = 7
+        oil0 = scalar, S16, 629, "V", 0.10000, 0.00000, -300.0, 3276.7, 1
     """.trimIndent()
 
     private suspend fun connect(): Pair<EcuClient, ClientFakeEcu> {
@@ -55,6 +59,27 @@ class EcuClientMegaSpeedFieldWriteTest {
         assertEquals(listOf(0x64), w.data.map { it.toInt() and 0xFF })
         assertEquals(listOf(0x04), ecu.burns)
         assertEquals(6500.0, c.readMegaSpeedFieldValues(listOf("RevLimNormal2"))["RevLimNormal2"])
+    }
+
+    @Test
+    fun `baromax grava os dois bytes como na captura do TunerStudio`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        c.writeMegaSpeedConfigField("baromax", 416.5) // raw 4165 = 0x1045
+        val w = ecu.fieldWrites().single()
+        assertEquals(532, w.offset)
+        assertEquals(listOf(0x10, 0x45), w.data.map { it.toInt() and 0xFF })
+        assertEquals(listOf(0x04), ecu.burns)
+    }
+
+    @Test
+    fun `oil0 grava na tabela 0C so o byte que mudou e queima essa tabela`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        c.writeMegaSpeedConfigField("oil0", 4.9) // raw 49 = 0x31, igual à captura (offset 630)
+        val w = ecu.writes.single { it.id == 0x0C }
+        assertEquals(630, w.offset)
+        assertEquals(listOf(0x31), w.data.map { it.toInt() and 0xFF })
+        assertEquals(listOf(0x0C), ecu.burns)
+        assertFailsWith<IllegalArgumentException> { c.writeMegaSpeedConfigField("oil0", 6.0) }
     }
 
     @Test
