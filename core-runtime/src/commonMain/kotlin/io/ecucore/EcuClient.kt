@@ -261,9 +261,11 @@ class EcuClient(
         companion object Key : CoroutineContext.Key<EcuIoOwner>
     }
 
+    // I/O de transporte é bloqueante (Thread.sleep/read): nunca pode rodar na thread do chamador,
+    // que pode ser a Main (ex.: teste de saídas da UI) e gerar ANR.
     private suspend fun <T> withEcuIo(block: suspend () -> T): T {
         if (currentCoroutineContext()[EcuIoOwner] != null) return block()
-        return ioMutex.withLock { withContext(EcuIoOwner()) { block() } }
+        return ioMutex.withLock { withContext(Dispatchers.IO + EcuIoOwner()) { block() } }
     }
 
     /** Como [withEcuIo], mas desiste (null) se o canal está ocupado. Usado pelo live stream. */
@@ -271,7 +273,7 @@ class EcuClient(
         if (currentCoroutineContext()[EcuIoOwner] != null) return block()
         if (!ioMutex.tryLock()) return null
         return try {
-            withContext(EcuIoOwner()) { block() }
+            withContext(Dispatchers.IO + EcuIoOwner()) { block() }
         } finally {
             ioMutex.unlock()
         }
