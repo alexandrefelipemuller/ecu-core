@@ -31,6 +31,11 @@ class EcuClientMegaSpeedFieldWriteTest {
         map0 = scalar, S16, 506, "Kpa", 0.10000, 0.00000, -100.0, 3276.7, 1
         baromax = scalar, S16, 532, "kPa", 0.10000, 0.00000, -3276.8, 3276.7, 1
         RevLimNormal2 = scalar, S16, 656, "RPM", 1.00000, 0.00000, 0.00, 15000, 0
+        RevLimNormal2_hyst= scalar,U16,    46,             "RPM",      1.00000,   0.00000,  100,  1000,       0
+        RevLimOption_retard = bits,U08,    636,      [0:1], "Desligado", "Retardo progressivo", "Angulo fixo", "INVALID"
+        RevLimOption_spkcut = bits,U08,    636,      [2:2], "Desligado", "Ligado"
+        RevLimMaxRtd    = scalar,  U08,    637,             "grau",      0.10000,   0.00000,  0,      25.50,      1
+        RevLimRtdAng    = scalar,  S16,    654,             "grau",      0.10000,   0.00000,-10,   25.5,      1
         IdleCtl = bits, U08, 547, [0:1], "Nenhuma", "Atuador On/Off", "Atuador PWM", "Motor de Passo"
 
         page = 7
@@ -122,5 +127,39 @@ class EcuClientMegaSpeedFieldWriteTest {
         client.connect()
         assertFailsWith<UnsupportedOperationException> { client.writeMegaSpeedConfigField("RevLimNormal2", 6500.0) }
         assertTrue(ecu.writes.isEmpty())
+    }
+
+    @Test
+    fun `campo de 8 bits grava um byte`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        c.writeMegaSpeedConfigField("RevLimMaxRtd", 5.0) // raw 50
+        val w = ecu.fieldWrites().single()
+        assertEquals(637, w.offset)
+        assertEquals(listOf(50), w.data.map { it.toInt() and 0xFF })
+        assertEquals(5.0, c.readMegaSpeedFieldValues(listOf("RevLimMaxRtd"))["RevLimMaxRtd"])
+    }
+
+    @Test
+    fun `bits preservam os outros bits do byte`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        ecu.load(0x04, 636, byteArrayOf(0b0010_0001)) // retard=1, fuelcut ligado
+        c.writeMegaSpeedConfigField("RevLimOption_spkcut", 1.0)
+        val w = ecu.fieldWrites().single()
+        assertEquals(636, w.offset)
+        assertEquals(listOf(0b0010_0101), w.data.map { it.toInt() and 0xFF })
+        c.writeMegaSpeedConfigField("RevLimOption_retard", 2.0)
+        assertEquals(listOf(0b0010_0110), ecu.fieldWrites().last().data.map { it.toInt() and 0xFF })
+        assertEquals(2.0, c.readMegaSpeedFieldValues(listOf("RevLimOption_retard"))["RevLimOption_retard"])
+        assertFailsWith<IllegalArgumentException> { c.writeMegaSpeedConfigField("RevLimOption_spkcut", 2.0) }
+    }
+
+    @Test
+    fun `retardo fixo negativo usa complemento de dois`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        c.writeMegaSpeedConfigField("RevLimRtdAng", -5.0) // raw -50 = 0xFFCE
+        val w = ecu.fieldWrites().single()
+        assertEquals(654, w.offset)
+        assertEquals(listOf(0xFF, 0xCE), w.data.map { it.toInt() and 0xFF })
+        assertEquals(-5.0, c.readMegaSpeedFieldValues(listOf("RevLimRtdAng"))["RevLimRtdAng"])
     }
 }

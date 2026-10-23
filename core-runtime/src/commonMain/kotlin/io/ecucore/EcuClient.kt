@@ -1755,8 +1755,23 @@ class EcuClient(
         }
     }
 
-    /** Campo escalar de 16 bits big-endian do .ini ativo, com a página resolvida para o ID real na ECU. */
-    private class MegaSpeedScalar(val pageId: Int, val offset: Int, val signed: Boolean, val scale: Double, val translate: Double)
+    /**
+     * Campo do .ini ativo (escalar U08/S08/U16/S16 big-endian ou `bits` de um byte), com a página
+     * resolvida para o ID real na ECU. Em campo `bits`, [bitLow]/[bitHigh] delimitam o valor no byte.
+     */
+    private class MegaSpeedScalar(
+        val pageId: Int,
+        val offset: Int,
+        val width: Int,
+        val signed: Boolean,
+        val scale: Double,
+        val translate: Double,
+        val bitLow: Int? = null,
+        val bitHigh: Int? = null,
+    ) {
+        val isBits get() = bitLow != null
+        val bitMask get() = ((1 shl (bitHigh!! - bitLow!! + 1)) - 1)
+    }
 
     private fun megaSpeedScalar(name: String): MegaSpeedScalar {
         if (MegaSpeedWritableFields.byName(name) == null) {
@@ -1767,14 +1782,22 @@ class EcuClient(
         val field = definition.fields.firstOrNull { it.section.equals("Constants", true) && it.name == name }
             ?: throw UnsupportedOperationException("Campo $name ausente no .ini")
         val type = field.dataType.uppercase()
-        require(field.kind == io.ecucore.definition.IniFieldKind.SCALAR && (type == "S16" || type == "U16")) {
-            "Campo $name não é escalar de 16 bits ($type)"
-        }
         val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
             ?: throw UnsupportedOperationException("Página do campo $name não resolvida")
+        val offset = field.offset ?: error("Campo $name sem offset")
+        if (field.kind == io.ecucore.definition.IniFieldKind.BITS) {
+            require(type == "U08") { "Campo $name: bits só suportados em U08 ($type)" }
+            val low = field.bitLow ?: error("Campo $name sem bit inicial")
+            val high = field.bitHigh ?: error("Campo $name sem bit final")
+            require(low in 0..high && high <= 7) { "Campo $name: faixa de bits inválida" }
+            return MegaSpeedScalar(pageId, offset, 1, false, 1.0, 0.0, low, high)
+        }
+        require(field.kind == io.ecucore.definition.IniFieldKind.SCALAR && type in setOf("S08", "U08", "S16", "U16")) {
+            "Campo $name não é escalar de 8 ou 16 bits ($type)"
+        }
         val scale = field.scale ?: 1.0
         require(scale > 0.0) { "Escala inválida para $name" }
-        return MegaSpeedScalar(pageId, field.offset ?: error("Campo $name sem offset"), type == "S16", scale, field.translate ?: 0.0)
+        return MegaSpeedScalar(pageId, offset, if (type.endsWith("16")) 2 else 1, type.startsWith("S"), scale, field.translate ?: 0.0)
     }
 
     private fun requireMegaSpeedForFieldAccess() {
@@ -1787,9 +1810,12 @@ class EcuClient(
         requireMegaSpeedForFieldAccess()
         return fields.associateWith { name ->
             val f = megaSpeedScalar(name)
-            val bytes = readConfigChunk(f.pageId, f.offset, 2)
-            var raw = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
-            if (f.signed && raw >= 0x8000) raw -= 0x10000
+            val bytes = readConfigChunk(f.pageId, f.offset, f.width)
+            if (f.isBits) {
+                return@associateWith (((bytes[0].toInt() and 0xFF) shr f.bitLow!!) and f.bitMask).toDouble()
+            }
+            var raw = if (f.width == 2) ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF) else bytes[0].toInt() and 0xFF
+            if (f.signed && raw >= (1 shl (8 * f.width - 1))) raw -= 1 shl (8 * f.width)
             (raw + f.translate) * f.scale
         }
     }
@@ -1803,18 +1829,34 @@ class EcuClient(
             "${spec.label}: valor ${value} fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
         }
         val f = megaSpeedScalar(field)
-        val raw = kotlin.math.round(value / f.scale - f.translate).toInt()
-        val range = if (f.signed) -32768..32767 else 0..65535
-        require(raw in range) { "${spec.label}: valor fora do alcance do campo" }
-        val newBytes = byteArrayOf(((raw shr 8) and 0xFF).toByte(), (raw and 0xFF).toByte())
-        val current = readConfigChunk(f.pageId, f.offset, 2)
+        val current = readConfigChunk(f.pageId, f.offset, f.width)
+        val raw: Int
+        val newBytes: ByteArray
+        if (f.isBits) {
+            val bits = kotlin.math.round(value).toInt()
+            require(bits in 0..f.bitMask) { "${spec.label}: valor fora do alcance do campo" }
+            raw = bits
+            // Os demais bits do byte (ex.: outros RevLimOption_*) são preservados a partir da leitura.
+            val keep = (f.bitMask shl f.bitLow!!).inv()
+            newBytes = byteArrayOf((((current[0].toInt() and 0xFF) and keep) or (bits shl f.bitLow)).toByte())
+        } else {
+            raw = kotlin.math.round(value / f.scale - f.translate).toInt()
+            val range = if (f.signed) -(1 shl (8 * f.width - 1)) until (1 shl (8 * f.width - 1)) else 0 until (1 shl (8 * f.width))
+            require(raw in range) { "${spec.label}: valor fora do alcance do campo" }
+            newBytes = if (f.width == 2) {
+                byteArrayOf(((raw shr 8) and 0xFF).toByte(), (raw and 0xFF).toByte())
+            } else {
+                byteArrayOf((raw and 0xFF).toByte())
+            }
+        }
         // Igual ao TunerStudio: só os bytes que mudaram vão para a ECU.
-        val first = (0..1).firstOrNull { current[it] != newBytes[it] }
+        val indices = newBytes.indices
+        val first = indices.firstOrNull { current[it] != newBytes[it] }
         if (first == null) {
             Logger.d(TAG, "MegaSpeed $field já está em $value; nada a gravar")
             return
         }
-        val last = (1 downTo 0).first { current[it] != newBytes[it] }
+        val last = indices.last { current[it] != newBytes[it] }
         val data = newBytes.copyOfRange(first, last + 1)
         Logger.d(TAG, "Gravando MegaSpeed $field=$value (raw=$raw) tabela=0x${f.pageId.toString(16)} off=${f.offset + first} len=${data.size}")
         writeMsTableVerified(
