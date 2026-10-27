@@ -467,11 +467,15 @@ class EcuClient(
                 // A partir daqui a era do firmware manda no enquadramento, não o transporte —
                 // mas só onde temos evidência. Afirmamos `true` apenas para Speeduino 202201+,
                 // onde o .ini declara `messageEnvelopeFormat = msEnvelope_1.0` e o campo foi
-                // validado em ECU real. Todo o resto fica `null` = decide pelos flags do
+                // validado em ECU real. rusEFI também: só fala o protocolo em envelope, sem
+                // alternativa legacy, então o perfil USB STABLE (sem fallback modern) não pode
+                // bloqueá-lo (Crashlytics 1.6.4: "Modern protocol unavailable for rusEFI ..."). Todo o resto fica `null` = decide pelos flags do
                 // transporte, exatamente como antes: nunca forçamos legacy num firmware que hoje
                 // funciona em modern, porque isso seria uma mudança sem cobertura nenhuma.
                 protocol.setSessionModernEnvelope(
-                    if (resolvedDefinition.family == EcuFamily.SPEEDUINO && era.usesModernEnvelope()) {
+                    if (era.usesModernEnvelope() &&
+                        (resolvedDefinition.family == EcuFamily.SPEEDUINO || resolvedDefinition.family == EcuFamily.RUSEFI)
+                    ) {
                         true
                     } else {
                         null

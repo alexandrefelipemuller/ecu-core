@@ -90,6 +90,42 @@ class EcuProtocolModernLiveDataGuardTest {
         assertTrue(connection.sentPackets.isNotEmpty())
     }
 
+    @Test
+    fun `rusefi output channels are blocked on a no-fallback transport while envelope is unconfirmed`() = runBlocking {
+        // Flags do EcuUsbSerialConnection com o perfil STABLE.
+        val connection = FakeTransport(prefersLegacy = true, supportsModern = false, modernFallback = false)
+        connection.connect()
+        val protocol = EcuProtocol(connection)
+
+        val error = assertFailsWith<Exception> { protocol.readRusefiOutputChannels(4) }
+
+        assertTrue(error.message!!.contains("Modern protocol unavailable"))
+        assertTrue(connection.sentPackets.isEmpty())
+    }
+
+    @Test
+    fun `confirmed envelope lets rusefi read output channels on a no-fallback transport`() = runBlocking {
+        val payload = ByteArray(4) { (it + 1).toByte() }
+        val connection = FakeTransport(
+            prefersLegacy = true,
+            supportsModern = false,
+            modernFallback = false,
+            responseChunks = arrayOf(
+                byteArrayOf(0x00, 0x05),
+                byteArrayOf(0x00) + payload,
+                byteArrayOf(0x00, 0x00, 0x00, 0x00),
+            )
+        )
+        connection.connect()
+        val protocol = EcuProtocol(connection)
+        protocol.setSessionModernEnvelope(true)
+
+        val data = protocol.readRusefiOutputChannels(4)
+
+        assertContentEquals(payload, data)
+        assertEquals('O'.code, connection.sentPackets.single()[2].toInt() and 0xFF)
+    }
+
     private class FakeTransport(
         private val prefersLegacy: Boolean,
         private val supportsModern: Boolean,
