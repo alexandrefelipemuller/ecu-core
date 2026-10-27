@@ -97,6 +97,9 @@ class ConfigManagerTest {
         assertTrue(File(dir, "info.txt").readText().contains("Protocol Version: 2"))
         assertContentEquals(ByteArray(288) { (2 + it).toByte() }, File(dir, "page_2.bin").readBytes())
         assertEquals(288, result.pages[2.toByte()]!!.size)
+        val checksums = io.ecucore.sync.BackupIntegrity.readChecksums(dir)!!
+        assertEquals(11, checksums.size)
+        assertEquals(io.ecucore.sync.BackupIntegrity.crc32(File(dir, "page_2.bin").readBytes()), checksums[2.toByte()])
         assertTrue(progress.first().startsWith("Obtendo capacidades"))
         assertTrue(progress.last().startsWith("Download concluído!"))
         assertEquals(dir.name, manager.latestSavedConfig()!!.name)

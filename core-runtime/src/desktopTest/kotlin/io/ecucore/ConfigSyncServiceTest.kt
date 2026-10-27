@@ -150,6 +150,60 @@ class ConfigSyncServiceTest {
     }
 
     @Test
+    fun `a backup with a tampered page is refused before any write`() = runBlocking<Unit> {
+        val (client, ecu) = connected()
+        val dir = fullBackup("adulterado")
+        io.ecucore.sync.BackupIntegrity.writeChecksums(dir, manager.loadConfig(dir))
+        File(dir, "page_2.bin").writeBytes(ByteArray(288) { 0x55 })
+
+        val error = assertFailsWith<io.ecucore.sync.BackupCorruptedException> { service.restoreConfigToEcu(client, dir) }
+
+        assertEquals(listOf(2.toByte()), error.pages)
+        assertTrue(ecu.writes.isEmpty())
+        assertTrue(ecu.burns.isEmpty())
+    }
+
+    @Test
+    fun `a backup whose checksums match restores normally`() = runBlocking<Unit> {
+        val (client, ecu) = connected()
+        val dir = fullBackup("integro")
+        io.ecucore.sync.BackupIntegrity.writeChecksums(dir, manager.loadConfig(dir))
+
+        assertTrue(service.restoreConfigToEcu(client, dir).completed)
+        assertEquals((1..10).toSet(), ecu.writes.map { it.id }.toSet())
+    }
+
+    @Test
+    fun `a legacy backup without checksums is still restorable`() = runBlocking<Unit> {
+        val (client, _) = connected()
+        assertTrue(service.restoreConfigToEcu(client, fullBackup("legado")).completed)
+    }
+
+    @Test
+    fun `safety backup saves the current ECU state into a new session before writing`() = runBlocking<Unit> {
+        val (client, ecu) = connected()
+        for ((page, size) in ConfigManager.PAGE_SIZES) ecu.load(page.toInt(), 0, ByteArray(size) { 0x11 })
+        val backup = fullBackup("novo")
+        val before = sessionsDir.listFiles()!!.toSet()
+
+        service.restoreConfigToEcu(client, backup, safetyBackup = true)
+
+        val created = (sessionsDir.listFiles()!!.toSet() - before).single()
+        assertContentEquals(ByteArray(288) { 0x11 }, File(created, "page_2.bin").readBytes())
+        assertContentEquals(ByteArray(288) { (2 + it).toByte() }, ecu.mem(2).copyOf(288))
+    }
+
+    @Test
+    fun `restore is cancelled without writing when the safety backup fails`() = runBlocking<Unit> {
+        val (client, ecu) = connected()
+        val backup = fullBackup("novo2")
+        ecu.disconnect()
+
+        assertFailsWith<Exception> { service.restoreConfigToEcu(client, backup, safetyBackup = true) }
+        assertTrue(ecu.writes.isEmpty())
+    }
+
+    @Test
     fun `a full restore writes every page except the status page and burns once`() = runBlocking<Unit> {
         val (client, ecu) = connected()
         val outcome = service.restoreConfigToEcu(client, fullBackup())

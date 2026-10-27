@@ -118,15 +118,28 @@ class ConfigSyncService(
         stopOnRangeErr: Boolean = false,
         applyTriggerFix: Boolean = false,
         restartStreamIntervalMs: Long? = null,
+        safetyBackup: Boolean = false,
     ): RestoreOutcome = withContext(Dispatchers.IO) {
+        val pages = configManager.loadConfig(sessionDir)
+        if (pages.isEmpty()) {
+            throw IllegalStateException("Backup sem páginas válidas")
+        }
+        val corrupt = BackupIntegrity.corruptPages(pages, BackupIntegrity.readChecksums(sessionDir))
+        if (corrupt.isNotEmpty()) throw BackupCorruptedException(corrupt)
+
         val wasStreaming = client.isStreaming()
         if (wasStreaming) {
             client.pauseLiveDataStream()
         }
 
-        val pages = configManager.loadConfig(sessionDir)
-        if (pages.isEmpty()) {
-            throw IllegalStateException("Backup sem páginas válidas")
+        if (safetyBackup) {
+            // Estado atual da ECU salvo antes de sobrescrevê-lo; sem a cópia, nada é gravado.
+            val current = configManager.downloadAllConfigs(client) { _, _, _ -> }
+            if (!current.success) {
+                throw IllegalStateException(
+                    "Backup de segurança da ECU falhou (${current.error}); restauração cancelada"
+                )
+            }
         }
 
         val errors = mutableListOf<String>()

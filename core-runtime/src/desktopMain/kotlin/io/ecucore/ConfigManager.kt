@@ -11,6 +11,7 @@ import io.ecucore.model.TriggerSettings
 import io.ecucore.model.VeTable
 import io.ecucore.protocol.SerialCapability
 import io.ecucore.transport.EcuTransport
+import io.ecucore.sync.BackupIntegrity
 import io.ecucore.sync.SessionTableParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -126,6 +127,8 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
                     )
                 }
             }
+
+            BackupIntegrity.writeChecksums(sessionDir, downloadedPages.mapValues { it.value.data })
 
             onProgress(
                 PAGE_SIZES.size + 1,
