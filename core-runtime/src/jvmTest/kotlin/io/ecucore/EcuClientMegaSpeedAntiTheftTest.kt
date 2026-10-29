@@ -1,11 +1,13 @@
 package io.ecucore
 
 import io.ecucore.definition.IniParser
+import io.ecucore.model.EcuAntiTheft
 import io.ecucore.model.MegaSpeedAntiTheft
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** Antifurto: `floodClear` (tabela 4, offset 588) negativo trava a partida. */
@@ -43,19 +45,22 @@ class EcuClientMegaSpeedAntiTheftTest {
 
     private fun ClientFakeEcu.floodClear(raw: Int) = load(0x04, 588, MegaSpeedAntiTheft.encode(raw))
 
+    private fun ClientFakeEcu.floodClear() = MegaSpeedAntiTheft.decode(mem(0x04), 588)
+
     @Test
     fun `travar grava o valor negativo na tabela 4 e queima`() = runBlocking<Unit> {
         val (c, ecu) = connect()
         ecu.floodClear(700) // 70,0 %
 
-        assertEquals(700, c.lockMegaSpeedAntiTheft())
+        assertEquals(700, c.lockAntiTheft())
 
         val w = ecu.writes.single()
         assertEquals(0x04, w.id)
         assertEquals(588, w.offset)
         assertEquals(listOf(0xFD, 0x43), w.data.map { it.toInt() and 0xFF }) // -701
         assertEquals(listOf(0x04), ecu.burns)
-        assertEquals(-701, c.readMegaSpeedAntiTheftRaw())
+        assertTrue(c.readAntiTheftLocked())
+        assertEquals(-701, ecu.floodClear())
     }
 
     @Test
@@ -63,9 +68,10 @@ class EcuClientMegaSpeedAntiTheftTest {
         val (c, ecu) = connect()
         ecu.floodClear(-701)
 
-        c.unlockMegaSpeedAntiTheft()
+        c.unlockAntiTheft()
 
-        assertEquals(700, c.readMegaSpeedAntiTheftRaw())
+        assertEquals(700, ecu.floodClear())
+        assertFalse(c.readAntiTheftLocked())
         assertEquals(listOf(0x04), ecu.burns)
     }
 
@@ -73,15 +79,15 @@ class EcuClientMegaSpeedAntiTheftTest {
     fun `destravar com original do celular usa esse valor`() = runBlocking<Unit> {
         val (c, ecu) = connect()
         ecu.floodClear(-701)
-        c.unlockMegaSpeedAntiTheft(originalRaw = 650)
-        assertEquals(650, c.readMegaSpeedAntiTheftRaw())
+        c.unlockAntiTheft(originalRaw = 650)
+        assertEquals(650, ecu.floodClear())
     }
 
     @Test
     fun `destravar ecu ja destravada nao grava`() = runBlocking<Unit> {
         val (c, ecu) = connect()
         ecu.floodClear(700)
-        c.unlockMegaSpeedAntiTheft()
+        c.unlockAntiTheft()
         assertTrue(ecu.writes.isEmpty())
         assertTrue(ecu.burns.isEmpty())
     }
@@ -90,19 +96,19 @@ class EcuClientMegaSpeedAntiTheftTest {
     fun `motor girando ou ecu ja travada nao trava`() = runBlocking<Unit> {
         val (running, ecuRunning) = connect(rpm = 850)
         ecuRunning.floodClear(700)
-        assertFailsWith<IllegalStateException> { running.lockMegaSpeedAntiTheft() }
+        assertFailsWith<IllegalStateException> { running.lockAntiTheft() }
         assertTrue(ecuRunning.writes.isEmpty())
 
         val (c, ecu) = connect()
         ecu.floodClear(-701)
-        assertFailsWith<IllegalStateException> { c.lockMegaSpeedAntiTheft() }
+        assertFailsWith<IllegalStateException> { c.lockAntiTheft() }
         assertTrue(ecu.writes.isEmpty())
     }
 
     @Test
     fun `ini com floodClear em outro lugar recusa`() = runBlocking<Unit> {
         val (c, ecu) = connect(iniText = ini("""floodClear = scalar, S16, 590, "%", 0.10000, 0.00000, 0.00, 100.00, 1"""))
-        assertFailsWith<UnsupportedOperationException> { c.lockMegaSpeedAntiTheft() }
+        assertFailsWith<UnsupportedOperationException> { c.lockAntiTheft() }
         assertTrue(ecu.writes.isEmpty())
     }
 
@@ -111,9 +117,9 @@ class EcuClientMegaSpeedAntiTheftTest {
         val (c, ecu) = connect()
         ecu.floodClear(700)
         val ops = mutableListOf<String>()
-        c.writeGuard = { op -> ops += op; op != MegaSpeedAntiTheft.OP_LOCK }
-        assertFailsWith<WriteNotPermittedException> { c.lockMegaSpeedAntiTheft() }
-        assertEquals(listOf(MegaSpeedAntiTheft.OP_LOCK), ops)
+        c.writeGuard = { op -> ops += op; op != EcuAntiTheft.OP_LOCK }
+        assertFailsWith<WriteNotPermittedException> { c.lockAntiTheft() }
+        assertEquals(listOf(EcuAntiTheft.OP_LOCK), ops)
         assertTrue(ecu.writes.isEmpty())
     }
 
@@ -122,7 +128,7 @@ class EcuClientMegaSpeedAntiTheftTest {
         val ecu = ClientFakeEcu(ClientFakeEcu.Kind.MS2)
         val client = EcuClient(ecu, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
         client.connect()
-        assertFailsWith<UnsupportedOperationException> { client.readMegaSpeedAntiTheftRaw() }
-        assertFailsWith<UnsupportedOperationException> { client.lockMegaSpeedAntiTheft() }
+        assertFailsWith<UnsupportedOperationException> { client.readAntiTheftLocked() }
+        assertFailsWith<UnsupportedOperationException> { client.lockAntiTheft() }
     }
 }
