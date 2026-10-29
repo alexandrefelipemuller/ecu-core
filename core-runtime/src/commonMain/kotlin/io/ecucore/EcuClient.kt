@@ -2,6 +2,10 @@ package io.ecucore
 
 import kotlin.concurrent.Volatile
 
+import io.ecucore.model.MegaSpeedWritableField
+import io.ecucore.model.IniCurveCodec
+import io.ecucore.model.IniWritableCurve
+import io.ecucore.model.Ms2WritableFields
 import io.ecucore.model.Ms3GenericSensors
 import io.ecucore.model.Ms3GenericSensorConfig
 import io.ecucore.model.Ms3GenericSensorsSnapshot
@@ -1778,8 +1782,8 @@ class EcuClient(
     }
 
     private fun megaSpeedScalar(name: String): MegaSpeedScalar {
-        if (MegaSpeedWritableFields.byName(name) == null) {
-            throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $name")
+        if (writableFieldSpec(name) == null) {
+            throw IllegalArgumentException("Campo não permitido para gravação: $name")
         }
         val definition = activeIniDefinition
             ?: throw UnsupportedOperationException("Esta operação requer o .ini da CostaMegaSpeed carregado")
@@ -1805,9 +1809,75 @@ class EcuClient(
     }
 
     private fun requireMegaSpeedForFieldAccess() {
-        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed")
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MEGASPEED && family != EcuFamily.MS2) {
+            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed e MS2")
         }
+    }
+
+    /** Whitelist de campos escalares graváveis da família conectada. */
+    private fun writableFieldSpec(name: String): MegaSpeedWritableField? =
+        if (firmwareInfo?.family == EcuFamily.MS2) Ms2WritableFields.byName(name) else MegaSpeedWritableFields.byName(name)
+
+    private class IniCurve(val pageId: Int, val offset: Int, val count: Int, val width: Int, val signed: Boolean, val scale: Double, val translate: Double)
+
+    private fun iniCurve(spec: IniWritableCurve): IniCurve {
+        val definition = activeIniDefinition
+            ?: throw UnsupportedOperationException("Esta operação requer o .ini carregado")
+        val candidates = definition.fields.filter {
+            it.section.equals("Constants", true) && it.name == spec.name && it.kind == io.ecucore.definition.IniFieldKind.ARRAY
+        }
+        // O parser não avalia `#if`: com duas definições (ex.: tempTable °C/°F) escolhe pela unidade.
+        val field = (spec.unitSuffix?.let { suf -> candidates.firstOrNull { it.units?.trim()?.endsWith(suf, true) == true } }
+            ?: candidates.firstOrNull())
+            ?: throw UnsupportedOperationException("Curva ${spec.name} ausente no .ini")
+        val type = field.dataType.uppercase()
+        require(type in setOf("S08", "U08", "S16", "U16")) { "Curva ${spec.name}: tipo $type não suportado" }
+        val shape = field.shape ?: error("Curva ${spec.name} sem tamanho")
+        require(shape.columns == 1) { "Curva ${spec.name} não é 1D" }
+        val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
+            ?: throw UnsupportedOperationException("Página da curva ${spec.name} não resolvida")
+        val scale = field.scale ?: 1.0
+        require(scale > 0.0) { "Escala inválida para ${spec.name}" }
+        return IniCurve(pageId, field.offset ?: error("Curva ${spec.name} sem offset"), shape.rows,
+            if (type.endsWith("16")) 2 else 1, type.startsWith("S"), scale, field.translate ?: 0.0)
+    }
+
+    private fun curveSpec(name: String): IniWritableCurve {
+        if (firmwareInfo?.family != EcuFamily.MS2) throw UnsupportedOperationException("Curvas .ini disponíveis apenas para MS2")
+        return Ms2WritableFields.curveByName(name)
+            ?: throw IllegalArgumentException("Curva não permitida para gravação: $name")
+    }
+
+    override suspend fun readIniCurve(name: String): List<Double> {
+        val c = iniCurve(curveSpec(name))
+        return IniCurveCodec.decode(readConfigChunk(c.pageId, c.offset, c.count * c.width), c.width, c.signed, c.scale, c.translate)
+    }
+
+    override suspend fun writeIniCurve(name: String, values: List<Double>) {
+        ensureWritable("writeIniCurve")
+        val spec = curveSpec(name)
+        val c = iniCurve(spec)
+        require(values.size == c.count) { "${spec.label}: esperado ${c.count} pontos, recebido ${values.size}" }
+        values.forEach {
+            require(it.isFinite() && it >= spec.min && it <= spec.max) {
+                "${spec.label}: valor $it fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
+            }
+        }
+        val newBytes = IniCurveCodec.encode(values, c.width, c.signed, c.scale, c.translate)
+        val current = readConfigChunk(c.pageId, c.offset, newBytes.size)
+        val first = newBytes.indices.firstOrNull { current[it] != newBytes[it] }
+        if (first == null) {
+            Logger.d(TAG, "Curva $name já está igual; nada a gravar")
+            return
+        }
+        val last = newBytes.indices.last { current[it] != newBytes[it] }
+        val data = newBytes.copyOfRange(first, last + 1)
+        Logger.d(TAG, "Gravando curva $name tabela=0x${c.pageId.toString(16)} off=${c.offset + first} len=${data.size}")
+        writeMsTableVerified(
+            TableRegions(listOf(TableRegion(c.pageId, c.offset + first, data)), setOf(c.pageId)),
+            "Curva $name",
+        )
     }
 
     override suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> {
@@ -1827,8 +1897,8 @@ class EcuClient(
     override suspend fun writeMegaSpeedConfigField(field: String, value: Double) {
         ensureWritable("writeMegaSpeedConfigField")
         requireMegaSpeedForFieldAccess()
-        val spec = MegaSpeedWritableFields.byName(field)
-            ?: throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $field")
+        val spec = writableFieldSpec(field)
+            ?: throw IllegalArgumentException("Campo não permitido para gravação: $field")
         require(value.isFinite() && value >= spec.min && value <= spec.max) {
             "${spec.label}: valor ${value} fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
         }

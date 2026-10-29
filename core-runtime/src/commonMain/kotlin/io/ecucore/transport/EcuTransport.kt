@@ -149,6 +149,17 @@ interface EcuTransport {
     suspend fun writeMegaSpeedConfigField(field: String, value: Double): Unit =
         throw UnsupportedOperationException("MegaSpeed field write not supported by this transport")
 
+    /**
+     * Curva 1D do .ini (família MS2) na unidade do .ini; `tempTable` sempre em °F
+     * (use [io.ecucore.model.IniTemperature] para °C). Só nomes de [io.ecucore.model.Ms2WritableFields.curves].
+     */
+    suspend fun readIniCurve(name: String): List<Double> =
+        throw UnsupportedOperationException("INI curve read not supported by this transport")
+
+    /** Grava a curva 1D (só a faixa de bytes alterada), confere por releitura e dá burn da página. */
+    suspend fun writeIniCurve(name: String, values: List<Double>): Unit =
+        throw UnsupportedOperationException("INI curve write not supported by this transport")
+
     suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
 
