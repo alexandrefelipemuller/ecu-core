@@ -20,7 +20,9 @@ import io.ecucore.cache.NoopEcuConfigPageCache
 import io.ecucore.connection.ConnectionTrace
 import io.ecucore.connection.IEcuConnection
 import io.ecucore.model.FirmwareEra
+import io.ecucore.model.EcuAntiTheft
 import io.ecucore.model.MegaSpeedAntiTheft
+import io.ecucore.model.SpeeduinoAntiTheft
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.Algorithm
 import io.ecucore.model.EcuCapabilities
@@ -2054,18 +2056,44 @@ class EcuClient(
         return f
     }
 
-    override suspend fun readMegaSpeedAntiTheftRaw(): Int {
+    override suspend fun readAntiTheftLocked(): Boolean = when (firmwareInfo?.family) {
+        EcuFamily.MEGASPEED -> MegaSpeedAntiTheft.isLocked(readMegaSpeedAntiTheftRaw())
+        EcuFamily.SPEEDUINO -> readSpeeduinoAntiTheft().locked
+        else -> throw UnsupportedOperationException("Antifurto disponível apenas para MegaSpeed e Speeduino")
+    }
+
+    override suspend fun lockAntiTheft(): Int {
+        ensureWritable(EcuAntiTheft.OP_LOCK)
+        return when (firmwareInfo?.family) {
+            EcuFamily.MEGASPEED -> lockMegaSpeedAntiTheft()
+            EcuFamily.SPEEDUINO -> lockSpeeduinoAntiTheft()
+            else -> throw UnsupportedOperationException("Antifurto disponível apenas para MegaSpeed e Speeduino")
+        }
+    }
+
+    override suspend fun unlockAntiTheft(originalRaw: Int?) {
+        ensureWritable(EcuAntiTheft.OP_UNLOCK)
+        when (firmwareInfo?.family) {
+            EcuFamily.MEGASPEED -> unlockMegaSpeedAntiTheft(originalRaw)
+            EcuFamily.SPEEDUINO -> unlockSpeeduinoAntiTheft(originalRaw)
+            else -> throw UnsupportedOperationException("Antifurto disponível apenas para MegaSpeed e Speeduino")
+        }
+    }
+
+    /** Travar com o motor girando não apaga o motor (o corte só vale na partida), mas a trava é feita para o carro estacionado. */
+    private suspend fun requireEngineStoppedForAntiTheft() {
+        val rpm = withEcuIo { readLiveData() }.rpm
+        check(rpm == 0) { "Anti-theft: turn the engine off to lock (current speed $rpm RPM)" }
+    }
+
+    private suspend fun readMegaSpeedAntiTheftRaw(): Int {
         val f = megaSpeedAntiTheftScalar()
         return MegaSpeedAntiTheft.decode(readConfigChunk(f.pageId, f.offset, f.width))
     }
 
-    override suspend fun lockMegaSpeedAntiTheft(): Int {
-        ensureWritable(MegaSpeedAntiTheft.OP_LOCK)
+    private suspend fun lockMegaSpeedAntiTheft(): Int {
         val f = megaSpeedAntiTheftScalar()
-        // Travar com o motor girando não apaga o motor (o corte só vale na partida), mas a trava é
-        // feita para o carro estacionado: recusar evita qualquer surpresa.
-        val rpm = withEcuIo { readLiveData() }.rpm
-        check(rpm == 0) { "Anti-theft: turn the engine off to lock (current speed $rpm RPM)" }
+        requireEngineStoppedForAntiTheft()
         val current = readConfigChunk(f.pageId, f.offset, f.width)
         val original = MegaSpeedAntiTheft.decode(current)
         check(!MegaSpeedAntiTheft.isLocked(original)) { "Anti-theft: the ECU is already locked" }
@@ -2077,8 +2105,7 @@ class EcuClient(
         return original
     }
 
-    override suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int?) {
-        ensureWritable(MegaSpeedAntiTheft.OP_UNLOCK)
+    private suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int?) {
         val f = megaSpeedAntiTheftScalar()
         val current = readConfigChunk(f.pageId, f.offset, f.width)
         val raw = MegaSpeedAntiTheft.decode(current)
@@ -2089,6 +2116,96 @@ class EcuClient(
         val restored = originalRaw ?: MegaSpeedAntiTheft.originalFrom(raw)
         require(restored in 0..MegaSpeedAntiTheft.MAX_ORIGINAL_RAW) { "Anti-theft: invalid original value ($restored)" }
         writeMegaSpeedChangedBytes(f, current, MegaSpeedAntiTheft.encode(restored), "antifurto destravar", "MegaSpeed antifurto")
+    }
+
+    private class SpeeduinoAntiTheftState(val flood: Int, val marker: Int, val stored: Int) {
+        val locked get() = SpeeduinoAntiTheft.isLocked(flood, marker)
+    }
+
+    /** Campos do antifurto no .ini ativo; recusa se algum não estiver onde a trava espera. */
+    private fun requireSpeeduinoAntiTheftLayout() {
+        val expected = listOf(
+            Triple(SpeeduinoAntiTheft.FLOOD_FIELD, SpeeduinoAntiTheft.FLOOD_PAGE, SpeeduinoAntiTheft.FLOOD_OFFSET),
+            Triple(SpeeduinoAntiTheft.MARKER_FIELD, SpeeduinoAntiTheft.MARKER_PAGE, SpeeduinoAntiTheft.MARKER_OFFSET),
+            Triple(SpeeduinoAntiTheft.ORIGINAL_FIELD, SpeeduinoAntiTheft.MARKER_PAGE, SpeeduinoAntiTheft.ORIGINAL_OFFSET),
+        )
+        for ((name, page, offset) in expected) {
+            val f = try {
+                megaSpeedScalar(name, requireWritable = false)
+            } catch (e: IllegalArgumentException) {
+                throw UnsupportedOperationException("Antifurto: $name inválido no .ini (${e.message})")
+            } catch (e: IllegalStateException) {
+                throw UnsupportedOperationException("Antifurto: $name inválido no .ini (${e.message})")
+            }
+            if (f.pageId != page || f.offset != offset || f.width != 1 || f.signed || f.isBits) {
+                throw UnsupportedOperationException("Antifurto: $name do .ini não confere com o esperado")
+            }
+        }
+    }
+
+    private suspend fun readSpeeduinoAntiTheft(): SpeeduinoAntiTheftState {
+        requireSpeeduinoAntiTheftLayout()
+        val flood = readConfigChunk(SpeeduinoAntiTheft.FLOOD_PAGE, SpeeduinoAntiTheft.FLOOD_OFFSET, 1)
+        val marker = readConfigChunk(SpeeduinoAntiTheft.MARKER_PAGE, SpeeduinoAntiTheft.MARKER_OFFSET, 2)
+        return SpeeduinoAntiTheftState(
+            flood = flood[0].toInt() and 0xFF,
+            marker = marker[0].toInt() and 0xFF,
+            stored = marker[1].toInt() and 0xFF,
+        )
+    }
+
+    private suspend fun writeSpeeduinoAntiTheftBytes(page: Int, offset: Int, data: ByteArray, label: String) {
+        writeConfigPageVerified(pageNum = page.toByte(), offset = offset, data = data, label = label)
+        invalidateCachedPage(page)
+        protocol.burnConfig()
+    }
+
+    /**
+     * Marca antes do desafogador: se a segunda gravação falhar, a marca sozinha não trava nada.
+     * Na volta, o desafogador antes da marca, pelo mesmo motivo.
+     */
+    private suspend fun lockSpeeduinoAntiTheft(): Int {
+        val state = readSpeeduinoAntiTheft()
+        requireEngineStoppedForAntiTheft()
+        check(!state.locked) { "Antifurto: a ECU já está travada" }
+        require(state.flood != SpeeduinoAntiTheft.LOCKED_FLOOD) {
+            "Antifurto: o desafogador (${SpeeduinoAntiTheft.FLOOD_FIELD}) já está em 0 %; confira a configuração de partida"
+        }
+        writeSpeeduinoAntiTheftBytes(
+            SpeeduinoAntiTheft.MARKER_PAGE,
+            SpeeduinoAntiTheft.MARKER_OFFSET,
+            byteArrayOf(SpeeduinoAntiTheft.MARKER.toByte(), state.flood.toByte()),
+            "Speeduino antifurto (marca)",
+        )
+        writeSpeeduinoAntiTheftBytes(
+            SpeeduinoAntiTheft.FLOOD_PAGE,
+            SpeeduinoAntiTheft.FLOOD_OFFSET,
+            byteArrayOf(SpeeduinoAntiTheft.LOCKED_FLOOD.toByte()),
+            "Speeduino antifurto (travar)",
+        )
+        return state.flood
+    }
+
+    private suspend fun unlockSpeeduinoAntiTheft(originalRaw: Int?) {
+        val state = readSpeeduinoAntiTheft()
+        if (!state.locked) {
+            Logger.d(TAG, "Antifurto: ECU já destravada; nada a gravar")
+            return
+        }
+        val restored = originalRaw ?: SpeeduinoAntiTheft.originalFrom(state.stored)
+        require(restored in 1..0xFF) { "Antifurto: valor original inválido ($restored)" }
+        writeSpeeduinoAntiTheftBytes(
+            SpeeduinoAntiTheft.FLOOD_PAGE,
+            SpeeduinoAntiTheft.FLOOD_OFFSET,
+            byteArrayOf(restored.toByte()),
+            "Speeduino antifurto (destravar)",
+        )
+        writeSpeeduinoAntiTheftBytes(
+            SpeeduinoAntiTheft.MARKER_PAGE,
+            SpeeduinoAntiTheft.MARKER_OFFSET,
+            byteArrayOf(0, 0),
+            "Speeduino antifurto (limpar marca)",
+        )
     }
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {

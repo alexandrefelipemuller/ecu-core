@@ -16,10 +16,6 @@ object MegaSpeedAntiTheft {
     const val OFFSET = 588
     const val WIDTH = 2
 
-    /** Nomes de operação passados ao `writeGuard` do client ao travar e destravar. */
-    const val OP_LOCK = "megaSpeedAntiTheftLock"
-    const val OP_UNLOCK = "megaSpeedAntiTheftUnlock"
-
     /** 100,0 % em bruto: maior valor que o .ini aceita para o `floodClear`. */
     const val MAX_ORIGINAL_RAW = 1000
 

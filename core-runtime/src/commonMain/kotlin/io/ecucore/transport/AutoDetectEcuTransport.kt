@@ -200,11 +200,11 @@ class AutoDetectEcuTransport(
     override suspend fun writeMegaSpeedConfigField(field: String, value: Double) =
         selected().writeMegaSpeedConfigField(field, value)
 
-    override suspend fun readMegaSpeedAntiTheftRaw(): Int = selected().readMegaSpeedAntiTheftRaw()
+    override suspend fun readAntiTheftLocked(): Boolean = selected().readAntiTheftLocked()
 
-    override suspend fun lockMegaSpeedAntiTheft(): Int = selected().lockMegaSpeedAntiTheft()
+    override suspend fun lockAntiTheft(): Int = selected().lockAntiTheft()
 
-    override suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int?) = selected().unlockMegaSpeedAntiTheft(originalRaw)
+    override suspend fun unlockAntiTheft(originalRaw: Int?) = selected().unlockAntiTheft(originalRaw)
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot =
         selected().readRusefiInputOutputSnapshot()

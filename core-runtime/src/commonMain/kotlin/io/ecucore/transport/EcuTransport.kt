@@ -160,17 +160,17 @@ interface EcuTransport {
     suspend fun writeIniCurve(name: String, values: List<Double>): Unit =
         throw UnsupportedOperationException("INI curve write not supported by this transport")
 
-    /** `floodClear` bruto do antifurto ([io.ecucore.model.MegaSpeedAntiTheft]); negativo = partida travada. */
-    suspend fun readMegaSpeedAntiTheftRaw(): Int =
-        throw UnsupportedOperationException("MegaSpeed anti-theft not supported by this transport")
+    /** Partida travada pelo antifurto ([io.ecucore.model.EcuAntiTheft]): MegaSpeed e Speeduino. */
+    suspend fun readAntiTheftLocked(): Boolean =
+        throw UnsupportedOperationException("Anti-theft not supported by this transport")
 
-    /** Trava a partida (motor parado), confere e dá burn; devolve o valor original do `floodClear`. */
-    suspend fun lockMegaSpeedAntiTheft(): Int =
-        throw UnsupportedOperationException("MegaSpeed anti-theft not supported by this transport")
+    /** Trava a partida (motor parado), confere e dá burn; devolve o valor original do desafogador. */
+    suspend fun lockAntiTheft(): Int =
+        throw UnsupportedOperationException("Anti-theft not supported by this transport")
 
     /** Destrava com [originalRaw] ou, se nulo, com o original guardado na própria trava. */
-    suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int? = null): Unit =
-        throw UnsupportedOperationException("MegaSpeed anti-theft not supported by this transport")
+    suspend fun unlockAntiTheft(originalRaw: Int? = null): Unit =
+        throw UnsupportedOperationException("Anti-theft not supported by this transport")
 
     suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
