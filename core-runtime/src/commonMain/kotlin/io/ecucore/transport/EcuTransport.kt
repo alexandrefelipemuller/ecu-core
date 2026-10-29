@@ -149,6 +149,18 @@ interface EcuTransport {
     suspend fun writeMegaSpeedConfigField(field: String, value: Double): Unit =
         throw UnsupportedOperationException("MegaSpeed field write not supported by this transport")
 
+    /** `floodClear` bruto do antifurto ([io.ecucore.model.MegaSpeedAntiTheft]); negativo = partida travada. */
+    suspend fun readMegaSpeedAntiTheftRaw(): Int =
+        throw UnsupportedOperationException("MegaSpeed anti-theft not supported by this transport")
+
+    /** Trava a partida (motor parado), confere e dá burn; devolve o valor original do `floodClear`. */
+    suspend fun lockMegaSpeedAntiTheft(): Int =
+        throw UnsupportedOperationException("MegaSpeed anti-theft not supported by this transport")
+
+    /** Destrava com [originalRaw] ou, se nulo, com o original guardado na própria trava. */
+    suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int? = null): Unit =
+        throw UnsupportedOperationException("MegaSpeed anti-theft not supported by this transport")
+
     suspend fun readMegaSpeedTestStatus(): MegaSpeedTestStatus =
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
 
