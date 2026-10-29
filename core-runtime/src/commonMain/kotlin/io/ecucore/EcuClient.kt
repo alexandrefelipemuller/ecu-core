@@ -1747,8 +1747,9 @@ class EcuClient(
     }
 
     override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView {
-        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed")
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MEGASPEED && !(family == EcuFamily.MS2 && view == MegaSpeedConfigView.IDLE)) {
+            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed (e marcha lenta na MS2)")
         }
         val definition = activeIniDefinition
             ?: throw UnsupportedOperationException("Esta tela requer o .ini da CostaMegaSpeed carregado")
