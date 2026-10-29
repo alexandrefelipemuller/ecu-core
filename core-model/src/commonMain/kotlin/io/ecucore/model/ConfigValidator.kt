@@ -25,6 +25,7 @@ object ConfigValidator {
     const val PROTECTION_RPM_STEP = 100
     const val TPS_ADC_MAX = 255
     const val TPS_MIN_SPAN_WARNING = 50
+    const val TPS_MIN_SPAN_10BIT = 100
     const val PRESSURE_MIN_KPA = -100
     const val PRESSURE_MIN_MAX_KPA = 127
     const val PRESSURE_MAX_KPA = 25500
@@ -85,10 +86,14 @@ object ConfigValidator {
     fun validateTpsCalibration(calibration: TpsCalibration): ValidationResult {
         val errors = mutableListOf<String>()
         val warnings = mutableListOf<String>()
-        rangeError(errors, "TPS min", calibration.tpsMin, 0..TPS_ADC_MAX, " ADC")
-        rangeError(errors, "TPS max", calibration.tpsMax, 0..TPS_ADC_MAX, " ADC")
+        rangeError(errors, "TPS min", calibration.tpsMin, 0..calibration.adcMax, " ADC")
+        rangeError(errors, "TPS max", calibration.tpsMax, 0..calibration.adcMax, " ADC")
         if (calibration.tpsMin >= calibration.tpsMax) {
             errors.add("TPS min (${calibration.tpsMin}) must be lower than TPS max (${calibration.tpsMax})")
+        } else if (calibration.adcMax > TpsCalibration.ADC_MAX_8BIT &&
+            calibration.tpsMax - calibration.tpsMin < TPS_MIN_SPAN_10BIT
+        ) {
+            errors.add("TPS span (${calibration.tpsMax - calibration.tpsMin} ADC) is below the minimum of $TPS_MIN_SPAN_10BIT ADC counts")
         } else if (calibration.tpsMax - calibration.tpsMin < TPS_MIN_SPAN_WARNING) {
             warnings.add("⚠️  TPS calibration span is only ${calibration.tpsMax - calibration.tpsMin} ADC counts - check the sensor")
         }

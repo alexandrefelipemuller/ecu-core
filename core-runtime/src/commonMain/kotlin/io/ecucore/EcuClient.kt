@@ -82,6 +82,11 @@ import io.ecucore.model.RusefiIniUiParsers
 import io.ecucore.model.EcuIniDefinitions
 import io.ecucore.transport.MapSelectionSupport
 import io.ecucore.model.TpsCalibration
+import io.ecucore.model.MS2_TPS_TABLE
+import io.ecucore.model.MS2_TPS_MIN_OFFSET
+import io.ecucore.model.MS2_TPS_BYTES
+import io.ecucore.model.encodeMs2TpsCalibration
+import io.ecucore.model.decodeMs2TpsCalibration
 import io.ecucore.model.VeTable
 import io.ecucore.model.TriggerSettings
 import io.ecucore.model.afrTableLoadType
@@ -1431,10 +1436,17 @@ class EcuClient(
         }
     }
 
+    private fun isMs2TpsCalibrationFamily() =
+        firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED
+
     /**
      * Lê calibração de TPS em Page 1.
      */
     override suspend fun readTpsCalibration(): TpsCalibration = withContext(Dispatchers.IO) {
+        if (isMs2TpsCalibrationFamily()) {
+            val raw = withEcuIo { protocol.readTable(MS2_TPS_TABLE.toInt(), MS2_TPS_MIN_OFFSET, MS2_TPS_BYTES, EcuFamily.MS2) }
+            return@withContext decodeMs2TpsCalibration(raw)
+        }
         val pageData = readPage(pageNum = 1, offset = 0, length = 128)
         TpsCalibration(
             tpsMin = readU8(pageData, 44),
@@ -1447,6 +1459,19 @@ class EcuClient(
      */
     override suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeTpsCalibration")
+        if (isMs2TpsCalibrationFamily()) {
+            val ms2Calibration = calibration.copy(adcMax = TpsCalibration.ADC_MAX_10BIT)
+            ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(ms2Calibration))
+            val data = encodeMs2TpsCalibration(ms2Calibration)
+            writeMsTableVerified(
+                TableRegions(
+                    listOf(TableRegion(MS2_TPS_TABLE.toInt(), MS2_TPS_MIN_OFFSET, data)),
+                    if (burn) setOf(MS2_TPS_TABLE.toInt()) else emptySet(),
+                ),
+                "TPS Calibration (MS2)",
+            )
+            return@withContext
+        }
         requireSpeeduinoLayout("writeTpsCalibration")
         ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)

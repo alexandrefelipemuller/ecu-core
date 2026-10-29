@@ -2,6 +2,7 @@ package io.ecucore
 
 object Ms2LiveDataParser {
     private const val MIN_OUTPUT_BLOCK_SIZE = 212
+    const val TPS_ADC_OFFSET = 86
 
     fun fromOutputChannels(data: ByteArray): EcuLiveData {
         require(data.size >= MIN_OUTPUT_BLOCK_SIZE) {
@@ -33,6 +34,7 @@ object Ms2LiveDataParser {
                 o2 = o2,
                 engineStatus = engineStatus,
                 sparkStatus = sparkStatus,
+                tpsAdc = u16be(data, TPS_ADC_OFFSET),
                 outputChannelBlockSize = data.size,
                 outputChannelData = data.copyOf()
             )
