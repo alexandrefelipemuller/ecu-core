@@ -20,6 +20,7 @@ import io.ecucore.cache.NoopEcuConfigPageCache
 import io.ecucore.connection.ConnectionTrace
 import io.ecucore.connection.IEcuConnection
 import io.ecucore.model.FirmwareEra
+import io.ecucore.model.MegaSpeedAntiTheft
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.Algorithm
 import io.ecucore.model.EcuCapabilities
@@ -1782,8 +1783,8 @@ class EcuClient(
         val bitMask get() = ((1 shl (bitHigh!! - bitLow!! + 1)) - 1)
     }
 
-    private fun megaSpeedScalar(name: String): MegaSpeedScalar {
-        if (writableFieldSpec(name) == null) {
+    private fun megaSpeedScalar(name: String, requireWritable: Boolean = true): MegaSpeedScalar {
+        if (requireWritable && writableFieldSpec(name) == null) {
             throw IllegalArgumentException("Campo não permitido para gravação: $name")
         }
         val definition = activeIniDefinition
@@ -1924,20 +1925,79 @@ class EcuClient(
                 byteArrayOf((raw and 0xFF).toByte())
             }
         }
-        // Igual ao TunerStudio: só os bytes que mudaram vão para a ECU.
+        writeMegaSpeedChangedBytes(f, current, newBytes, "$field=$value (raw=$raw)", "MegaSpeed $field")
+    }
+
+    /** Igual ao TunerStudio: só os bytes que mudaram vão para a ECU, com releitura de conferência e burn. */
+    private suspend fun writeMegaSpeedChangedBytes(
+        f: MegaSpeedScalar,
+        current: ByteArray,
+        newBytes: ByteArray,
+        description: String,
+        label: String,
+    ) {
         val indices = newBytes.indices
         val first = indices.firstOrNull { current[it] != newBytes[it] }
         if (first == null) {
-            Logger.d(TAG, "MegaSpeed $field já está em $value; nada a gravar")
+            Logger.d(TAG, "MegaSpeed $description já gravado; nada a gravar")
             return
         }
         val last = indices.last { current[it] != newBytes[it] }
         val data = newBytes.copyOfRange(first, last + 1)
-        Logger.d(TAG, "Gravando MegaSpeed $field=$value (raw=$raw) tabela=0x${f.pageId.toString(16)} off=${f.offset + first} len=${data.size}")
+        Logger.d(TAG, "Gravando MegaSpeed $description tabela=0x${f.pageId.toString(16)} off=${f.offset + first} len=${data.size}")
         writeMsTableVerified(
             TableRegions(listOf(TableRegion(f.pageId, f.offset + first, data)), setOf(f.pageId)),
-            "MegaSpeed $field",
+            label,
         )
+    }
+
+    /** `floodClear` do antifurto, conferido contra o .ini ativo para nunca gravar em outro lugar. */
+    private fun megaSpeedAntiTheftScalar(): MegaSpeedScalar {
+        requireMegaSpeedForFieldAccess()
+        val f = megaSpeedScalar(MegaSpeedAntiTheft.FIELD, requireWritable = false)
+        if (f.pageId != MegaSpeedAntiTheft.TABLE_ID || f.offset != MegaSpeedAntiTheft.OFFSET ||
+            f.width != MegaSpeedAntiTheft.WIDTH || !f.signed || f.isBits
+        ) {
+            throw UnsupportedOperationException("Antifurto: ${MegaSpeedAntiTheft.FIELD} do .ini não confere com o esperado")
+        }
+        return f
+    }
+
+    override suspend fun readMegaSpeedAntiTheftRaw(): Int {
+        val f = megaSpeedAntiTheftScalar()
+        return MegaSpeedAntiTheft.decode(readConfigChunk(f.pageId, f.offset, f.width))
+    }
+
+    override suspend fun lockMegaSpeedAntiTheft(): Int {
+        ensureWritable(MegaSpeedAntiTheft.OP_LOCK)
+        val f = megaSpeedAntiTheftScalar()
+        // Travar com o motor girando não apaga o motor (o corte só vale na partida), mas a trava é
+        // feita para o carro estacionado: recusar evita qualquer surpresa.
+        val rpm = withEcuIo { readLiveData() }.rpm
+        check(rpm == 0) { "Antifurto: desligue o motor para travar (rotação atual $rpm RPM)" }
+        val current = readConfigChunk(f.pageId, f.offset, f.width)
+        val original = MegaSpeedAntiTheft.decode(current)
+        check(!MegaSpeedAntiTheft.isLocked(original)) { "Antifurto: a ECU já está travada" }
+        require(original in 0..MegaSpeedAntiTheft.MAX_ORIGINAL_RAW) {
+            "Antifurto: ${MegaSpeedAntiTheft.FIELD} atual ($original) fora de 0..100 %; confira a configuração de partida"
+        }
+        val locked = MegaSpeedAntiTheft.encodeLocked(original)
+        writeMegaSpeedChangedBytes(f, current, MegaSpeedAntiTheft.encode(locked), "antifurto travar", "MegaSpeed antifurto")
+        return original
+    }
+
+    override suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int?) {
+        ensureWritable(MegaSpeedAntiTheft.OP_UNLOCK)
+        val f = megaSpeedAntiTheftScalar()
+        val current = readConfigChunk(f.pageId, f.offset, f.width)
+        val raw = MegaSpeedAntiTheft.decode(current)
+        if (!MegaSpeedAntiTheft.isLocked(raw)) {
+            Logger.d(TAG, "Antifurto: ECU já destravada; nada a gravar")
+            return
+        }
+        val restored = originalRaw ?: MegaSpeedAntiTheft.originalFrom(raw)
+        require(restored in 0..MegaSpeedAntiTheft.MAX_ORIGINAL_RAW) { "Antifurto: valor original inválido ($restored)" }
+        writeMegaSpeedChangedBytes(f, current, MegaSpeedAntiTheft.encode(restored), "antifurto destravar", "MegaSpeed antifurto")
     }
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {
@@ -3472,7 +3532,7 @@ class EcuClient(
                 if (!validationResult.isValid) {
                     throw ValidationException(validationResult)
                 }
-                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.valuesInWholeDegrees()) { readIgnitionTable(1).valuesInWholeDegrees() }
                 val serialized = MegaSpeedIniTableDefinitions.serializeIgnitionTable(catalog.ignitionTable, ignitionTable)
                 writeMsTableVerified(serialized.toRegions(), "MegaSpeed Ignition Table 1")
                 Logger.d(TAG, "✅ MegaSpeed Ignition Table 1 gravada via .ini e burn executado")
@@ -3484,7 +3544,7 @@ class EcuClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
-        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.valuesInWholeDegrees()) { readIgnitionTable(1).valuesInWholeDegrees() }
 
         val serialized = Ms2TableDefinitions.serializeIgnitionTable(ignitionTable)
         writeMsTableVerified(serialized.toRegions(), "MS2 Ignition Table 1")

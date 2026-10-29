@@ -158,7 +158,7 @@ object Ms2TableDefinitions {
         }
         val rpmBins = parseAxis(VE_TABLE_1.rpmAxis, rpmAxisData)
         val loadBins = parseAxis(VE_TABLE_1.loadAxis, loadAxisData)
-        return VeTable(rpmBins, loadBins, values, loadType)
+        return VeTable(rpmBins, loadBins, values, loadType, loadScale = VE_TABLE_1.loadAxis.scale)
     }
 
     fun serializeVeTable(table: VeTable): SerializedMs2Table {
@@ -185,7 +185,7 @@ object Ms2TableDefinitions {
             rpmAxisData = serializeAxis(table.rpmBins, VE_TABLE_1.rpmAxis),
             loadAxisTableId = VE_TABLE_1.loadAxis.tableId,
             loadAxisOffset = VE_TABLE_1.loadAxis.offset,
-            loadAxisData = serializeAxis(table.loadBins, VE_TABLE_1.loadAxis),
+            loadAxisData = serializeAxis(table.loadBins, VE_TABLE_1.loadAxis, table.loadScale),
             burnTableIds = setOf(VE_TABLE_1.metadata.page),
         )
     }
@@ -206,12 +206,16 @@ object Ms2TableDefinitions {
                     IGNITION_TABLE_1.metadata.valueType,
                     IGNITION_TABLE_1.valueByteOrder,
                 )
-                (raw * IGNITION_TABLE_1.metadata.scale).roundToInt()
+                raw // unidade bruta da ECU (decimos de grau); escala em IgnitionTable.valueScale
             }
         }
         val rpmBins = parseAxis(IGNITION_TABLE_1.rpmAxis, rpmAxisData)
         val loadBins = parseAxis(IGNITION_TABLE_1.loadAxis, loadAxisData)
-        return IgnitionTable(rpmBins, loadBins, values, loadType)
+        return IgnitionTable(
+            rpmBins, loadBins, values, loadType,
+            loadScale = IGNITION_TABLE_1.loadAxis.scale,
+            valueScale = IGNITION_TABLE_1.metadata.scale,
+        )
     }
 
     fun serializeIgnitionTable(table: IgnitionTable): SerializedMs2Table {
@@ -224,7 +228,8 @@ object Ms2TableDefinitions {
         table.values.forEach { row ->
             require(row.size == IGNITION_TABLE_1.metadata.valuesShape.second) { "Invalid ignition column count" }
             row.forEach { value ->
-                writeS16(valuesData, writeOffset, value * 10, signed = true)
+                val raw = kotlin.math.round(value * table.valueScale / IGNITION_TABLE_1.metadata.scale).toInt()
+                writeS16(valuesData, writeOffset, raw.coerceIn(-32768, 32767), signed = true)
                 writeOffset += 2
             }
         }
@@ -238,7 +243,7 @@ object Ms2TableDefinitions {
             rpmAxisData = serializeAxis(table.rpmBins, IGNITION_TABLE_1.rpmAxis),
             loadAxisTableId = IGNITION_TABLE_1.loadAxis.tableId,
             loadAxisOffset = IGNITION_TABLE_1.loadAxis.offset,
-            loadAxisData = serializeAxis(table.loadBins, IGNITION_TABLE_1.loadAxis),
+            loadAxisData = serializeAxis(table.loadBins, IGNITION_TABLE_1.loadAxis, table.loadScale),
             burnTableIds = setOf(IGNITION_TABLE_1.metadata.page),
         )
     }
@@ -258,7 +263,7 @@ object Ms2TableDefinitions {
         }
         val rpmBins = parseAxis(AFR_TABLE_1.rpmAxis, rpmAxisData)
         val loadBins = parseAxis(AFR_TABLE_1.loadAxis, loadAxisData)
-        return AfrTable(rpmBins, loadBins, values, loadType)
+        return AfrTable(rpmBins, loadBins, values, loadType, loadScale = AFR_TABLE_1.loadAxis.scale)
     }
 
     fun serializeAfrTable(table: AfrTable): SerializedMs2Table {
@@ -285,7 +290,7 @@ object Ms2TableDefinitions {
             rpmAxisData = serializeAxis(table.rpmBins, AFR_TABLE_1.rpmAxis),
             loadAxisTableId = AFR_TABLE_1.loadAxis.tableId,
             loadAxisOffset = AFR_TABLE_1.loadAxis.offset,
-            loadAxisData = serializeAxis(table.loadBins, AFR_TABLE_1.loadAxis),
+            loadAxisData = serializeAxis(table.loadBins, AFR_TABLE_1.loadAxis, table.loadScale),
             burnTableIds = setOf(AFR_TABLE_1.metadata.page),
         )
     }
@@ -301,11 +306,12 @@ object Ms2TableDefinitions {
                 type = axis.dataType,
                 byteOrder = EcuByteOrder.BIG_ENDIAN,
             )
-            (raw * axis.scale).roundToInt()
+            // Valor bruto da ECU; a escala (ex.: 0.1 kPa) vai no modelo (loadScale), sem arredondar
+            raw
         }
     }
 
-    private fun serializeAxis(values: List<Int>, layout: AxisLayout): ByteArray {
+    private fun serializeAxis(values: List<Int>, layout: AxisLayout, valueScale: Double = 1.0): ByteArray {
         require(values.size == layout.count) { "Invalid axis count" }
         val elementSize = when (layout.dataType) {
             DataType.U08, DataType.S08 -> 1
@@ -313,7 +319,7 @@ object Ms2TableDefinitions {
         }
         val output = ByteArray(values.size * elementSize)
         values.forEachIndexed { index, value ->
-            val raw = (value / layout.scale).roundToInt()
+            val raw = (value * valueScale / layout.scale).roundToInt()
             val offset = index * elementSize
             when (layout.dataType) {
                 DataType.U08 -> output[offset] = raw.coerceIn(0, 255).toByte()
