@@ -3461,7 +3461,7 @@ class EcuClient(
                 if (!validationResult.isValid) {
                     throw ValidationException(validationResult)
                 }
-                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.valuesInWholeDegrees()) { readIgnitionTable(1).valuesInWholeDegrees() }
                 val serialized = MegaSpeedIniTableDefinitions.serializeIgnitionTable(catalog.ignitionTable, ignitionTable)
                 writeMsTableVerified(serialized.toRegions(), "MegaSpeed Ignition Table 1")
                 Logger.d(TAG, "✅ MegaSpeed Ignition Table 1 gravada via .ini e burn executado")
@@ -3473,7 +3473,7 @@ class EcuClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
-        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.valuesInWholeDegrees()) { readIgnitionTable(1).valuesInWholeDegrees() }
 
         val serialized = Ms2TableDefinitions.serializeIgnitionTable(ignitionTable)
         writeMsTableVerified(serialized.toRegions(), "MS2 Ignition Table 1")

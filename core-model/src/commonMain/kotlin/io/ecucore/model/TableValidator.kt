@@ -119,7 +119,7 @@ class TableValidator(private val metadata: TableMetadata) {
 
         // 2. Validate Load bins
         val isMap = table.loadType == VeTable.LoadType.MAP
-        validateLoadBins(table.loadBins, isMap, errors, warnings)
+        validateLoadBins(userLoadBins(table), isMap, errors, warnings)
 
         // 3. Validate VE values (0-255%)
         validateVeValues(table.values, errors, warnings)
@@ -240,19 +240,29 @@ class TableValidator(private val metadata: TableMetadata) {
 
         // 2. Validate Load bins
         val isMap = table.loadType == IgnitionTable.LoadType.MAP
-        validateLoadBins(table.loadBins, isMap, errors, warnings)
+        validateLoadBins(userLoadBins(table), isMap, errors, warnings)
+
+        // Valores em graus reais (MS2 guarda décimos de grau: valueScale = 0.1)
+        val degrees = table.values.map { row -> row.map { it * table.valueScale } }
 
         // 3. Validate Ignition advance values (-40 to 70°)
-        validateIgnitionValues(table.values, errors, warnings)
+        validateIgnitionValues(degrees, errors, warnings)
 
         // 4. CRITICAL: Check for dangerous ignition advance
-        checkDangerousIgnitionAdvance(table.values, errors, warnings)
+        checkDangerousIgnitionAdvance(degrees, errors, warnings)
 
         // 5. Check for excessive retard
-        checkExcessiveRetard(table.values, warnings)
+        checkExcessiveRetard(degrees, warnings)
     }
 
-    private fun validateIgnitionValues(values: List<List<Int>>, errors: MutableList<String>, warnings: MutableList<String>) {
+    private fun fmtDeg(v: Double): String = if (v == kotlin.math.floor(v)) v.toInt().toString() else v.toString()
+
+    /** Eixo de carga em kPa/% inteiros de usuário (arredonda quando o modelo guarda décimos). */
+    private fun userLoadBins(table: TableModel): List<Int> =
+        if (table.loadScale == 1.0) table.loadBins
+        else table.loadBins.map { kotlin.math.round(it * table.loadScale).toInt() }
+
+    private fun validateIgnitionValues(values: List<List<Double>>, errors: MutableList<String>, warnings: MutableList<String>) {
         var outOfRangeCount = 0
         val isRusEfi = metadata.name.contains("rusEFI", ignoreCase = true)
         val allowedMax = if (isRusEfi) {
@@ -264,10 +274,10 @@ class TableValidator(private val metadata: TableMetadata) {
 
         values.forEachIndexed { row, rowValues ->
             rowValues.forEachIndexed { col, value ->
-                if (value.toDouble() !in allowedRange) {
+                if (value !in allowedRange) {
                     outOfRangeCount++
                     if (outOfRangeCount <= 5) {
-                        errors.add("Ignition advance out of range at [$row,$col]: ${value}° (valid: ${allowedRange}°)")
+                        errors.add("Ignition advance out of range at [$row,$col]: ${fmtDeg(value)}° (valid: ${allowedRange}°)")
                     }
                 }
             }
@@ -278,7 +288,7 @@ class TableValidator(private val metadata: TableMetadata) {
         }
     }
 
-    private fun checkDangerousIgnitionAdvance(values: List<List<Int>>, errors: MutableList<String>, warnings: MutableList<String>) {
+    private fun checkDangerousIgnitionAdvance(values: List<List<Double>>, errors: MutableList<String>, warnings: MutableList<String>) {
         var dangerCount = 0
         var warningCount = 0
         val dangerousCells = mutableListOf<String>()
@@ -290,7 +300,7 @@ class TableValidator(private val metadata: TableMetadata) {
                     advance >= IGNITION_ADVANCE_DANGER_THRESHOLD -> {
                         dangerCount++
                         if (dangerousCells.size < 5) {
-                            dangerousCells.add("[$row,$col]: ${advance}°")
+                            dangerousCells.add("[$row,$col]: ${fmtDeg(advance)}°")
                         }
                     }
                     advance >= IGNITION_ADVANCE_WARNING_THRESHOLD -> {
@@ -323,7 +333,7 @@ class TableValidator(private val metadata: TableMetadata) {
         }
     }
 
-    private fun checkExcessiveRetard(values: List<List<Int>>, warnings: MutableList<String>) {
+    private fun checkExcessiveRetard(values: List<List<Double>>, warnings: MutableList<String>) {
         var retardCount = 0
 
         values.forEach { rowValues ->
