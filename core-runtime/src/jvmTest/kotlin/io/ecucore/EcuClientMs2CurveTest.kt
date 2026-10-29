@@ -3,6 +3,7 @@ package io.ecucore
 import io.ecucore.definition.IniParser
 import io.ecucore.model.IniCurveCodec
 import io.ecucore.model.IniTemperature
+import io.ecucore.model.Ms2WueError
 import io.ecucore.model.Ms2WueValidator
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
@@ -112,13 +113,27 @@ class EcuClientMs2CurveTest {
     }
 
     @Test
+    fun `pontos de temperatura nao editados mantem o bruto exato`() {
+        val orig = listOf(-40.0, 33.3, 37.9, 100.0, 160.0) // 33,3 e 37,9 F nao sao exatos em C com 1 casa
+        val shown = orig.map { Math.round(IniTemperature.fahrenheitToCelsius(it) * 10) / 10.0 }
+        assertEquals(orig, IniTemperature.mergeEditedCelsius(orig, shown))
+        val edited = shown.toMutableList().also { it[3] = 40.0 } // 104 F
+        val merged = IniTemperature.mergeEditedCelsius(orig, edited)
+        assertEquals(104.0, merged[3], 1e-9)
+        assertEquals(orig.filterIndexed { i, _ -> i != 3 }, merged.filterIndexed { i, _ -> i != 3 })
+    }
+
+    @Test
     fun `validacao do WUE`() {
         val ok = wue.map { it.toDouble() }
         val t = tempsF10.map { it / 10.0 }
         assertTrue(Ms2WueValidator.validate(ok, t).isEmpty())
-        assertTrue(Ms2WueValidator.validate(ok.dropLast(1) + 99.0, t).isNotEmpty())
-        assertTrue(Ms2WueValidator.validate(ok.dropLast(1) + 256.0, t).isNotEmpty())
-        assertTrue(Ms2WueValidator.validate(ok, t.toMutableList().also { it[4] = it[3] }).isNotEmpty())
-        assertTrue(Ms2WueValidator.validate(ok.drop(1), t).isNotEmpty())
+        assertEquals(listOf(Ms2WueError(Ms2WueError.Code.WUE_LAST_NOT_100, 9)), Ms2WueValidator.validate(ok.dropLast(1) + 99.0, t))
+        assertTrue(Ms2WueValidator.validate(ok.dropLast(1) + 256.0, t).any { it.code == Ms2WueError.Code.WUE_OUT_OF_RANGE && it.index == 9 })
+        assertEquals(
+            listOf(Ms2WueError(Ms2WueError.Code.TEMP_NOT_INCREASING, 4)),
+            Ms2WueValidator.validate(ok, t.toMutableList().also { it[4] = it[3] }),
+        )
+        assertTrue(Ms2WueValidator.validate(ok.drop(1), t).any { it.code == Ms2WueError.Code.WUE_POINT_COUNT })
     }
 }
