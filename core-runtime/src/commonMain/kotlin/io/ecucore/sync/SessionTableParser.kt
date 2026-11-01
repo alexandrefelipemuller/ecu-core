@@ -250,6 +250,9 @@ object SessionTableParser {
         pages: Map<Int, ByteArray>,
         engineConstants: EngineConstants? = parseEngineConstants(ecuFamily, pages),
     ): DwellTable? {
+        // A dwell map 4x4 é só do Speeduino. No MS2/MS3 a chave 12 é a página 0x0c (outro
+        // conteúdo), e parsear como dwell mostrava eixos e valores sem sentido.
+        if (ecuFamily != EcuFamily.SPEEDUINO) return null
         val data = pages[12] ?: return null
         val loadType = engineConstants?.ignitionTableLoadType() ?: IgnitionTable.LoadType.MAP
         return DwellTable.fromPageData(data, loadType = loadType)

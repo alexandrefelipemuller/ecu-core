@@ -2,7 +2,8 @@ package io.ecucore.model
 
 /**
  * Canais ao vivo da MegaSpeed MS2-X (bloco de saída de 219 bytes, `[OutputChannels]` do .ini da
- * CostaMegaSpeed) para a tela de diagnóstico em tempo real.
+ * CostaMegaSpeed) e do MS2/Extra (212 bytes, mesmo layout até o offset 211) para a tela de
+ * diagnóstico em tempo real.
  *
  * A lista é curada à mão (o parser de .ini não guarda bits de canais de saída, e o .ini tem ramos
  * `#if CELSIUS`), mas cada canal é conferido contra as linhas reais do .ini em teste.
@@ -51,7 +52,11 @@ enum class MegaSpeedEngineBit(val bit: Int, val label: String) {
 }
 
 object MegaSpeedLiveChannels {
-    const val MIN_BLOCK_SIZE = 219
+    /**
+     * Menor bloco aceito: o outpc do MS2Extra (212 bytes). Os canais da MegaSpeed além disso
+     * (oil, fuel, runsecs em 212..217) só aparecem quando o bloco os contém.
+     */
+    const val MIN_BLOCK_SIZE = 212
     const val ENGINE_OFFSET = 11
     const val STATUS3_OFFSET = 80
 
@@ -125,7 +130,7 @@ object MegaSpeedLiveChannels {
     /** null se o bloco é curto demais (não mostra valor errado em vez de nada). */
     fun decode(block: ByteArray?): List<MegaSpeedChannelReading>? {
         if (block == null || block.size < MIN_BLOCK_SIZE) return null
-        return CHANNELS.map { ch ->
+        return CHANNELS.filter { it.offset + it.type.bytes <= block.size }.map { ch ->
             val raw = readRaw(block, ch)
             val value = (raw + ch.translate) * ch.scale
             val number = formatFixed(value, ch.digits)
