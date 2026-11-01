@@ -22,10 +22,15 @@ class ClosedLoopCorrectionMapperTest {
         page[10] = 8
         page[11] = 35
         page[12] = 24
-        page[112] = 60
-        page[113] = 18
+        // egoMAPMax/Min ficam na página 9, não na 6
+        val page9 = ByteArray(ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE)
+        page9[112] = 60
+        page9[113] = 18
 
-        val parsed = ClosedLoopCorrectionMapper.fromPage(page, FirmwareEra.MODERN_2025)
+        val parsed = ClosedLoopCorrectionMapper.withMapWindow(
+            ClosedLoopCorrectionMapper.fromPage(page, FirmwareEra.MODERN_2025),
+            page9,
+        )
 
         assertEquals(ClosedLoopSensorType.WIDE_BAND, parsed.sensorType)
         assertEquals(ClosedLoopStrategy.PID, parsed.strategy)
@@ -79,8 +84,12 @@ class ClosedLoopCorrectionMapperTest {
         assertEquals(12, updated[10].toInt() and 0xFF)
         assertEquals(25, updated[11].toInt() and 0xFF)
         assertEquals(17, updated[12].toInt() and 0xFF)
-        assertEquals(50, updated[112].toInt() and 0xFF)
-        assertEquals(20, updated[113].toInt() and 0xFF)
+        // página 6: offsets 112/113 são iacCrankBins e não podem ser tocados
+        assertEquals(0x55.toByte(), updated[112])
+        assertEquals(0x55.toByte(), updated[113])
+        val page9 = ClosedLoopCorrectionMapper.applyMapWindowToPage9(ByteArray(ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE), config)
+        assertEquals(50, page9[112].toInt() and 0xFF)
+        assertEquals(20, page9[113].toInt() and 0xFF)
         assertEquals(0, updated[1].toInt() and 0xFF)
         assertEquals(0, updated[2].toInt() and 0xFF)
         assertEquals(0, updated[3].toInt() and 0xFF)

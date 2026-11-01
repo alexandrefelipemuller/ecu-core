@@ -151,6 +151,7 @@ class EcuClient(
         // falha como condição de link (ruído/perda de bytes), não como defeito de protocolo.
         const val LIVE_DATA_LINK_DESYNC_MARKER = "link_desync"
         private const val LIVE_DATA_CRC_ERR_RESPONSE = "response code = 0x82"
+        private const val EMPTY_LIVE_DATA_RESPONSE = "response code = null"
         private const val LIVE_DATA_UNEXPECTED_SIZE_MARKER = "Live data modern com tamanho inesperado"
         // EcuProtocol.LegacyAsciiModernResponseException: length lido de bytes ASCII = stream desalinhado.
         private const val LEGACY_ASCII_RESPONSE_MARKER = "Modern response was legacy ASCII"
@@ -1998,14 +1999,16 @@ class EcuClient(
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
         val base = EngineProtectionMapper.fromPage(pageData, era)
         if (!era.isModern()) return base
-        // Rev-limiter fields (valet mode) live in pages 1, 4 and 9; a failure here must not break the page 6 read.
+        // Os demais campos moram nas páginas 1, 4, 9 e 10; falha aqui não pode quebrar a leitura da
+        // página 6 (a config volta com extendedPagesLoaded=false e as páginas extras não são gravadas).
         return runCatching {
             val page1 = readPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, 0, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE)
             val page4 = readPage(EngineProtectionMapper.RPM_PAGE_NUMBER, 0, EngineProtectionMapper.RPM_PAGE_SIZE)
             val page9 = readPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 0, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE)
-            EngineProtectionMapper.withRevLimiterPages(base, page1, page4, page9)
+            val page10 = readPage(EngineProtectionMapper.OIL_PAGE_NUMBER, 0, EngineProtectionMapper.OIL_PAGE_SIZE)
+            EngineProtectionMapper.withExtendedPages(base, era, page1, page4, page9, page10)
         }.getOrElse {
-            Logger.w(TAG, "Rev limiter pages (1/4/9) unavailable: ${it.message}")
+            Logger.w(TAG, "Engine protection pages (1/4/9/10) unavailable: ${it.message}")
             base
         }
     }
@@ -2024,7 +2027,16 @@ class EcuClient(
             offset = 0,
             length = ClosedLoopCorrectionMapper.PAGE_SIZE
         )
-        return ClosedLoopCorrectionMapper.fromPage(pageData, era)
+        val base = ClosedLoopCorrectionMapper.fromPage(pageData, era)
+        if (!ClosedLoopCorrectionMapper.hasMapWindowPage(era)) return base
+        // A janela de MAP (egoMAPMax/Min) mora na página 9; falhar aqui falha a leitura inteira, senão
+        // a gravação seguinte escreveria 0 nesses campos.
+        val page9 = readPage(
+            pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE
+        )
+        return ClosedLoopCorrectionMapper.withMapWindow(base, page9)
     }
 
     /**
@@ -2044,23 +2056,29 @@ class EcuClient(
             length = EngineProtectionMapper.PAGE_SIZE
         )
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
-        val updatedData = EngineProtectionMapper.applyToPage(basePage, config, era)
+        val updatedData = EngineProtectionMapper.applyToPage(basePage, config)
         writeConfigPageVerified(
             pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
             offset = 0,
             data = updatedData,
             label = "Engine Protection",
         )
-        // Pages 1/4/9 are only touched when the config carries a rev limiter read from the ECU.
-        if (era.isModern() && config.hardRevLimitRpm > 0) {
-            writeRevLimiterPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
+        // Páginas 1/4/9/10 só são tocadas se a config foi lida delas (extendedPagesLoaded): sem isso os
+        // campos estariam em valor padrão e a gravação zeraria limites que o app nunca viu.
+        if (era.isModern() && config.extendedPagesLoaded) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
                 EngineProtectionMapper.applyToPage1(it, config)
             }
-            writeRevLimiterPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
                 EngineProtectionMapper.applyToPage4(it, config)
             }
-            writeRevLimiterPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
-                EngineProtectionMapper.applyToPage9(it, config)
+            if (EngineProtectionMapper.hasPage9Protection(era)) {
+                writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
+                    EngineProtectionMapper.applyToPage9(it, config, era)
+                }
+            }
+            writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage10(it, config)
             }
         }
         if (burn) {
@@ -2072,7 +2090,7 @@ class EcuClient(
         }
     }
 
-    private suspend fun writeRevLimiterPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
+    private suspend fun writeEngineProtectionExtraPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
         val updated = transform(readPage(pageNum = pageNum, offset = 0, length = size))
         writeConfigPageVerified(pageNum = pageNum.toByte(), offset = 0, data = updated, label = "Engine Protection page $pageNum")
         if (burn) {
@@ -2103,6 +2121,19 @@ class EcuClient(
             data = updatedData,
             label = "Closed Loop Corrections",
         )
+        if (ClosedLoopCorrectionMapper.hasMapWindowPage(era)) {
+            val basePage9 = readPage(
+                pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
+                offset = 0,
+                length = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE
+            )
+            writeConfigPageVerified(
+                pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
+                offset = 0,
+                data = ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
+                label = "Closed Loop Corrections MAP window",
+            )
+        }
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -3958,6 +3989,12 @@ class EcuClient(
         // o read de live data devia ter a mesma leniência em vez de escalar como erro de
         // protocolo (era a causa dos non-fatals repetidos "response code = 0x80" no Crashlytics).
         if (message.contains("response code = 0x80", ignoreCase = true)) {
+            return true
+        }
+        // Frame modern vazio (length=0, "response code = null"): o link entregou o envelope mas a ECU/
+        // adaptador não tinha payload - é o que sobra de uma rajada de timeouts num Bluetooth
+        // instável. Mesmo tratamento do 0x80: limpar o buffer e repetir.
+        if (message.contains(EMPTY_LIVE_DATA_RESPONSE, ignoreCase = true)) {
             return true
         }
         val match = PARTIAL_TIMEOUT_REGEX.find(message) ?: return false

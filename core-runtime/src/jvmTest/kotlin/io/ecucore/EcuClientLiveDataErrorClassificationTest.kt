@@ -38,6 +38,16 @@ class EcuClientLiveDataErrorClassificationTest {
     }
 
     @Test
+    fun `empty modern live data frame (response code null) is recoverable`() {
+        // Caso de campo (Bluetooth): rajada de timeouts e depois frames "00 00 + CRC zerado".
+        assertTrue(
+            client.isRecoverableLiveDataTimeout(
+                Exception("Erro ao ler live data modern: response code = null")
+            )
+        )
+    }
+
+    @Test
     fun `SERIAL_RC_TIMEOUT response code 0x80 on live data read is recoverable`() {
         // 0x80 significa que a ECU não montou a resposta a tempo (ocupada), não um erro de
         // protocolo. Os caminhos de write/burn já toleram 0x80; o read de live data deve seguir

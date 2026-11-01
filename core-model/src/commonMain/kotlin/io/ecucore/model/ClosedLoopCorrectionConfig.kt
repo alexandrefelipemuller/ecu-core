@@ -38,8 +38,12 @@ data class ClosedLoopCorrectionConfig(
 }
 
 object ClosedLoopCorrectionMapper {
+    // ⚠️ A página 6 tem 128 bytes (240 é a página 7). egoMAPMax/egoMAPMin NÃO estão nela: ficam
+    // na página 9 (192 bytes, 202402+); na página 6 os offsets 112/113 são iacCrankBins.
     const val PAGE_NUMBER = 6
-    const val PAGE_SIZE = 240
+    const val PAGE_SIZE = 128
+    const val MAP_WINDOW_PAGE_NUMBER = 9
+    const val MAP_WINDOW_PAGE_SIZE = 192
     const val STOICH_AFR = 14.7
 
     private const val ALGORITHM_OFFSET = 0
@@ -58,6 +62,28 @@ object ClosedLoopCorrectionMapper {
     private const val MAP_MIN_OFFSET = 113
 
     fun isSupported(era: FirmwareEra): Boolean = era.isModern()
+
+    /** egoMAPMax/egoMAPMin existem na página 9 a partir do 202402. */
+    fun hasMapWindowPage(era: FirmwareEra): Boolean =
+        era == FirmwareEra.MODERN_2024 || era == FirmwareEra.MODERN_2025
+
+    /** Completa a config da página 6 com a janela de MAP (página 9). */
+    fun withMapWindow(config: ClosedLoopCorrectionConfig, page9: ByteArray): ClosedLoopCorrectionConfig =
+        sanitize(
+            config.copy(
+                activeBelowMapKpa = readU8(page9, MAP_MAX_OFFSET) * 2,
+                activeAboveMapKpa = readU8(page9, MAP_MIN_OFFSET) * 2,
+            )
+        )
+
+    /** Página 9: grava só egoMAPMax/egoMAPMin. */
+    fun applyMapWindowToPage9(base: ByteArray, config: ClosedLoopCorrectionConfig): ByteArray {
+        val page = base.copyOf()
+        val normalized = sanitize(config)
+        writeU8(page, MAP_MAX_OFFSET, (normalized.activeBelowMapKpa / 2.0).roundToInt())
+        writeU8(page, MAP_MIN_OFFSET, (normalized.activeAboveMapKpa / 2.0).roundToInt())
+        return page
+    }
 
     fun fromPage(page: ByteArray, era: FirmwareEra): ClosedLoopCorrectionConfig {
         require(isSupported(era)) { "Closed-loop corrections requer firmware Speeduino moderno" }
@@ -90,8 +116,6 @@ object ClosedLoopCorrectionMapper {
                 activeAboveCoolantF = rawCoolantToFahrenheit(readU8(page, COOLANT_OFFSET)),
                 activeAboveRpm = readU8(page, RPM_OFFSET) * 100,
                 activeBelowTpsPercent = readU8(page, TPS_OFFSET) * 0.5,
-                activeBelowMapKpa = readU8(page, MAP_MAX_OFFSET) * 2,
-                activeAboveMapKpa = readU8(page, MAP_MIN_OFFSET) * 2,
                 delayAfterStartSeconds = readU8(page, DELAY_OFFSET),
                 pidProportional = readU8(page, PID_KP_OFFSET),
                 pidIntegral = readU8(page, PID_KI_OFFSET),
@@ -129,8 +153,6 @@ object ClosedLoopCorrectionMapper {
         writeU8(page, DELAY_OFFSET, normalized.delayAfterStartSeconds)
         writeU8(page, RPM_OFFSET, (normalized.activeAboveRpm / 100.0).roundToInt())
         writeU8(page, TPS_OFFSET, (normalized.activeBelowTpsPercent / 0.5).roundToInt())
-        writeU8(page, MAP_MAX_OFFSET, (normalized.activeBelowMapKpa / 2.0).roundToInt())
-        writeU8(page, MAP_MIN_OFFSET, (normalized.activeAboveMapKpa / 2.0).roundToInt())
         return page
     }
 
