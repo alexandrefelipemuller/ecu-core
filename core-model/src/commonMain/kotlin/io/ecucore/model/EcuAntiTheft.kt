@@ -1,7 +1,7 @@
 package io.ecucore.model
 
 /**
- * Antifurto (trava de partida por senha), comum às famílias: cada uma trava pelo desafogador
+ * Antifurto (trava de partida por senha), comum às famílias: cada uma trava com a sua estratégia
  * ([MegaSpeedAntiTheft], [SpeeduinoAntiTheft]).
  */
 object EcuAntiTheft {

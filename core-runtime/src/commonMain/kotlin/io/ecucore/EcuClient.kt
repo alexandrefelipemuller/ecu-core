@@ -1882,20 +1882,33 @@ class EcuClient(
         )
     }
 
-    /** `floodClear` do antifurto, conferido contra o .ini ativo para nunca gravar em outro lugar. */
-    private fun megaSpeedAntiTheftScalar(): MegaSpeedScalar {
+    /**
+     * Campos do antifurto no .ini ativo e os vizinhos do espaço livre; recusa se algum não estiver
+     * onde a trava espera, para nunca gravar em outro lugar.
+     */
+    private fun requireMegaSpeedAntiTheftLayout() {
         requireMegaSpeedForFieldAccess()
-        val f = megaSpeedScalar(MegaSpeedAntiTheft.FIELD, requireWritable = false)
-        if (f.pageId != MegaSpeedAntiTheft.TABLE_ID || f.offset != MegaSpeedAntiTheft.OFFSET ||
-            f.width != MegaSpeedAntiTheft.WIDTH || !f.signed || f.isBits
-        ) {
-            throw UnsupportedOperationException("Antifurto: ${MegaSpeedAntiTheft.FIELD} do .ini não confere com o esperado")
+        for (expected in MegaSpeedAntiTheft.ALL_FIELDS + MegaSpeedAntiTheft.STASH_NEIGHBORS) {
+            val f = try {
+                megaSpeedScalar(expected.name, requireWritable = false)
+            } catch (e: IllegalArgumentException) {
+                throw UnsupportedOperationException("Antifurto: ${expected.name} inválido no .ini (${e.message})")
+            } catch (e: IllegalStateException) {
+                throw UnsupportedOperationException("Antifurto: ${expected.name} inválido no .ini (${e.message})")
+            }
+            val shapeMatches = if (expected.isBits) {
+                f.bitLow == expected.bitLow && f.bitHigh == expected.bitLow!! + expected.bitCount - 1
+            } else {
+                !f.isBits && f.width == expected.width && (!expected.signed || f.signed)
+            }
+            if (f.pageId != MegaSpeedAntiTheft.TABLE_ID || f.offset != expected.offset || !shapeMatches) {
+                throw UnsupportedOperationException("Antifurto: ${expected.name} do .ini não confere com o esperado")
+            }
         }
-        return f
     }
 
     override suspend fun readAntiTheftLocked(): Boolean = when (firmwareInfo?.family) {
-        EcuFamily.MEGASPEED -> MegaSpeedAntiTheft.isLocked(readMegaSpeedAntiTheftRaw())
+        EcuFamily.MEGASPEED -> readMegaSpeedAntiTheft().locked
         EcuFamily.SPEEDUINO -> readSpeeduinoAntiTheft().locked
         else -> throw UnsupportedOperationException("Antifurto disponível apenas para MegaSpeed e Speeduino")
     }
@@ -1918,42 +1931,100 @@ class EcuClient(
         }
     }
 
-    /** Travar com o motor girando não apaga o motor (o corte só vale na partida), mas a trava é feita para o carro estacionado. */
+    /** Travada, a ECU corta a injeção com o motor girando também: trava-se só com o carro parado. */
     private suspend fun requireEngineStoppedForAntiTheft() {
         val rpm = withEcuIo { readLiveData() }.rpm
         check(rpm == 0) { "Antifurto: desligue o motor para travar (rotação atual $rpm RPM)" }
     }
 
-    private suspend fun readMegaSpeedAntiTheftRaw(): Int {
-        val f = megaSpeedAntiTheftScalar()
-        return MegaSpeedAntiTheft.decode(readConfigChunk(f.pageId, f.offset, f.width))
+    private class MegaSpeedAntiTheftState(val marker: Int, val revLimit: Int, val optionsByte: Int) {
+        val locked get() = MegaSpeedAntiTheft.isLocked(marker)
     }
 
+    private suspend fun readMegaSpeedAntiTheft(): MegaSpeedAntiTheftState {
+        requireMegaSpeedAntiTheftLayout()
+        val stash = readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, MegaSpeedAntiTheft.MARKER_OFFSET, MegaSpeedAntiTheft.STASH_LENGTH)
+        return MegaSpeedAntiTheftState(
+            marker = stash[0].toInt() and 0xFF,
+            revLimit = MegaSpeedAntiTheft.decode(readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, MegaSpeedAntiTheft.REV_LIMIT.offset, 2)),
+            optionsByte = readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, MegaSpeedAntiTheft.OPTIONS_OFFSET, 1)[0].toInt() and 0xFF,
+        )
+    }
+
+    private suspend fun writeMegaSpeedAntiTheftBytes(offset: Int, data: ByteArray, label: String) {
+        val current = readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, offset, data.size)
+        if (current.contentEquals(data)) return
+        writeMsTableVerified(
+            TableRegions(listOf(TableRegion(MegaSpeedAntiTheft.TABLE_ID, offset, data)), setOf(MegaSpeedAntiTheft.TABLE_ID)),
+            "MegaSpeed antifurto ($label)",
+        )
+    }
+
+    private suspend fun readAntiTheftOptionsByte(): Int =
+        readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, MegaSpeedAntiTheft.OPTIONS_OFFSET, 1)[0].toInt() and 0xFF
+
+    /**
+     * Originais antes da assinatura: ela é o que diz "travada", então só entra com os originais já
+     * gravados. Depois as opções e, por último, o limite em 0.
+     */
     private suspend fun lockMegaSpeedAntiTheft(): Int {
-        val f = megaSpeedAntiTheftScalar()
+        val state = readMegaSpeedAntiTheft()
         requireEngineStoppedForAntiTheft()
-        val current = readConfigChunk(f.pageId, f.offset, f.width)
-        val original = MegaSpeedAntiTheft.decode(current)
-        check(!MegaSpeedAntiTheft.isLocked(original)) { "Antifurto: a ECU já está travada" }
-        require(original in 0..MegaSpeedAntiTheft.MAX_ORIGINAL_RAW) {
-            "Antifurto: ${MegaSpeedAntiTheft.FIELD} atual ($original) fora de 0..100 %; confira a configuração de partida"
+        check(!state.locked) { "Antifurto: a ECU já está travada" }
+        require(state.revLimit != MegaSpeedAntiTheft.LOCKED_REV_LIMIT) {
+            "Antifurto: o limitador de giro (${MegaSpeedAntiTheft.REV_LIMIT.name}) já está em 0 RPM; confira a configuração"
         }
-        val locked = MegaSpeedAntiTheft.encodeLocked(original)
-        writeMegaSpeedChangedBytes(f, current, MegaSpeedAntiTheft.encode(locked), "antifurto travar", "MegaSpeed antifurto")
-        return original
+        val options = state.optionsByte
+        val original = MegaSpeedAntiTheft.Original(
+            revLimit = state.revLimit,
+            cltBased = MegaSpeedAntiTheft.REV_LIMIT_CLT_BASED.read(options),
+            fuelProg = MegaSpeedAntiTheft.REV_LIMIT_FUEL_PROG.read(options),
+            fuelCut = MegaSpeedAntiTheft.REV_LIMIT_FUEL_CUT.read(options),
+        )
+        writeMegaSpeedAntiTheftBytes(
+            MegaSpeedAntiTheft.MARKER_OFFSET,
+            byteArrayOf(original.markerByte().toByte()) + MegaSpeedAntiTheft.encode(original.revLimit),
+            "assinatura e original",
+        )
+        var locked = MegaSpeedAntiTheft.REV_LIMIT_CLT_BASED.write(options, MegaSpeedAntiTheft.LOCKED_CLT_BASED)
+        locked = MegaSpeedAntiTheft.REV_LIMIT_FUEL_PROG.write(locked, MegaSpeedAntiTheft.LOCKED_FUEL_PROG)
+        locked = MegaSpeedAntiTheft.REV_LIMIT_FUEL_CUT.write(locked, MegaSpeedAntiTheft.LOCKED_FUEL_CUT)
+        writeMegaSpeedAntiTheftBytes(MegaSpeedAntiTheft.OPTIONS_OFFSET, byteArrayOf(locked.toByte()), "opções do limitador")
+        writeMegaSpeedAntiTheftBytes(
+            MegaSpeedAntiTheft.REV_LIMIT.offset,
+            MegaSpeedAntiTheft.encode(MegaSpeedAntiTheft.LOCKED_REV_LIMIT),
+            "limite em 0 RPM",
+        )
+        return original.toRaw()
     }
 
+    /** Devolve o limite e as opções e só então apaga a assinatura: interrompido no meio, continua travada. */
     private suspend fun unlockMegaSpeedAntiTheft(originalRaw: Int?) {
-        val f = megaSpeedAntiTheftScalar()
-        val current = readConfigChunk(f.pageId, f.offset, f.width)
-        val raw = MegaSpeedAntiTheft.decode(current)
-        if (!MegaSpeedAntiTheft.isLocked(raw)) {
+        val state = readMegaSpeedAntiTheft()
+        if (!state.locked) {
             Logger.d(TAG, "Antifurto: ECU já destravada; nada a gravar")
             return
         }
-        val restored = originalRaw ?: MegaSpeedAntiTheft.originalFrom(raw)
-        require(restored in 0..MegaSpeedAntiTheft.MAX_ORIGINAL_RAW) { "Antifurto: valor original inválido ($restored)" }
-        writeMegaSpeedChangedBytes(f, current, MegaSpeedAntiTheft.encode(restored), "antifurto destravar", "MegaSpeed antifurto")
+        val stash = readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, MegaSpeedAntiTheft.MARKER_OFFSET, MegaSpeedAntiTheft.STASH_LENGTH)
+        val original = if (originalRaw != null) {
+            MegaSpeedAntiTheft.Original.fromRaw(originalRaw)
+        } else {
+            MegaSpeedAntiTheft.Original.fromStored(
+                markerByte = state.marker,
+                revLimit = MegaSpeedAntiTheft.decode(stash, 1) and 0xFFFF,
+            )
+        }
+        writeMegaSpeedAntiTheftBytes(
+            MegaSpeedAntiTheft.REV_LIMIT.offset,
+            MegaSpeedAntiTheft.encode(original.revLimit),
+            "limite original",
+        )
+        var options = readAntiTheftOptionsByte()
+        options = MegaSpeedAntiTheft.REV_LIMIT_CLT_BASED.write(options, original.cltBased)
+        options = MegaSpeedAntiTheft.REV_LIMIT_FUEL_PROG.write(options, original.fuelProg)
+        options = MegaSpeedAntiTheft.REV_LIMIT_FUEL_CUT.write(options, original.fuelCut)
+        writeMegaSpeedAntiTheftBytes(MegaSpeedAntiTheft.OPTIONS_OFFSET, byteArrayOf(options.toByte()), "opções originais")
+        writeMegaSpeedAntiTheftBytes(MegaSpeedAntiTheft.MARKER_OFFSET, ByteArray(MegaSpeedAntiTheft.STASH_LENGTH), "apaga assinatura")
     }
 
     private class SpeeduinoAntiTheftState(val flood: Int, val marker: Int, val stored: Int) {
