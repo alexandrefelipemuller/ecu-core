@@ -134,8 +134,11 @@ class EcuClientFamilyWriteSafetyTest {
         for (kind in families) {
             val (c, ecu) = connect(kind)
             val before = ecu.writes.size
-            assertFailsWith<UnsupportedOperationException>(kind.name) {
-                c.writeTpsCalibration(io.ecucore.model.TpsCalibration(10, 240), burn = true)
+            // MS2/MegaSpeed têm calibração de TPS própria (tabela 0x04, S16); o resto recusa.
+            if (kind != ClientFakeEcu.Kind.MS2 && kind != ClientFakeEcu.Kind.MEGASPEED) {
+                assertFailsWith<UnsupportedOperationException>(kind.name) {
+                    c.writeTpsCalibration(io.ecucore.model.TpsCalibration(10, 240), burn = true)
+                }
             }
             assertFailsWith<UnsupportedOperationException>(kind.name) {
                 c.writePressureCalibration(io.ecucore.model.PressureCalibration(10, 260, 10, 260, 0, 0), burn = true)

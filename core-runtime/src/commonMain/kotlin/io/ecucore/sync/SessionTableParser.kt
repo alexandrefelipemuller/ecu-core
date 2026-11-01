@@ -250,6 +250,9 @@ object SessionTableParser {
         pages: Map<Int, ByteArray>,
         engineConstants: EngineConstants? = parseEngineConstants(ecuFamily, pages),
     ): DwellTable? {
+        // A dwell map 4x4 é só do Speeduino. No MS2/MS3 a chave 12 é a página 0x0c (outro
+        // conteúdo), e parsear como dwell mostrava eixos e valores sem sentido.
+        if (ecuFamily != EcuFamily.SPEEDUINO) return null
         val data = pages[12] ?: return null
         val loadType = engineConstants?.ignitionTableLoadType() ?: IgnitionTable.LoadType.MAP
         return DwellTable.fromPageData(data, loadType = loadType)
@@ -297,7 +300,14 @@ object SessionTableParser {
     ): EngineProtectionConfig? {
         if (ecuFamily != EcuFamily.SPEEDUINO) return null
         val page = pages[EngineProtectionMapper.PAGE_NUMBER] ?: return null
-        return EngineProtectionMapper.fromPage(page, firmwareEra)
+        val base = EngineProtectionMapper.fromPage(page, firmwareEra)
+        if (!firmwareEra.isModern()) return base
+        val page1 = pages[EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER]
+        val page4 = pages[EngineProtectionMapper.RPM_PAGE_NUMBER]
+        val page9 = pages[EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER]
+        val page10 = pages[EngineProtectionMapper.OIL_PAGE_NUMBER]
+        if (page1 == null || page4 == null || page9 == null || page10 == null) return base
+        return EngineProtectionMapper.withExtendedPages(base, firmwareEra, page1, page4, page9, page10)
     }
 
     fun parseClosedLoopCorrectionConfig(
@@ -309,7 +319,10 @@ object SessionTableParser {
             return null
         }
         val page = pages[ClosedLoopCorrectionMapper.PAGE_NUMBER] ?: return null
-        return ClosedLoopCorrectionMapper.fromPage(page, firmwareEra)
+        val base = ClosedLoopCorrectionMapper.fromPage(page, firmwareEra)
+        if (!ClosedLoopCorrectionMapper.hasMapWindowPage(firmwareEra)) return base
+        val page9 = pages[ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER] ?: return base
+        return ClosedLoopCorrectionMapper.withMapWindow(base, page9)
     }
 
     private fun ByteArray.sliceRange(offset: Int, length: Int): ByteArray {

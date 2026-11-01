@@ -36,6 +36,12 @@ internal class ClientFakeEcu(
 
     private val tables = HashMap<Int, ByteArray>()
     val writes = mutableListOf<Write>()
+
+    /**
+     * Tamanho real de cada página no firmware (pageSize do .ini). Como o Speeduino, gravar além do
+     * fim da página devolve RANGE_ERR (0x84) e não altera nada. Vazio = sem limite.
+     */
+    val pageSizeLimits = HashMap<Int, Int>()
     val burns = mutableListOf<Int>()
     val commands = mutableListOf<Char>()
 
@@ -124,6 +130,10 @@ internal class ClientFakeEcu(
                 val off = u16le(p, 2)
                 val len = u16le(p, 4)
                 val body = p.copyOfRange(6, 6 + len)
+                val limit = pageSizeLimits[page]
+                if (limit != null && off + len > limit) {
+                    return code(0x84)
+                }
                 body.copyInto(mem(page), off)
                 writes += Write(page, off, body)
                 ok()

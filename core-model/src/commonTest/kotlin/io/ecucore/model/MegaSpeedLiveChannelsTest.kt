@@ -182,7 +182,7 @@ signature = "MS2Extra MegaSpeed "
         val names = MegaSpeedLiveChannels.CHANNELS.map { it.name }
         assertEquals(names.size, names.toSet().size)
         MegaSpeedLiveChannels.CHANNELS.forEach {
-            assertTrue(it.offset + it.type.bytes <= MegaSpeedLiveChannels.MIN_BLOCK_SIZE, it.name)
+            assertTrue(it.offset + it.type.bytes <= 219, it.name)
         }
     }
 
@@ -233,9 +233,27 @@ signature = "MS2Extra MegaSpeed "
     @Test
     fun `bloco curto ou nulo nao decodifica`() {
         assertNull(MegaSpeedLiveChannels.decode(null))
-        assertNull(MegaSpeedLiveChannels.decode(ByteArray(218)))
+        assertNull(MegaSpeedLiveChannels.decode(ByteArray(211)))
         assertNull(MegaSpeedLiveChannels.engineBits(ByteArray(5)))
         assertNull(MegaSpeedLiveChannels.status3(null))
+    }
+
+    @Test
+    fun `bloco de 212 bytes do MS2Extra decodifica sem os canais exclusivos da MegaSpeed`() {
+        val d = ByteArray(212).also {
+            put16(it, 2, 2252)              // pulseWidth1: 2252 * 0.000666 = 1.50 ms
+            put16(it, 62, 17)               // dwell: 17 * 0.0666 = 1.13 ms
+            it[94] = 0                      // synccnt
+        }
+        val r = assertNotNull(MegaSpeedLiveChannels.decode(d)).associateBy { it.channel.name }
+        assertEquals("1.50 ms", r.getValue("pulseWidth1").text)
+        assertEquals("1.13 ms", r.getValue("dwell").text)
+        assertEquals("0", r.getValue("synccnt").text)
+        assertNull(r["oil"])
+        assertNull(r["fuel"])
+        assertNull(r["runsecs"])
+        // Bloco da MegaSpeed (219) mantém todos.
+        assertEquals(MegaSpeedLiveChannels.CHANNELS.size, assertNotNull(MegaSpeedLiveChannels.decode(ByteArray(219))).size)
     }
 
     @Test

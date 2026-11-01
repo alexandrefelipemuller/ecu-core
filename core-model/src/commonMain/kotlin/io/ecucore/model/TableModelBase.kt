@@ -14,6 +14,12 @@ interface TableModel {
     val loadBins: List<Int>
     val values: List<List<Int>>
     val loadType: TableModelBase.LoadType
+
+    /**
+     * Unidade do eixo de carga em relacao a kPa/% de usuario: usuario = loadBins * loadScale.
+     * 1.0 (padrao) = loadBins ja esta em kPa/% inteiros. MS2 guarda decimos (0.1).
+     */
+    val loadScale: Double get() = 1.0
 }
 
 object TableModelBase {
@@ -272,7 +278,9 @@ fun <T> setTableLoadBin(
 ): T {
     if (index !in 0..15) return factory(table.loadBins)
     val newLoadBins = table.loadBins.toMutableList()
-    newLoadBins[index] = newLoad.coerceIn(0, TableModelBase.maxLoadForType(table.loadType))
+    val maxLoad = TableModelBase.maxLoadForType(table.loadType)
+    val maxRaw = if (table.loadScale == 1.0) maxLoad else kotlin.math.round(maxLoad / table.loadScale).toInt()
+    newLoadBins[index] = newLoad.coerceIn(0, maxRaw)
     return factory(newLoadBins)
 }
 

@@ -2,6 +2,10 @@ package io.ecucore
 
 import kotlin.concurrent.Volatile
 
+import io.ecucore.model.MegaSpeedWritableField
+import io.ecucore.model.IniCurveCodec
+import io.ecucore.model.IniWritableCurve
+import io.ecucore.model.Ms2WritableFields
 import io.ecucore.model.Ms3GenericSensors
 import io.ecucore.model.Ms3GenericSensorConfig
 import io.ecucore.model.Ms3GenericSensorsSnapshot
@@ -84,6 +88,11 @@ import io.ecucore.model.RusefiIniUiParsers
 import io.ecucore.model.EcuIniDefinitions
 import io.ecucore.transport.MapSelectionSupport
 import io.ecucore.model.TpsCalibration
+import io.ecucore.model.MS2_TPS_TABLE
+import io.ecucore.model.MS2_TPS_MIN_OFFSET
+import io.ecucore.model.MS2_TPS_BYTES
+import io.ecucore.model.encodeMs2TpsCalibration
+import io.ecucore.model.decodeMs2TpsCalibration
 import io.ecucore.model.VeTable
 import io.ecucore.model.TriggerSettings
 import io.ecucore.model.afrTableLoadType
@@ -153,6 +162,10 @@ class EcuClient(
         // falha como condição de link (ruído/perda de bytes), não como defeito de protocolo.
         const val LIVE_DATA_LINK_DESYNC_MARKER = "link_desync"
         private const val LIVE_DATA_CRC_ERR_RESPONSE = "response code = 0x82"
+        private const val EMPTY_LIVE_DATA_RESPONSE = "response code = null"
+        private const val LIVE_DATA_UNEXPECTED_SIZE_MARKER = "Live data modern com tamanho inesperado"
+        // EcuProtocol.LegacyAsciiModernResponseException: length lido de bytes ASCII = stream desalinhado.
+        private const val LEGACY_ASCII_RESPONSE_MARKER = "Modern response was legacy ASCII"
         private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
         // Gravação de tabelas de tuning (VE/Ignição/AFR): chunks pequenos reduzem a chance de
         // perder bytes num frame grande via Bluetooth, e cada página é relida e comparada antes
@@ -314,6 +327,9 @@ class EcuClient(
     private var lastFaultRecoveryAtMs = 0L
     @Volatile
     private var liveDataStreamStopRequested = false
+
+    /** Já recebemos ao menos um frame modern do tamanho exato do OCH nesta conexão. */
+    private var fullModernLiveFrameSeen = false
     @Volatile
     private var forceLegacyFirmwareHandshakeAfterModernDisconnect = false
 
@@ -922,6 +938,7 @@ class EcuClient(
         lastGlobalDisconnectWasActive = true
         lastGlobalDisconnectAtMs = lastDisconnectAtMs
         stopLiveDataStream()
+        fullModernLiveFrameSeen = false
         connection.disconnect()
         protocol.setSessionLegacyPreferred(false)
         protocol.setSessionModernEnvelope(null)
@@ -1433,10 +1450,17 @@ class EcuClient(
         }
     }
 
+    private fun isMs2TpsCalibrationFamily() =
+        firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED
+
     /**
      * Lê calibração de TPS em Page 1.
      */
     override suspend fun readTpsCalibration(): TpsCalibration = withContext(Dispatchers.IO) {
+        if (isMs2TpsCalibrationFamily()) {
+            val raw = withEcuIo { protocol.readTable(MS2_TPS_TABLE.toInt(), MS2_TPS_MIN_OFFSET, MS2_TPS_BYTES, EcuFamily.MS2) }
+            return@withContext decodeMs2TpsCalibration(raw)
+        }
         val pageData = readPage(pageNum = 1, offset = 0, length = 128)
         TpsCalibration(
             tpsMin = readU8(pageData, 44),
@@ -1449,6 +1473,19 @@ class EcuClient(
      */
     override suspend fun writeTpsCalibration(calibration: TpsCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeTpsCalibration")
+        if (isMs2TpsCalibrationFamily()) {
+            val ms2Calibration = calibration.copy(adcMax = TpsCalibration.ADC_MAX_10BIT)
+            ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(ms2Calibration))
+            val data = encodeMs2TpsCalibration(ms2Calibration)
+            writeMsTableVerified(
+                TableRegions(
+                    listOf(TableRegion(MS2_TPS_TABLE.toInt(), MS2_TPS_MIN_OFFSET, data)),
+                    if (burn) setOf(MS2_TPS_TABLE.toInt()) else emptySet(),
+                ),
+                "TPS Calibration (MS2)",
+            )
+            return@withContext
+        }
         requireSpeeduinoLayout("writeTpsCalibration")
         ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
@@ -1746,8 +1783,9 @@ class EcuClient(
     }
 
     override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView {
-        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed")
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MEGASPEED && !(family == EcuFamily.MS2 && view == MegaSpeedConfigView.IDLE)) {
+            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed (e marcha lenta na MS2)")
         }
         val definition = activeIniDefinition
             ?: throw UnsupportedOperationException("Esta tela requer o .ini da CostaMegaSpeed carregado")
@@ -1781,8 +1819,8 @@ class EcuClient(
     }
 
     private fun megaSpeedScalar(name: String, requireWritable: Boolean = true): MegaSpeedScalar {
-        if (requireWritable && MegaSpeedWritableFields.byName(name) == null) {
-            throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $name")
+        if (requireWritable && writableFieldSpec(name) == null) {
+            throw IllegalArgumentException("Campo não permitido para gravação: $name")
         }
         val definition = activeIniDefinition
             ?: throw UnsupportedOperationException("Esta operação requer o .ini da ECU carregado")
@@ -1808,9 +1846,75 @@ class EcuClient(
     }
 
     private fun requireMegaSpeedForFieldAccess() {
-        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed")
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MEGASPEED && family != EcuFamily.MS2) {
+            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed e MS2")
         }
+    }
+
+    /** Whitelist de campos escalares graváveis da família conectada. */
+    private fun writableFieldSpec(name: String): MegaSpeedWritableField? =
+        if (firmwareInfo?.family == EcuFamily.MS2) Ms2WritableFields.byName(name) else MegaSpeedWritableFields.byName(name)
+
+    private class IniCurve(val pageId: Int, val offset: Int, val count: Int, val width: Int, val signed: Boolean, val scale: Double, val translate: Double)
+
+    private fun iniCurve(spec: IniWritableCurve): IniCurve {
+        val definition = activeIniDefinition
+            ?: throw UnsupportedOperationException("Esta operação requer o .ini carregado")
+        val candidates = definition.fields.filter {
+            it.section.equals("Constants", true) && it.name == spec.name && it.kind == io.ecucore.definition.IniFieldKind.ARRAY
+        }
+        // O parser não avalia `#if`: com duas definições (ex.: tempTable °C/°F) escolhe pela unidade.
+        val field = (spec.unitSuffix?.let { suf -> candidates.firstOrNull { it.units?.trim()?.endsWith(suf, true) == true } }
+            ?: candidates.firstOrNull())
+            ?: throw UnsupportedOperationException("Curva ${spec.name} ausente no .ini")
+        val type = field.dataType.uppercase()
+        require(type in setOf("S08", "U08", "S16", "U16")) { "Curva ${spec.name}: tipo $type não suportado" }
+        val shape = field.shape ?: error("Curva ${spec.name} sem tamanho")
+        require(shape.columns == 1) { "Curva ${spec.name} não é 1D" }
+        val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
+            ?: throw UnsupportedOperationException("Página da curva ${spec.name} não resolvida")
+        val scale = field.scale ?: 1.0
+        require(scale > 0.0) { "Escala inválida para ${spec.name}" }
+        return IniCurve(pageId, field.offset ?: error("Curva ${spec.name} sem offset"), shape.rows,
+            if (type.endsWith("16")) 2 else 1, type.startsWith("S"), scale, field.translate ?: 0.0)
+    }
+
+    private fun curveSpec(name: String): IniWritableCurve {
+        if (firmwareInfo?.family != EcuFamily.MS2) throw UnsupportedOperationException("Curvas .ini disponíveis apenas para MS2")
+        return Ms2WritableFields.curveByName(name)
+            ?: throw IllegalArgumentException("Curva não permitida para gravação: $name")
+    }
+
+    override suspend fun readIniCurve(name: String): List<Double> {
+        val c = iniCurve(curveSpec(name))
+        return IniCurveCodec.decode(readConfigChunk(c.pageId, c.offset, c.count * c.width), c.width, c.signed, c.scale, c.translate)
+    }
+
+    override suspend fun writeIniCurve(name: String, values: List<Double>) {
+        ensureWritable("writeIniCurve")
+        val spec = curveSpec(name)
+        val c = iniCurve(spec)
+        require(values.size == c.count) { "${spec.label}: esperado ${c.count} pontos, recebido ${values.size}" }
+        values.forEach {
+            require(it.isFinite() && it >= spec.min && it <= spec.max) {
+                "${spec.label}: valor $it fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
+            }
+        }
+        val newBytes = IniCurveCodec.encode(values, c.width, c.signed, c.scale, c.translate)
+        val current = readConfigChunk(c.pageId, c.offset, newBytes.size)
+        val first = newBytes.indices.firstOrNull { current[it] != newBytes[it] }
+        if (first == null) {
+            Logger.d(TAG, "Curva $name já está igual; nada a gravar")
+            return
+        }
+        val last = newBytes.indices.last { current[it] != newBytes[it] }
+        val data = newBytes.copyOfRange(first, last + 1)
+        Logger.d(TAG, "Gravando curva $name tabela=0x${c.pageId.toString(16)} off=${c.offset + first} len=${data.size}")
+        writeMsTableVerified(
+            TableRegions(listOf(TableRegion(c.pageId, c.offset + first, data)), setOf(c.pageId)),
+            "Curva $name",
+        )
     }
 
     override suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> {
@@ -1830,8 +1934,8 @@ class EcuClient(
     override suspend fun writeMegaSpeedConfigField(field: String, value: Double) {
         ensureWritable("writeMegaSpeedConfigField")
         requireMegaSpeedForFieldAccess()
-        val spec = MegaSpeedWritableFields.byName(field)
-            ?: throw IllegalArgumentException("Campo MegaSpeed não permitido para gravação: $field")
+        val spec = writableFieldSpec(field)
+            ?: throw IllegalArgumentException("Campo não permitido para gravação: $field")
         require(value.isFinite() && value >= spec.min && value <= spec.max) {
             "${spec.label}: valor ${value} fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
         }
@@ -2179,14 +2283,16 @@ class EcuClient(
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
         val base = EngineProtectionMapper.fromPage(pageData, era)
         if (!era.isModern()) return base
-        // Rev-limiter fields (valet mode) live in pages 1, 4 and 9; a failure here must not break the page 6 read.
+        // Os demais campos moram nas páginas 1, 4, 9 e 10; falha aqui não pode quebrar a leitura da
+        // página 6 (a config volta com extendedPagesLoaded=false e as páginas extras não são gravadas).
         return runCatching {
             val page1 = readPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, 0, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE)
             val page4 = readPage(EngineProtectionMapper.RPM_PAGE_NUMBER, 0, EngineProtectionMapper.RPM_PAGE_SIZE)
             val page9 = readPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 0, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE)
-            EngineProtectionMapper.withRevLimiterPages(base, page1, page4, page9)
+            val page10 = readPage(EngineProtectionMapper.OIL_PAGE_NUMBER, 0, EngineProtectionMapper.OIL_PAGE_SIZE)
+            EngineProtectionMapper.withExtendedPages(base, era, page1, page4, page9, page10)
         }.getOrElse {
-            Logger.w(TAG, "Rev limiter pages (1/4/9) unavailable: ${it.message}")
+            Logger.w(TAG, "Engine protection pages (1/4/9/10) unavailable: ${it.message}")
             base
         }
     }
@@ -2205,7 +2311,16 @@ class EcuClient(
             offset = 0,
             length = ClosedLoopCorrectionMapper.PAGE_SIZE
         )
-        return ClosedLoopCorrectionMapper.fromPage(pageData, era)
+        val base = ClosedLoopCorrectionMapper.fromPage(pageData, era)
+        if (!ClosedLoopCorrectionMapper.hasMapWindowPage(era)) return base
+        // A janela de MAP (egoMAPMax/Min) mora na página 9; falhar aqui falha a leitura inteira, senão
+        // a gravação seguinte escreveria 0 nesses campos.
+        val page9 = readPage(
+            pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
+            offset = 0,
+            length = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE
+        )
+        return ClosedLoopCorrectionMapper.withMapWindow(base, page9)
     }
 
     /**
@@ -2225,23 +2340,29 @@ class EcuClient(
             length = EngineProtectionMapper.PAGE_SIZE
         )
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
-        val updatedData = EngineProtectionMapper.applyToPage(basePage, config, era)
+        val updatedData = EngineProtectionMapper.applyToPage(basePage, config)
         writeConfigPageVerified(
             pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
             offset = 0,
             data = updatedData,
             label = "Engine Protection",
         )
-        // Pages 1/4/9 are only touched when the config carries a rev limiter read from the ECU.
-        if (era.isModern() && config.hardRevLimitRpm > 0) {
-            writeRevLimiterPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
+        // Páginas 1/4/9/10 só são tocadas se a config foi lida delas (extendedPagesLoaded): sem isso os
+        // campos estariam em valor padrão e a gravação zeraria limites que o app nunca viu.
+        if (era.isModern() && config.extendedPagesLoaded) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
                 EngineProtectionMapper.applyToPage1(it, config)
             }
-            writeRevLimiterPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
                 EngineProtectionMapper.applyToPage4(it, config)
             }
-            writeRevLimiterPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
-                EngineProtectionMapper.applyToPage9(it, config)
+            if (EngineProtectionMapper.hasPage9Protection(era)) {
+                writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
+                    EngineProtectionMapper.applyToPage9(it, config, era)
+                }
+            }
+            writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, burn) {
+                EngineProtectionMapper.applyToPage10(it, config)
             }
         }
         if (burn) {
@@ -2253,7 +2374,7 @@ class EcuClient(
         }
     }
 
-    private suspend fun writeRevLimiterPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
+    private suspend fun writeEngineProtectionExtraPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
         val updated = transform(readPage(pageNum = pageNum, offset = 0, length = size))
         writeConfigPageVerified(pageNum = pageNum.toByte(), offset = 0, data = updated, label = "Engine Protection page $pageNum")
         if (burn) {
@@ -2284,6 +2405,19 @@ class EcuClient(
             data = updatedData,
             label = "Closed Loop Corrections",
         )
+        if (ClosedLoopCorrectionMapper.hasMapWindowPage(era)) {
+            val basePage9 = readPage(
+                pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
+                offset = 0,
+                length = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE
+            )
+            writeConfigPageVerified(
+                pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
+                offset = 0,
+                data = ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
+                label = "Closed Loop Corrections MAP window",
+            )
+        }
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -3649,7 +3783,7 @@ class EcuClient(
                 if (!validationResult.isValid) {
                     throw ValidationException(validationResult)
                 }
-                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+                confirmTableChange(TableChangeKind.IGNITION, ignitionTable.valuesInWholeDegrees()) { readIgnitionTable(1).valuesInWholeDegrees() }
                 val serialized = MegaSpeedIniTableDefinitions.serializeIgnitionTable(catalog.ignitionTable, ignitionTable)
                 writeMsTableVerified(serialized.toRegions(), "MegaSpeed Ignition Table 1")
                 Logger.d(TAG, "✅ MegaSpeed Ignition Table 1 gravada via .ini e burn executado")
@@ -3661,7 +3795,7 @@ class EcuClient(
         if (!validationResult.isValid) {
             throw ValidationException(validationResult)
         }
-        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.values) { readIgnitionTable(1).values }
+        confirmTableChange(TableChangeKind.IGNITION, ignitionTable.valuesInWholeDegrees()) { readIgnitionTable(1).valuesInWholeDegrees() }
 
         val serialized = Ms2TableDefinitions.serializeIgnitionTable(ignitionTable)
         writeMsTableVerified(serialized.toRegions(), "MS2 Ignition Table 1")
@@ -3911,10 +4045,22 @@ class EcuClient(
         }
 
         if (outputSize > 0 && data.size != outputSize) {
+            // Link que já entregou frames completos e agora devolve outro tamanho = frame
+            // desalinhado (CRC de live data é lenient): descartar em vez de parsear lixo como
+            // live data, sem emitir oc_mismatch (que vira non-fatal). O stream trata como
+            // dessincronização recuperável (limpa buffer, repete e reconecta se persistir).
+            if (usedModernRead && fullModernLiveFrameSeen && data.size < outputSize) {
+                connection.clearInputBuffer()
+                throw Exception(
+                    "$LIVE_DATA_UNEXPECTED_SIZE_MARKER: expected=$outputSize actual=${data.size}"
+                )
+            }
             val mode = if (canTryModern) "modern_or_fallback" else "legacy"
             val message = "oc_mismatch family=${ecuFamily.name} mode=$mode expected=$outputSize actual=${data.size}"
             Logger.w(TAG, "⚠ $message")
             ConnectionTrace.info("live_data", message)
+        } else if (usedModernRead && outputSize > 0) {
+            fullModernLiveFrameSeen = true
         }
 
         val isModernData = usedModernRead && data.size == outputSize
@@ -4129,6 +4275,12 @@ class EcuClient(
         if (message.contains("response code = 0x80", ignoreCase = true)) {
             return true
         }
+        // Frame modern vazio (length=0, "response code = null"): o link entregou o envelope mas a ECU/
+        // adaptador não tinha payload - é o que sobra de uma rajada de timeouts num Bluetooth
+        // instável. Mesmo tratamento do 0x80: limpar o buffer e repetir.
+        if (message.contains(EMPTY_LIVE_DATA_RESPONSE, ignoreCase = true)) {
+            return true
+        }
         val match = PARTIAL_TIMEOUT_REGEX.find(message) ?: return false
         val received = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return false
         return received >= 0
@@ -4140,8 +4292,12 @@ class EcuClient(
      * indica bytes perdidos/corrompidos no caminho ou restos de um frame anterior no buffer da
      * ECU - condição de link, recuperável esperando a ECU descartar o frame parcial.
      */
-    internal fun isLiveDataLinkDesync(error: Exception): Boolean =
-        error.message?.contains(LIVE_DATA_CRC_ERR_RESPONSE, ignoreCase = true) == true
+    internal fun isLiveDataLinkDesync(error: Exception): Boolean {
+        val message = error.message ?: return false
+        return message.contains(LIVE_DATA_CRC_ERR_RESPONSE, ignoreCase = true) ||
+            message.contains(LIVE_DATA_UNEXPECTED_SIZE_MARKER, ignoreCase = true) ||
+            (fullModernLiveFrameSeen && message.contains(LEGACY_ASCII_RESPONSE_MARKER, ignoreCase = true))
+    }
 
     internal fun liveDataRetryDelayMs(error: Exception): Long =
         if (isLiveDataLinkDesync(error)) LIVE_DATA_DESYNC_RESYNC_DELAY_MS else 25L

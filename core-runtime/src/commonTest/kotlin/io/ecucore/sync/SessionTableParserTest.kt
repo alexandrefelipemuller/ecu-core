@@ -11,6 +11,7 @@ import io.ecucore.model.VeTable
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 
 class SessionTableParserTest {
 
@@ -41,5 +42,13 @@ class SessionTableParserTest {
         assertEquals(expected.values, parsed.values)
         assertEquals(expected.rpmBins, parsed.rpmBins)
         assertEquals(expected.loadBins, parsed.loadBins)
+    }
+
+    @Test
+    fun `dwell table so existe no speeduino - pagina 0x0c do MS2 nao vira dwell map`() {
+        val page12 = ByteArray(1024) { (it * 7).toByte() }
+        assertNull(SessionTableParser.parseDwellTable(EcuFamily.MS2, mapOf(12 to page12), engineConstants = null))
+        assertNull(SessionTableParser.parseDwellTable(EcuFamily.MS3, mapOf(12 to page12), engineConstants = null))
+        assertNull(SessionTableParser.parseDwellTable(EcuFamily.MEGASPEED, mapOf(12 to page12), engineConstants = null))
     }
 }

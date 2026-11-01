@@ -25,6 +25,8 @@ data class EcuLiveData(
     val gpsSpeedKph: Double? = null,
     val gpsLatitude: Double? = null,
     val gpsLongitude: Double? = null,
+    /** ADC bruto do TPS (0..1023), só MS2/Extra. */
+    val tpsAdc: Int? = null,
     val outputChannelBlockSize: Int = 0,
     val outputChannelData: ByteArray? = null
 ) {

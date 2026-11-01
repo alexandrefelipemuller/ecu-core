@@ -24,6 +24,10 @@ import io.ecucore.shared.Logger
 object EcuOutputChannels {
 
     private const val TAG = "OutputChannels"
+
+    /** MS2/MS3 mandam temperaturas em °F×10; °C = (raw - 320) * 0.05555, como no ramo CELSIUS do .ini. */
+    private const val MS_TEMP_SCALE = 0.05555
+    private const val MS_TEMP_TRANSLATE = -320.0
     private val runtimeDefinitions = mutableMapOf<Int, List<OutputField>>()
     private val loggedDefinitionSelections = mutableSetOf<String>()
 
@@ -94,16 +98,21 @@ object EcuOutputChannels {
         OutputField("engine", 11, DataType.U08, units = "bits"),
         OutputField("afrtgt1", 12, DataType.U08, scale = 0.1, units = "AFR"),
         OutputField("afrtgt2", 13, DataType.U08, scale = 0.1, units = "AFR"),
+        OutputField("barometer", 16, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("map", 18, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("mat", 20, DataType.S16, scale = MS_TEMP_SCALE, translate = MS_TEMP_TRANSLATE, units = "°C", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("coolant", 22, DataType.S16, scale = MS_TEMP_SCALE, translate = MS_TEMP_TRANSLATE, units = "°C", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("tps", 24, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("batteryVoltage", 26, DataType.S16, scale = 0.1, units = "V", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("afr", 28, DataType.S16, scale = 0.1, units = "AFR", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("afr2", 30, DataType.S16, scale = 0.1, units = "AFR", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("egoCorrection1", 34, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("egoCorrection2", 36, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("airCorrection", 38, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("warmupEnrich", 40, DataType.S16, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("accelEnrich", 42, DataType.S16, scale = 0.1, units = "ms", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("baroCorrection", 46, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("gammaEnrich", 48, DataType.S16, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("veCurr1", 50, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("iacstep", 54, DataType.S16, byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("dwell", 62, DataType.U16, scale = 0.0666, units = "ms", byteOrder = EcuByteOrder.BIG_ENDIAN),
@@ -128,7 +137,6 @@ object EcuOutputChannels {
         OutputField("adv1", 192, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("adv2", 194, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("adv3", 196, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),
-        OutputField("oil", 212, DataType.S16, scale = 0.1, units = "bar", byteOrder = EcuByteOrder.BIG_ENDIAN),
     )
 
     /**
@@ -146,6 +154,8 @@ object EcuOutputChannels {
         OutputField("engine", 11, DataType.U08, units = "bits"),
         OutputField("baro", 16, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("map", 18, DataType.S16, scale = 0.1, units = "kPa", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("mat", 20, DataType.S16, scale = MS_TEMP_SCALE, translate = MS_TEMP_TRANSLATE, units = "°C", byteOrder = EcuByteOrder.BIG_ENDIAN),
+        OutputField("coolant", 22, DataType.S16, scale = MS_TEMP_SCALE, translate = MS_TEMP_TRANSLATE, units = "°C", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("tps", 24, DataType.S16, scale = 0.1, units = "%", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("batteryVoltage", 26, DataType.S16, scale = 0.1, units = "V", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("afr", 28, DataType.S16, scale = 0.1, units = "AFR", byteOrder = EcuByteOrder.BIG_ENDIAN),
@@ -197,7 +207,9 @@ object EcuOutputChannels {
 
     fun isMs3BlockSize(blockSize: Int): Boolean = blockSize in 509..512
 
+    // oil (212) só existe no bloco de 219 bytes da MegaSpeed; o outpc do MS2Extra termina em 211.
     val MEGASPEED_219_FIELDS = MS2_212_FIELDS + listOf(
+        OutputField("oil", 212, DataType.S16, scale = 0.1, units = "bar", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("fuel", 214, DataType.S16, scale = 0.1, units = "bar", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("runsecs", 216, DataType.U16, units = "s", byteOrder = EcuByteOrder.BIG_ENDIAN),
         OutputField("start_retard", 218, DataType.S16, scale = 0.1, units = "deg", byteOrder = EcuByteOrder.BIG_ENDIAN),

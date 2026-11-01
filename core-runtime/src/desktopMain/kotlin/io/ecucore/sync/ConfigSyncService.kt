@@ -149,7 +149,7 @@ class ConfigSyncService(
         val restoreSkipPages = skipPages + 0.toByte()
         var stopDueToRangeErr = false
 
-        pageLoop@ for ((pageNum, pageSize) in ConfigManager.PAGE_SIZES) {
+        pageLoop@ for ((pageNum, pageSize) in ConfigManager.pageSizesFor(client)) {
             if (restoreSkipPages.contains(pageNum)) {
                 val reason = when (pageNum.toInt()) {
                     0 -> "read-only/status"
@@ -158,10 +158,16 @@ class ConfigSyncService(
                 warnings.add("Página $pageNum ignorada no restore ($reason)")
                 continue
             }
-            val data = pages[pageNum]
+            var data = pages[pageNum]
             if (data == null) {
                 warnings.add("Página $pageNum ausente no backup")
                 continue
+            }
+            if (data.size > pageSize) {
+                // Backups antigos guardavam páginas com tamanho errado (ex.: página 6 com 192/240 bytes
+                // quando o firmware tem 128). O excedente está além do fim da página - descartar.
+                warnings.add("Página $pageNum do backup com ${data.size} bytes; usando os primeiros $pageSize")
+                data = data.copyOf(pageSize)
             }
             if (data.size != pageSize) {
                 errors.add("Página $pageNum com tamanho inesperado (${data.size} != $pageSize)")

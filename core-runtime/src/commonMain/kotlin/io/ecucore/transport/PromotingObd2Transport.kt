@@ -219,6 +219,12 @@ class PromotingObd2Transport(
     override suspend fun readMegaSpeedFieldValues(fields: List<String>): Map<String, Double> =
         selected().readMegaSpeedFieldValues(fields)
 
+    override suspend fun readIniCurve(name: String): List<Double> =
+        selected().readIniCurve(name)
+
+    override suspend fun writeIniCurve(name: String, values: List<Double>) =
+        selected().writeIniCurve(name, values)
+
     override suspend fun writeMegaSpeedConfigField(field: String, value: Double) =
         selected().writeMegaSpeedConfigField(field, value)
 

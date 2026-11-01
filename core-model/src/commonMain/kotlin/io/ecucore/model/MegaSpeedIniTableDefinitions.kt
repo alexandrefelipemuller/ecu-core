@@ -141,9 +141,10 @@ object MegaSpeedIniTableDefinitions {
         }
         return VeTable(
             rpmBins = parseAxis(layout.rpmAxis, rpmAxisData),
-            loadBins = parseAxis(layout.loadAxis, loadAxisData),
+            loadBins = parseRawAxis(layout.loadAxis, loadAxisData),
             values = values,
             loadType = loadType,
+            loadScale = layout.loadAxis.scale,
         )
     }
 
@@ -171,7 +172,7 @@ object MegaSpeedIniTableDefinitions {
             rpmAxisData = serializeAxis(table.rpmBins, layout.rpmAxis, EcuByteOrder.BIG_ENDIAN),
             loadAxisTableId = layout.loadAxis.pageId,
             loadAxisOffset = layout.loadAxis.offset,
-            loadAxisData = serializeAxis(table.loadBins, layout.loadAxis, EcuByteOrder.BIG_ENDIAN),
+            loadAxisData = serializeAxis(table.loadBins, layout.loadAxis, EcuByteOrder.BIG_ENDIAN, table.loadScale),
             burnTableIds = setOf(layout.metadata.page),
         )
     }
@@ -194,14 +195,19 @@ object MegaSpeedIniTableDefinitions {
                     type = layout.metadata.valueType,
                     byteOrder = layout.valueByteOrder,
                 )
-                (raw * layout.metadata.scale + layout.metadata.translate).roundToInt()
+                // Sem translate, guarda o bruto (décimos de grau) e a escala vai em valueScale,
+                // para não perder 13,2° -> 13° na leitura nem regravar a tabela arredondada.
+                if (keepsRawIgnition(layout)) raw
+                else (raw * layout.metadata.scale + layout.metadata.translate).roundToInt()
             }
         }
         return IgnitionTable(
             rpmBins = parseAxis(layout.rpmAxis, rpmAxisData),
-            loadBins = parseAxis(layout.loadAxis, loadAxisData),
+            loadBins = parseRawAxis(layout.loadAxis, loadAxisData),
             values = values,
             loadType = loadType,
+            loadScale = layout.loadAxis.scale,
+            valueScale = if (keepsRawIgnition(layout)) layout.metadata.scale else 1.0,
         )
     }
 
@@ -216,7 +222,7 @@ object MegaSpeedIniTableDefinitions {
         table.values.forEach { row ->
             require(row.size == layout.metadata.valuesShape.second) { "Invalid ignition column count" }
             row.forEach { value ->
-                val raw = ((value - layout.metadata.translate) / layout.metadata.scale).roundToInt()
+                val raw = ((value * table.valueScale - layout.metadata.translate) / layout.metadata.scale).roundToInt()
                 writeValue(valuesData, writeOffset, layout.metadata.valueType, raw, layout.valueByteOrder)
                 writeOffset += elementSize
             }
@@ -231,7 +237,7 @@ object MegaSpeedIniTableDefinitions {
             rpmAxisData = serializeAxis(table.rpmBins, layout.rpmAxis, EcuByteOrder.BIG_ENDIAN),
             loadAxisTableId = layout.loadAxis.pageId,
             loadAxisOffset = layout.loadAxis.offset,
-            loadAxisData = serializeAxis(table.loadBins, layout.loadAxis, EcuByteOrder.BIG_ENDIAN),
+            loadAxisData = serializeAxis(table.loadBins, layout.loadAxis, EcuByteOrder.BIG_ENDIAN, table.loadScale),
             burnTableIds = setOf(layout.metadata.page),
         )
     }
@@ -253,9 +259,10 @@ object MegaSpeedIniTableDefinitions {
         }
         return AfrTable(
             rpmBins = parseAxis(layout.rpmAxis, rpmAxisData),
-            loadBins = parseAxis(layout.loadAxis, loadAxisData),
+            loadBins = parseRawAxis(layout.loadAxis, loadAxisData),
             values = values,
             loadType = loadType,
+            loadScale = layout.loadAxis.scale,
         )
     }
 
@@ -283,7 +290,7 @@ object MegaSpeedIniTableDefinitions {
             rpmAxisData = serializeAxis(table.rpmBins, layout.rpmAxis, EcuByteOrder.BIG_ENDIAN),
             loadAxisTableId = layout.loadAxis.pageId,
             loadAxisOffset = layout.loadAxis.offset,
-            loadAxisData = serializeAxis(table.loadBins, layout.loadAxis, EcuByteOrder.BIG_ENDIAN),
+            loadAxisData = serializeAxis(table.loadBins, layout.loadAxis, EcuByteOrder.BIG_ENDIAN, table.loadScale),
             burnTableIds = setOf(layout.metadata.page),
         )
     }
@@ -376,12 +383,22 @@ object MegaSpeedIniTableDefinitions {
         }
     }
 
-    private fun serializeAxis(values: List<Int>, axis: AxisLayout, byteOrder: EcuByteOrder): ByteArray {
+    /** Eixo em unidade bruta da ECU (ex.: décimos de kPa); a escala vai no loadScale do modelo. */
+    private fun parseRawAxis(axis: AxisLayout, data: ByteArray): List<Int> {
+        val step = dataTypeSize(axis.dataType)
+        return List(axis.count) { index -> readValue(data, index * step, axis.dataType, EcuByteOrder.BIG_ENDIAN) }
+    }
+
+    private fun keepsRawIgnition(layout: TableLayout): Boolean =
+        layout.metadata.translate == 0.0 && layout.metadata.scale != 1.0
+
+    /** [valueScale] = unidade de [values] em relação à de usuário (loadScale do modelo). */
+    private fun serializeAxis(values: List<Int>, axis: AxisLayout, byteOrder: EcuByteOrder, valueScale: Double = 1.0): ByteArray {
         require(values.size == axis.count) { "Invalid axis count" }
         val elementSize = dataTypeSize(axis.dataType)
         val output = ByteArray(values.size * elementSize)
         values.forEachIndexed { index, value ->
-            val raw = (value / axis.scale).roundToInt()
+            val raw = (value * valueScale / axis.scale).roundToInt()
             writeValue(output, index * elementSize, axis.dataType, raw, byteOrder)
         }
         return output
