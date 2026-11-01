@@ -48,6 +48,23 @@ class EcuClientLiveDataTest {
     }
 
     @Test
+    fun `short modern frame after a healthy one is a recoverable desync not parsed as live data`() = runBlocking<Unit> {
+        val (c, ecu) = connect(ClientFakeEcu.Kind.SPEEDUINO_2025)
+        assertNotNull(c.readLiveData()) // frame completo: link saudável
+        val shortFrame = listOf(byteArrayOf(0x00, 0x0B), ByteArray(11), ByteArray(4))
+        ecu.onFrame = { cmd, _ -> if (cmd == 'r') shortFrame else null }
+        val error = assertFailsWith<Exception> { c.readLiveData() }
+        assertTrue(c.isLiveDataLinkDesync(error), error.message)
+    }
+
+    @Test
+    fun `legacy ascii response after a healthy stream is a link desync`() = runBlocking<Unit> {
+        val (c, _) = connect(ClientFakeEcu.Kind.SPEEDUINO_2025)
+        assertNotNull(c.readLiveData())
+        assertTrue(c.isLiveDataLinkDesync(Exception("Modern response was legacy ASCII: ^q")))
+    }
+
+    @Test
     fun `modern envelope era never falls back to legacy`() = runBlocking<Unit> {
         val (c, ecu) = connect(ClientFakeEcu.Kind.SPEEDUINO_2025)
         ecu.onFrame = { cmd, _ -> if (cmd == 'r') errorFrame else null }

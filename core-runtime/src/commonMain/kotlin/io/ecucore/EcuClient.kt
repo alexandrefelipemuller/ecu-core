@@ -151,6 +151,9 @@ class EcuClient(
         // falha como condição de link (ruído/perda de bytes), não como defeito de protocolo.
         const val LIVE_DATA_LINK_DESYNC_MARKER = "link_desync"
         private const val LIVE_DATA_CRC_ERR_RESPONSE = "response code = 0x82"
+        private const val LIVE_DATA_UNEXPECTED_SIZE_MARKER = "Live data modern com tamanho inesperado"
+        // EcuProtocol.LegacyAsciiModernResponseException: length lido de bytes ASCII = stream desalinhado.
+        private const val LEGACY_ASCII_RESPONSE_MARKER = "Modern response was legacy ASCII"
         private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
         // Gravação de tabelas de tuning (VE/Ignição/AFR): chunks pequenos reduzem a chance de
         // perder bytes num frame grande via Bluetooth, e cada página é relida e comparada antes
@@ -312,6 +315,9 @@ class EcuClient(
     private var lastFaultRecoveryAtMs = 0L
     @Volatile
     private var liveDataStreamStopRequested = false
+
+    /** Já recebemos ao menos um frame modern do tamanho exato do OCH nesta conexão. */
+    private var fullModernLiveFrameSeen = false
     @Volatile
     private var forceLegacyFirmwareHandshakeAfterModernDisconnect = false
 
@@ -920,6 +926,7 @@ class EcuClient(
         lastGlobalDisconnectWasActive = true
         lastGlobalDisconnectAtMs = lastDisconnectAtMs
         stopLiveDataStream()
+        fullModernLiveFrameSeen = false
         connection.disconnect()
         protocol.setSessionLegacyPreferred(false)
         protocol.setSessionModernEnvelope(null)
@@ -3723,10 +3730,22 @@ class EcuClient(
         }
 
         if (outputSize > 0 && data.size != outputSize) {
+            // Link que já entregou frames completos e agora devolve outro tamanho = frame
+            // desalinhado (CRC de live data é lenient): descartar em vez de parsear lixo como
+            // live data, sem emitir oc_mismatch (que vira non-fatal). O stream trata como
+            // dessincronização recuperável (limpa buffer, repete e reconecta se persistir).
+            if (usedModernRead && fullModernLiveFrameSeen && data.size < outputSize) {
+                connection.clearInputBuffer()
+                throw Exception(
+                    "$LIVE_DATA_UNEXPECTED_SIZE_MARKER: expected=$outputSize actual=${data.size}"
+                )
+            }
             val mode = if (canTryModern) "modern_or_fallback" else "legacy"
             val message = "oc_mismatch family=${ecuFamily.name} mode=$mode expected=$outputSize actual=${data.size}"
             Logger.w(TAG, "⚠ $message")
             ConnectionTrace.info("live_data", message)
+        } else if (usedModernRead && outputSize > 0) {
+            fullModernLiveFrameSeen = true
         }
 
         val isModernData = usedModernRead && data.size == outputSize
@@ -3952,8 +3971,12 @@ class EcuClient(
      * indica bytes perdidos/corrompidos no caminho ou restos de um frame anterior no buffer da
      * ECU - condição de link, recuperável esperando a ECU descartar o frame parcial.
      */
-    internal fun isLiveDataLinkDesync(error: Exception): Boolean =
-        error.message?.contains(LIVE_DATA_CRC_ERR_RESPONSE, ignoreCase = true) == true
+    internal fun isLiveDataLinkDesync(error: Exception): Boolean {
+        val message = error.message ?: return false
+        return message.contains(LIVE_DATA_CRC_ERR_RESPONSE, ignoreCase = true) ||
+            message.contains(LIVE_DATA_UNEXPECTED_SIZE_MARKER, ignoreCase = true) ||
+            (fullModernLiveFrameSeen && message.contains(LEGACY_ASCII_RESPONSE_MARKER, ignoreCase = true))
+    }
 
     internal fun liveDataRetryDelayMs(error: Exception): Long =
         if (isLiveDataLinkDesync(error)) LIVE_DATA_DESYNC_RESYNC_DELAY_MS else 25L
