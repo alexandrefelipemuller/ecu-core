@@ -12,7 +12,8 @@ data class AfrTable(
     override val rpmBins: List<Int>,        // RPM values (columns) - e.g., [500, 1000, 1500, ...]
     override val loadBins: List<Int>,       // Load values (rows) - MAP kPa or TPS %
     override val values: List<List<Int>>,   // AFR target values (multiplied by 10, e.g., 14.7 = 147)
-    override val loadType: TableModelBase.LoadType = TableModelBase.LoadType.MAP
+    override val loadType: TableModelBase.LoadType = TableModelBase.LoadType.MAP,
+    override val loadScale: Double = 1.0   // 0.1 = loadBins em decimos de kPa (MS2)
 ) : TableModel {
     typealias LoadType = TableModelBase.LoadType
     typealias StorageFormat = TableModelBase.StorageFormat

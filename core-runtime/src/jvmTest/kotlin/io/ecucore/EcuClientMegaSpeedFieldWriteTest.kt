@@ -121,8 +121,8 @@ class EcuClientMegaSpeedFieldWriteTest {
     }
 
     @Test
-    fun `fora de MegaSpeed recusa`() = runBlocking<Unit> {
-        val ecu = ClientFakeEcu(ClientFakeEcu.Kind.MS2)
+    fun `fora de MegaSpeed e MS2 recusa`() = runBlocking<Unit> {
+        val ecu = ClientFakeEcu(ClientFakeEcu.Kind.SPEEDUINO_2025)
         val client = EcuClient(ecu, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
         client.connect()
         assertFailsWith<UnsupportedOperationException> { client.writeMegaSpeedConfigField("RevLimNormal2", 6500.0) }

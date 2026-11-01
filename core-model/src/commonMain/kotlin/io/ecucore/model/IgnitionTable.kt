@@ -11,7 +11,10 @@ data class IgnitionTable(
     override val rpmBins: List<Int>,        // RPM values (columns) - e.g., [500, 1000, 1500, ...]
     override val loadBins: List<Int>,       // Load values (rows) - MAP kPa or TPS %
     override val values: List<List<Int>>,   // Ignition advance values (degrees BTDC)
-    override val loadType: TableModelBase.LoadType = TableModelBase.LoadType.MAP
+    override val loadType: TableModelBase.LoadType = TableModelBase.LoadType.MAP,
+    override val loadScale: Double = 1.0,  // 0.1 = loadBins em decimos de kPa (MS2)
+    /** graus = values * valueScale. 1.0 (padrao) = graus inteiros; MS2 usa 0.1 (decimos de grau). */
+    val valueScale: Double = 1.0
 ) : TableModel {
     typealias LoadType = TableModelBase.LoadType
     typealias StorageFormat = TableModelBase.StorageFormat
@@ -112,12 +115,22 @@ data class IgnitionTable(
         return values.getOrNull(row)?.getOrNull(col) ?: 0
     }
 
+    /** Valores em graus inteiros (arredondados), para comparações que assumem graus. */
+    fun valuesInWholeDegrees(): List<List<Int>> =
+        if (valueScale == 1.0) values
+        else values.map { row -> row.map { kotlin.math.round(it * valueScale).toInt() } }
+
+    /** Avanço em graus da célula (aplica [valueScale]). */
+    fun degreesAt(row: Int, col: Int): Double = getValue(row, col) * valueScale
+
     /**
-     * Update value at specific row/column
+     * Update value at specific row/column (newValue na unidade de [values], i.e. graus / valueScale)
      * Ignition advance values range from -40 to +70 degrees BTDC
      */
     fun setValue(row: Int, col: Int, newValue: Int): IgnitionTable {
-        return setTableValue(this, row, col, newValue, { it.coerceIn(-40, 70) }) { newValues ->
+        val minRaw = kotlin.math.round(-40 / valueScale).toInt()
+        val maxRaw = kotlin.math.round(70 / valueScale).toInt()
+        return setTableValue(this, row, col, newValue, { it.coerceIn(minRaw, maxRaw) }) { newValues ->
             copy(values = newValues)
         }
     }
