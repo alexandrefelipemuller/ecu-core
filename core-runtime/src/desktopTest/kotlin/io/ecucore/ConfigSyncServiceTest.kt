@@ -174,6 +174,39 @@ class ConfigSyncServiceTest {
     }
 
     @Test
+    fun `fallback page sizes follow the ini - page 6 has 128 bytes not 240`() {
+        assertEquals(128, ConfigManager.PAGE_SIZES[6.toByte()])
+        assertEquals(128, ConfigManager.PAGE_SIZES[4.toByte()])
+        assertEquals(240, ConfigManager.PAGE_SIZES[7.toByte()])
+        assertEquals(384, ConfigManager.PAGE_SIZES[8.toByte()])
+    }
+
+    @Test
+    fun `page sizes come from the connected ECU definition`() = runBlocking<Unit> {
+        val (client, _) = connected()
+
+        val sizes = ConfigManager.pageSizesFor(client)
+
+        assertEquals(128, sizes[6.toByte()])
+        assertEquals(240, sizes[7.toByte()])
+        assertEquals(client.getEcuPageCatalog().filter { it.size > 0 }.associate { it.id.toByte() to it.size }, sizes)
+    }
+
+    @Test
+    fun `old backup with an oversized page 6 is truncated instead of rejected`() = runBlocking<Unit> {
+        val (client, ecu) = connected()
+        ecu.pageSizeLimits[6] = 128 // firmware real: gravar além do fim = RANGE_ERR
+        val dir = fullBackup("antigo")
+        File(dir, "page_6.bin").writeBytes(ByteArray(192) { 0x22 }) // backups antigos tinham 192 bytes
+
+        val outcome = service.restoreConfigToEcu(client, dir)
+
+        assertTrue(outcome.completed)
+        assertTrue(outcome.warnings.any { it.contains("Página 6 do backup com 192 bytes") })
+        assertTrue(ecu.writes.filter { it.id == 6 }.all { it.offset + it.data.size <= 128 })
+    }
+
+    @Test
     fun `a legacy backup without checksums is still restorable`() = runBlocking<Unit> {
         val (client, _) = connected()
         assertTrue(service.restoreConfigToEcu(client, fullBackup("legado")).completed)
@@ -206,10 +239,15 @@ class ConfigSyncServiceTest {
     @Test
     fun `a full restore writes every page except the status page and burns once`() = runBlocking<Unit> {
         val (client, ecu) = connected()
-        val outcome = service.restoreConfigToEcu(client, fullBackup())
+        // backup completo = todas as páginas do catálogo do firmware conectado (0..15)
+        val backup = session(
+            "completo",
+            *ConfigManager.pageSizesFor(client).map { (p, size) -> p.toInt() to ByteArray(size) { (p + it).toByte() } }.toTypedArray(),
+        )
+        val outcome = service.restoreConfigToEcu(client, backup)
         assertEquals(RestoreOutcome(outcome.warnings, emptyList(), true), outcome)
         assertEquals(listOf("Página 0 ignorada no restore (read-only/status)"), outcome.warnings)
-        assertEquals((1..10).toSet(), ecu.writes.map { it.id }.toSet())
+        assertEquals((1..15).toSet(), ecu.writes.map { it.id }.toSet())
         assertEquals(1, ecu.burns.size)
         assertContentEquals(ByteArray(288) { (2 + it).toByte() }, ecu.mem(2).copyOf(288))
     }

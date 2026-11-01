@@ -484,8 +484,9 @@ object SpeeduinoDefinitionProvider : EcuDefinitionProvider {
         EcuPageDescriptor(3, 288, "Ignition Table"),
         EcuPageDescriptor(4, 128, "Trigger Settings"),
         EcuPageDescriptor(5, 288, "AFR Table"),
-        EcuPageDescriptor(6, 240, "Boost VVT"),
-        EcuPageDescriptor(7, 240, "Trim Tables"),
+        // ⚠️ Página 6 = 128 bytes (EGO/IAC/engineProtectType); 240 é a página 7. Ver speeduino_*.ini pageSize.
+        EcuPageDescriptor(6, 128, "EGO / IAC"),
+        EcuPageDescriptor(7, 240, "Boost VVT Staging"),
         EcuPageDescriptor(8, 384, "CAN Config"),
         EcuPageDescriptor(9, 192, "Warmup Enrichment"),
         EcuPageDescriptor(10, 192, "Linear Misc"),

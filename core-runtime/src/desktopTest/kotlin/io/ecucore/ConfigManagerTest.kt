@@ -89,8 +89,9 @@ class ConfigManagerTest {
 
         assertTrue(result.success, result.error)
         assertNull(result.error)
-        assertEquals(11, result.pagesDownloaded)
-        assertEquals(11, result.totalPages)
+        // o catálogo do firmware (0..15) define o que baixar, não a tabela fixa de fallback
+        assertEquals(16, result.pagesDownloaded)
+        assertEquals(16, result.totalPages)
         assertEquals(2, result.capability!!.protocolVersion)
         assertTrue(result.timestamp.matches(Regex("""\d{8}_\d{6}""")))
         val dir = result.sessionDir!!
@@ -98,7 +99,7 @@ class ConfigManagerTest {
         assertContentEquals(ByteArray(288) { (2 + it).toByte() }, File(dir, "page_2.bin").readBytes())
         assertEquals(288, result.pages[2.toByte()]!!.size)
         val checksums = io.ecucore.sync.BackupIntegrity.readChecksums(dir)!!
-        assertEquals(11, checksums.size)
+        assertEquals(16, checksums.size)
         assertEquals(io.ecucore.sync.BackupIntegrity.crc32(File(dir, "page_2.bin").readBytes()), checksums[2.toByte()])
         assertTrue(progress.first().startsWith("Obtendo capacidades"))
         assertTrue(progress.last().startsWith("Download concluído!"))
@@ -125,7 +126,7 @@ class ConfigManagerTest {
         val progress = mutableListOf<String>()
         val result = manager.downloadAllConfigs(client) { _, _, message -> progress += message }
         assertFalse(result.success)
-        assertEquals(10, result.pagesDownloaded)
+        assertEquals(15, result.pagesDownloaded)
         assertEquals("Páginas com falha: 7", result.error)
         assertTrue(progress.any { it.startsWith("Erro na página 7") })
         assertTrue(progress.last().startsWith("Download concluído com falhas: 7"))

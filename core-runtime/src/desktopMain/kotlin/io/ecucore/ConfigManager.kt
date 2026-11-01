@@ -33,20 +33,35 @@ import java.util.zip.ZipOutputStream
 class ConfigManager(baseDir: File = defaultBaseDir()) {
 
     companion object {
-        // Tamanhos de páginas padrão (podem variar por firmware)
+        // Fallback quando o transporte não expõe o catálogo de páginas do .ini (ver [pageSizesFor]).
+        // Valores do pageSize do speeduino_202501.ini. ⚠️ A página 6 tem 128 bytes (240 é a página 7).
         val PAGE_SIZES = linkedMapOf(
             0.toByte() to 128,   // Page 0 - Configurações gerais / status
             1.toByte() to 128,   // Page 1 - Engine constants (algoritmo, req fuel, etc)
             2.toByte() to 288,   // Page 2 - VE Table (16x16 + eixos compactados)
             3.toByte() to 288,   // Page 3 - Ignition Table (16x16 + eixos)
-            4.toByte() to 192,   // Page 4 - Ign settings / trigger
+            4.toByte() to 128,   // Page 4 - trigger / idle / rev limiter
             5.toByte() to 288,   // Page 5 - AFR Target Table
-            6.toByte() to 192,   // Page 6 - Boost/VVT (varia por firmware)
-            7.toByte() to 192,   // Page 7 - Trim tables
-            8.toByte() to 192,   // Page 8 - CAN config
-            9.toByte() to 192,   // Page 9 - Warmup enrichment
-            10.toByte() to 192   // Page 10 - Linear/misc config
+            6.toByte() to 128,   // Page 6 - EGO / IAC / engine protect type
+            7.toByte() to 240,   // Page 7 - Boost / VVT / staging
+            8.toByte() to 384,   // Page 8
+            9.toByte() to 192,   // Page 9 - hard rev mode / AFR protect / secondary serial
+            10.toByte() to 192   // Page 10 - oil pressure flags
         )
+
+        /**
+         * Tamanho das páginas conforme o .ini carregado no cliente (varia por firmware: o 201609 tem
+         * páginas de 64 bytes, o 202501 tem 15 páginas). Cai para [PAGE_SIZES] só sem catálogo.
+         */
+        fun pageSizesFor(client: EcuTransport): Map<Byte, Int> {
+            val fromIni = client.getEcuPageCatalog()
+                .filter { it.size > 0 && it.id in 0..255 }
+                .associate { it.id.toByte() to it.size }
+            return if (fromIni.isEmpty()) PAGE_SIZES else fromIni
+        }
+
+        private const val MAX_SPEEDUINO_PAGE = 15
+        private val PAGE_FILE_REGEX = Regex("""page_(\d+)\.bin""")
 
         const val CONFIG_DIR = "speeduino_configs"
 
@@ -66,12 +81,13 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
         client: EcuTransport,
         onProgress: (Int, Int, String) -> Unit
     ): ConfigDownloadResult = withContext(Dispatchers.IO) {
+        val pageSizes = pageSizesFor(client)
         try {
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val sessionDir = File(configDir, timestamp).apply { mkdirs() }
 
             // 1. Obter capacidades
-            onProgress(0, PAGE_SIZES.size + 1, "Obtendo capacidades...")
+            onProgress(0, pageSizes.size + 1, "Obtendo capacidades...")
             val capability = client.getSerialCapability()
 
             // Salvar informações gerais
@@ -91,9 +107,9 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
             var currentPage = 0
 
             // 2. Baixar cada página
-            for ((pageNum, pageSize) in PAGE_SIZES) {
+            for ((pageNum, pageSize) in pageSizes) {
                 currentPage++
-                onProgress(currentPage, PAGE_SIZES.size + 1, "Baixando página $pageNum ($pageSize bytes)...")
+                onProgress(currentPage, pageSizes.size + 1, "Baixando página $pageNum ($pageSize bytes)...")
 
                 try {
                     // CRC desabilitado - comando 'd' pode causar timeout em alguns firmwares
@@ -115,14 +131,14 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
                     val crcInfo = if (crc != 0L) " CRC: 0x${crc.toString(16)}" else ""
                     onProgress(
                         currentPage,
-                        PAGE_SIZES.size + 1,
+                        pageSizes.size + 1,
                         "Página $pageNum baixada (${pageData.size} bytes$crcInfo)"
                     )
                 } catch (e: Exception) {
                     failedPages += pageNum
                     onProgress(
                         currentPage,
-                        PAGE_SIZES.size + 1,
+                        pageSizes.size + 1,
                         "Erro na página $pageNum: ${e.message}"
                     )
                 }
@@ -131,8 +147,8 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
             BackupIntegrity.writeChecksums(sessionDir, downloadedPages.mapValues { it.value.data })
 
             onProgress(
-                PAGE_SIZES.size + 1,
-                PAGE_SIZES.size + 1,
+                pageSizes.size + 1,
+                pageSizes.size + 1,
                 if (failedPages.isEmpty()) {
                     "Download concluído! ${downloadedPages.size} páginas salvas"
                 } else {
@@ -144,7 +160,7 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
                 success = failedPages.isEmpty(),
                 timestamp = timestamp,
                 pagesDownloaded = downloadedPages.size,
-                totalPages = PAGE_SIZES.size,
+                totalPages = pageSizes.size,
                 sessionDir = sessionDir,
                 capability = capability,
                 pages = downloadedPages,
@@ -155,7 +171,7 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
                 success = false,
                 timestamp = "",
                 pagesDownloaded = 0,
-                totalPages = PAGE_SIZES.size,
+                totalPages = pageSizes.size,
                 sessionDir = null,
                 capability = null,
                 pages = emptyMap(),
@@ -175,12 +191,14 @@ class ConfigManager(baseDir: File = defaultBaseDir()) {
     suspend fun loadConfig(sessionDir: File): Map<Byte, ByteArray> = withContext(Dispatchers.IO) {
         val pages = mutableMapOf<Byte, ByteArray>()
 
-        for ((pageNum, _) in PAGE_SIZES) {
-            val pageFile = File(sessionDir, "page_$pageNum.bin")
-            if (pageFile.exists()) {
-                pages[pageNum] = pageFile.readBytes()
+        // Lê as page_N.bin (0..15) da sessão: o conjunto de páginas depende do firmware do backup.
+        sessionDir.listFiles()
+            ?.mapNotNull { file ->
+                val number = PAGE_FILE_REGEX.matchEntire(file.name)?.groupValues?.get(1)?.toIntOrNull()
+                number?.takeIf { it in 0..MAX_SPEEDUINO_PAGE }?.let { it.toByte() to file }
             }
-        }
+            ?.sortedBy { (page, _) -> page.toInt() and 0xFF }
+            ?.forEach { (page, file) -> pages[page] = file.readBytes() }
 
         pages
     }
