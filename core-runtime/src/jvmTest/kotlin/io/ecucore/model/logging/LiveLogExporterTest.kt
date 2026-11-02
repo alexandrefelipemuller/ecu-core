@@ -119,6 +119,8 @@ class LiveLogExporterTest {
         assertEquals(LiveLogExporter.FALLBACK_SIGNALS, LiveLogExporter.availableSignals(snapshot(listOf(entry(0)))))
         val raw = LiveLogExporter.availableSignals(snapshot(listOf(entry(0, raw = 130))))
         assertTrue("rpm" in raw && "gps_speed_kmh" in raw && "gps_location" in raw)
+        assertEquals(raw, LiveLogExporter.availableSignals(130))
+        assertEquals(LiveLogExporter.FALLBACK_SIGNALS, LiveLogExporter.availableSignals(0))
     }
 
     @Test

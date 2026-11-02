@@ -45,10 +45,17 @@ object LiveLogExporter {
     }
 
     /** Sinais que o usuário pode escolher para este snapshot (para montar a lista de seleção na UI). */
-    fun availableSignals(snapshot: LiveLogSnapshot): List<String> {
-        val fields = resolveFields(snapshot)
-        return if (fields.isEmpty()) FALLBACK_SIGNALS else fields.map { it.name } + listOf(GPS_SPEED, GPS_LOCATION)
-    }
+    fun availableSignals(snapshot: LiveLogSnapshot): List<String> = availableSignals(
+        resolveFields(snapshot).takeIf { it.isNotEmpty() },
+    )
+
+    /** O mesmo, a partir do tamanho do bloco de canais da ECU conectada (0 = sem bloco bruto). */
+    fun availableSignals(outputChannelBlockSize: Int): List<String> = availableSignals(
+        if (outputChannelBlockSize > 0) EcuOutputChannels.getDefinition(outputChannelBlockSize).takeIf { it.isNotEmpty() } else null,
+    )
+
+    private fun availableSignals(fields: List<OutputField>?): List<String> =
+        if (fields == null) FALLBACK_SIGNALS else fields.map { it.name } + listOf(GPS_SPEED, GPS_LOCATION)
 
     fun write(
         out: Writer,
