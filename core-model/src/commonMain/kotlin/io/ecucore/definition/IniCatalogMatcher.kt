@@ -165,7 +165,10 @@ object IniCatalogMatcher {
 
     fun matchesSignature(signature: String, pattern: String): Boolean {
         val normalizedSignature = normalizeForMatch(signature)
-        val normalizedPattern = normalizeForMatch(pattern)
+        // Espaços colados a um '*' (ex.: "MS/Extra format hr_10 **********") vêm de assinaturas brutas de ECU com
+        // sufixo de versão/checksum. A assinatura já normalizada não inclui esse sufixo nem o espaço à frente dele;
+        // tirar o espaço da fronteira do wildcard torna o sufixo opcional.
+        val normalizedPattern = normalizeForMatch(pattern).replace(Regex("\\s*\\*\\s*"), "*")
         val wildcardRegex = normalizedPattern
             .split('*')
             .joinToString(".*") { Regex.escape(it) }

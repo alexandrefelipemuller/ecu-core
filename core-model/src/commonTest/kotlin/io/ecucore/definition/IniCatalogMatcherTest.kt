@@ -188,4 +188,10 @@ class IniCatalogMatcherTest {
         assertEquals(3, entry.minAppVersion)
         assertEquals(emptyList(), IniCatalogMatcher.parseCatalog("{}"))
     }
+
+    @Test
+    fun wildcardSuffixIsOptionalWhenSignatureHasNoTrailingSpace() {
+        assertEquals(true, IniCatalogMatcher.matchesSignature("MS/Extra format hr_10", "MS/Extra format hr_10 **********"))
+        assertEquals(false, IniCatalogMatcher.matchesSignature("MS/Extra format hr_11", "MS/Extra format hr_10 **********"))
+    }
 }
