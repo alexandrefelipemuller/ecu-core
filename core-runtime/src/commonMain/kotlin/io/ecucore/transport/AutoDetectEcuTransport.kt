@@ -45,6 +45,9 @@ class AutoDetectEcuTransport(
     private val connectMutex = Mutex()
     private var activeTransport: EcuTransport? = null
 
+    /** Transporte escolhido na conexão (primário ou fallback), ou null se desconectado. */
+    fun activeTransportOrNull(): EcuTransport? = activeTransport
+
     override suspend fun connect() {
         connectMutex.withLock {
             val current = activeTransport
@@ -291,4 +294,13 @@ class AutoDetectEcuTransport(
 
     override fun isDiagnosticsAvailable(): Boolean =
         (selected() as? Obd2DiagnosticsCapable)?.isDiagnosticsAvailable() ?: false
+}
+
+/** Desce por cadeias de [AutoDetectEcuTransport] até o transporte realmente em uso. */
+fun EcuTransport.resolveActive(): EcuTransport {
+    var current: EcuTransport = this
+    while (current is AutoDetectEcuTransport) {
+        current = current.activeTransportOrNull() ?: return current
+    }
+    return current
 }

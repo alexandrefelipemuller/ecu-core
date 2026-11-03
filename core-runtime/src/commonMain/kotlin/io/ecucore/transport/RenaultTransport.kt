@@ -102,23 +102,6 @@ class RenaultTransport(
                 coolantCommands = listOf("22F40D", "210D")
             )
         )
-
-        /**
-         * Siemens Sirius 32 (Renault Clio K4M) não fala SAE J1979 - o dispatcher KWP2000
-         * "cru" do firmware só expõe 4 SIDs proprietários (0x27/0x23/0x14/0x2A). O único
-         * grupo de leitura por local ID (0x2A) que expõe status de DTC é o 0x0893, e só
-         * cobre a "palavra 0" da tabela real de 60 índices (word_index=0): IAT, MAP e CKP.
-         * Os demais ~57 códigos existem no binário mas não têm um grupo KWP conhecido que
-         * os exponha - ver ecu-core/core-runtime notas de RE / simulador (SIRIUS32_DTC_TABLE
-         * em obd2_tcp_simulator.py) para o levantamento completo.
-         */
-        private data class Sirius32DtcBit(val mask: Int, val code: String, val description: String)
-
-        private val SIRIUS32_WORD0_DTCS = listOf(
-            Sirius32DtcBit(0x0400, "DF003", "Circuito do sensor de temperatura do ar (IAT)"),
-            Sirius32DtcBit(0x0040, "DF045", "Circuito do sensor de pressão do coletor (MAP)"),
-            Sirius32DtcBit(0x0002, "DF025", "Circuito do sensor de rotação/virabrequim (CKP)"),
-        )
     }
 
     private data class RenaultCanCandidate(
@@ -923,9 +906,7 @@ class RenaultTransport(
     private suspend fun sirius32ReadDtcCodes(status: DtcStatus): List<DtcCode> {
         val words = sirius32ReadStatusWords() ?: return emptyList()
         val word = if (status == DtcStatus.ACTIVE) words.first else words.second
-        return SIRIUS32_WORD0_DTCS
-            .filter { (word and it.mask) != 0 }
-            .map { DtcCode(code = it.code, description = it.description, status = status) }
+        return Sirius32Dtc.decodeWord0(word, status)
     }
 
     /**
