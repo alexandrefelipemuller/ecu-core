@@ -295,6 +295,16 @@ class EcuClient(
 
     override suspend fun <T> withEcuIoLock(block: suspend () -> T): T = withEcuIo(block)
 
+    /**
+     * Só diagnóstico (telemetria de [PageWriteAnomaly]): quem tem o canal agora. `foreign_busy`
+     * numa gravação que não está sob [withEcuIo] indica operação paralela (p.ex. live stream).
+     */
+    private suspend fun ioLockState(): String = when {
+        currentCoroutineContext()[EcuIoOwner] != null -> "owned"
+        ioMutex.isLocked -> "foreign_busy"
+        else -> "free"
+    }
+
     override suspend fun drainStaleResponses() {
         withEcuIo {
             runCatching { connection.clearInputBuffer() }
@@ -2755,6 +2765,9 @@ class EcuClient(
                     writeErrorMessage = passError?.message,
                     writeResponseCode = (passError as? EcuProtocol.PageWriteRejectedException)?.responseCode,
                     recovered = false,
+                    readBackSize = readBack.size,
+                    shiftHint = PageWriteDiagnostics.detectShift(data, readBack),
+                    ioLockState = ioLockState(),
                 )
             }
             if (mismatches.isEmpty() && lastWriteError == null) {
@@ -3489,6 +3502,9 @@ class EcuClient(
                 writeErrorMessage = lastError?.message,
                 writeResponseCode = (writeError as? EcuProtocol.PageWriteRejectedException)?.responseCode,
                 recovered = false,
+                readBackSize = actual?.size ?: -1,
+                shiftHint = PageWriteDiagnostics.detectShift(expected, actual),
+                ioLockState = ioLockState(),
             )
             Logger.w(TAG, "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass; regravando")
         }
