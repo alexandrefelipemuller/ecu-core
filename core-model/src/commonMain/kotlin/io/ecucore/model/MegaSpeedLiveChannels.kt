@@ -8,6 +8,7 @@ package io.ecucore.model
  * A lista é curada à mão (o parser de .ini não guarda bits de canais de saída, e o .ini tem ramos
  * `#if CELSIUS`), mas cada canal é conferido contra as linhas reais do .ini em teste.
  * Temperaturas chegam em °F×10 (raw); a conversão para °C é `(raw - 320) * 0.05555`, como no .ini.
+ * Com o bit `tempUnits` em °C chegam em °C×10 (ver [MsTemperatureUnits]).
  */
 enum class MegaSpeedChannelGroup(val label: String) {
     ENGINE("Motor"),
@@ -60,8 +61,8 @@ object MegaSpeedLiveChannels {
     const val ENGINE_OFFSET = 11
     const val STATUS3_OFFSET = 80
 
-    private const val TEMP_SCALE = 0.05555
-    private const val TEMP_TRANSLATE = -320.0
+    private const val TEMP_SCALE = MsTemperatureUnits.FAHRENHEIT_SCALE
+    private const val TEMP_TRANSLATE = MsTemperatureUnits.FAHRENHEIT_TRANSLATE
 
     private fun c(
         name: String, label: String, group: MegaSpeedChannelGroup, offset: Int, type: MegaSpeedChannelType,
@@ -132,7 +133,11 @@ object MegaSpeedLiveChannels {
         if (block == null || block.size < MIN_BLOCK_SIZE) return null
         return CHANNELS.filter { it.offset + it.type.bytes <= block.size }.map { ch ->
             val raw = readRaw(block, ch)
-            val value = (raw + ch.translate) * ch.scale
+            val value = if (MsTemperatureUnits.isFahrenheitTemperature(ch.scale, ch.translate)) {
+                MsTemperatureUnits.rawToCelsius(raw)
+            } else {
+                (raw + ch.translate) * ch.scale
+            }
             val number = formatFixed(value, ch.digits)
             MegaSpeedChannelReading(ch, raw, value, if (ch.unit.isEmpty()) number else "$number ${ch.unit}")
         }

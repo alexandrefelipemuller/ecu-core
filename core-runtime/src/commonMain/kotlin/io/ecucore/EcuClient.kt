@@ -30,6 +30,7 @@ import io.ecucore.model.EcuFamily
 import io.ecucore.model.EcuConfigReadMode
 import io.ecucore.model.OutputField
 import io.ecucore.model.EcuOutputChannels
+import io.ecucore.model.MsTemperatureUnits
 import io.ecucore.model.EcuTableDefinitions
 import io.ecucore.model.EngineProtectionConfig
 import io.ecucore.model.EngineProtectionMapper
@@ -180,6 +181,7 @@ class EcuClient(
         // 0x84 (out of range). Achado de campo 2026-11 (MicroSquirt comms342hU): sync inicial
         // falhava com `page=10 length=288 ... code=84` e a gravação da ignição nunca passava.
         private const val MS2_MAX_TABLE_TRANSFER_SIZE = 256
+        private const val MS_PAGE1_TABLE_ID = 0x04
         private const val RUSEFI_RECONNECT_SETTLE_DELAY_MS = 3_000L
         private const val GLOBAL_RECONNECT_SETTLE_DELAY_MS = 1_000L
         // TTL padrão do cache de páginas de configuração: 30 dias. Seguro porque um download
@@ -533,6 +535,7 @@ class EcuClient(
                     EcuOutputChannels.getDefinition(loadedDefinitions.ochBlockSize)
                 }
                 preloadPinLayoutInfoIfPossible()
+                preloadMsTemperatureUnitsIfPossible()
 
                 Logger.i(TAG, "✅ Firmware compatível: $effectiveFirmwareSignature (era: $era)")
                 if (definitions != null) {
@@ -739,6 +742,34 @@ class EcuClient(
             Logger.e(TAG, error.message.orEmpty())
             throw error
         }
+    }
+
+    /**
+     * MS2/MS3/MegaSpeed: lê o bit `tempUnits` da página 1. Com ele em 1, o live data lido com `A`
+     * cru (modo compat do firmware) traz CLT/MAT em °C×10 em vez de °F×10 (ver [MsTemperatureUnits]).
+     * Sem isso o app convertia de novo e mostrava `(°C − 32) / 1,8` (campo 2026-11, MicroSquirt
+     * MS2/Extra 3.4.4).
+     */
+    private suspend fun preloadMsTemperatureUnitsIfPossible() {
+        val family = firmwareInfo?.family ?: return
+        if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") return
+        val offset = MsTemperatureUnits.offsetFor(family) ?: return
+        try {
+            val data = readConfigChunkUnlocked(MS_PAGE1_TABLE_ID, offset, 1)
+            updateMsTemperatureUnits(family, data, offset, source = "connect")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Logger.w(TAG, "Failed to read MS tempUnits on connect: ${e.message}")
+        }
+    }
+
+    private fun updateMsTemperatureUnits(family: EcuFamily, data: ByteArray, pageOffset: Int, source: String) {
+        val celsius = MsTemperatureUnits.decodeFlag(family, data, pageOffset) ?: return
+        if (MsTemperatureUnits.celsius != celsius) {
+            Logger.i(TAG, "MS tempUnits=${if (celsius) "°C" else "°F"} ($source): CLT/MAT in ${if (celsius) "°C×10" else "°F×10"}")
+        }
+        MsTemperatureUnits.celsius = celsius
     }
 
     private suspend fun preloadPinLayoutInfoIfPossible() {
@@ -977,6 +1008,7 @@ class EcuClient(
         cachedEngineConstants = null
         pinLayoutInfo = null
         EcuOutputChannels.clearAllRuntimeDefinitions()
+        MsTemperatureUnits.celsius = false
     }
 
     /**
@@ -1379,6 +1411,9 @@ class EcuClient(
             }
         }
 
+        if (pageNum == MS_PAGE1_TABLE_ID && family != EcuFamily.UNKNOWN && ecuDefinition?.runtime?.schemaId != "msextra-hr10") {
+            updateMsTemperatureUnits(family, pageData, 0, source = "page 0x04")
+        }
         pageData
     }
 

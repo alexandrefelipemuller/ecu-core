@@ -1,8 +1,9 @@
 package io.ecucore
 
 object ByteArrayParser {
-    fun tempRawToC(raw: Int): Int {
-        return (((raw / 10.0) - 32.0) * 5.0 / 9.0).toInt()
+    /** Temperatura do outpc MS2/MS3 em °C; respeita o bit `tempUnits` (ver [io.ecucore.model.MsTemperatureUnits]). */
+    fun tempRawToC(raw: Int, celsius: Boolean = io.ecucore.model.MsTemperatureUnits.celsius): Int {
+        return if (celsius) (raw / 10.0).toInt() else (((raw / 10.0) - 32.0) * 5.0 / 9.0).toInt()
     }
 
     fun u8(data: ByteArray, index: Int): Int {

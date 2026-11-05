@@ -114,13 +114,15 @@ class EcuClientMs2ConfigTest {
         )
         client.connect()
         assertEquals(io.ecucore.model.EcuFamily.MS2, client.getFirmwareInfoCached()?.family)
+        // O connect lê 1 byte da 0x04 (bit tempUnits, ver MsTemperatureUnits).
+        val readsAfterConnect = connection.envelopedTableReads
 
         val page = client.readFullPage(pageNum = 0x04, pageSize = 1024, blockSize = 256)
 
         assertEquals(1024, page.size)
         assertContentEquals(ByteArray(1024) { (it and 0xFF).toByte() }, page)
         assertTrue(connection.rawPageCommands == 0, "'p' cru não existe na MS2 e não pode ir pro fio")
-        assertEquals(4, connection.envelopedTableReads, "página 0x04 de 1024 bytes = 4 blocos de 256 via 'r'")
+        assertEquals(4, connection.envelopedTableReads - readsAfterConnect, "página 0x04 de 1024 bytes = 4 blocos de 256 via 'r'")
     }
 
     /**
