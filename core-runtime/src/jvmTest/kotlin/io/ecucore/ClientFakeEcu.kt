@@ -43,6 +43,16 @@ internal class ClientFakeEcu(
      */
     val pageSizeLimits = HashMap<Int, Int>()
     val burns = mutableListOf<Int>()
+
+    /**
+     * Máximo de bytes por 'r'/'w' de tabela de config (blockingFactor do .ini). MS2/Extra e
+     * MegaSpeed: 256 - acima disso a ECU real devolve 0x84 (out of range). Buffers de logger
+     * (0xF0+) ficam de fora: o .ini os lê com 1024 bytes de uma vez. `null` = sem limite.
+     */
+    var maxTableTransfer: Int? = if (kind == Kind.MS2 || kind == Kind.MEGASPEED) 256 else null
+
+    /** Tamanhos pedidos em cada 'r' de tabela (não-Speeduino), na ordem. */
+    val tableReadLengths = mutableListOf<Int>()
     val commands = mutableListOf<Char>()
 
     /** Resposta de `A` legacy / `r 0x30` / `O` (tamanho pedido ou este, o que for definido). */
@@ -145,12 +155,15 @@ internal class ClientFakeEcu(
                 val table = p[1].toInt() and 0xFF
                 val off = u16be(p, 2)
                 val len = u16be(p, 4)
+                tableReadLengths += len
+                if (table < 0xF0 && maxTableTransfer?.let { len > it } == true) return code(0x84)
                 ok(mem(table).copyOfRange(off, off + len))
             }
             'w' -> {
                 val table = p[1].toInt() and 0xFF
                 val off = u16be(p, 2)
                 val len = u16be(p, 4)
+                if (table < 0xF0 && maxTableTransfer?.let { len > it } == true) return code(0x84)
                 val body = p.copyOfRange(6, 6 + len)
                 body.copyInto(mem(table), off)
                 writes += Write(table, off, body)

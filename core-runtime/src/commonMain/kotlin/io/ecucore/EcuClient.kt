@@ -175,6 +175,11 @@ class EcuClient(
         private const val TABLE_WRITE_VERIFY_MAX_PASSES = 2
         private const val CONFIG_CHUNK_READ_RETRY_DELAY_MS = 40L
         private const val RUSEFI_CONFIG_READ_CHUNK_SIZE = 64
+        // MS2/Extra e MegaSpeed: `blockingFactor = 256 ; 256 is max read/write data size for
+        // MS2/Extra` no .ini. Um 'r'/'w' maior (ex.: advanceTable1 S16 12x12 = 288 bytes) volta
+        // 0x84 (out of range). Achado de campo 2026-11 (MicroSquirt comms342hU): sync inicial
+        // falhava com `page=10 length=288 ... code=84` e a gravação da ignição nunca passava.
+        private const val MS2_MAX_TABLE_TRANSFER_SIZE = 256
         private const val RUSEFI_RECONNECT_SETTLE_DELAY_MS = 3_000L
         private const val GLOBAL_RECONNECT_SETTLE_DELAY_MS = 1_000L
         // TTL padrão do cache de páginas de configuração: 30 dias. Seguro porque um download
@@ -1063,7 +1068,7 @@ class EcuClient(
             }
         }
         resolveMs2Alias(pageNum, offset, length)?.let { alias ->
-            return protocol.readTable(alias.pageId, alias.offset, length, getEcuFamily())
+            return readTableLimited(alias.pageId, alias.offset, length, getEcuFamily())
         }
         val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
 
@@ -1171,7 +1176,7 @@ class EcuClient(
                     runCatching { connection.clearInputBuffer() }
                 }
                 if (family == EcuFamily.RUSEFI && length > RUSEFI_CONFIG_READ_CHUNK_SIZE) {
-                    return readConfigChunkChunked(pageId, offset, length, RUSEFI_CONFIG_READ_CHUNK_SIZE)
+                    return readConfigChunkChunked(pageId, offset, length, RUSEFI_CONFIG_READ_CHUNK_SIZE, EcuFamily.RUSEFI)
                 }
                 return if (readMode == EcuConfigReadMode.LEGACY_PAGE) {
                     protocol.readPage(
@@ -1182,7 +1187,7 @@ class EcuClient(
                     )
                 } else {
                     when (family) {
-                        EcuFamily.MS2, EcuFamily.MEGASPEED -> protocol.readTable(pageId, offset, length, EcuFamily.MS2)
+                        EcuFamily.MS2, EcuFamily.MEGASPEED -> readTableLimited(pageId, offset, length, EcuFamily.MS2)
                         EcuFamily.MS3 -> protocol.readTable(pageId, offset, length, EcuFamily.MS3)
                         EcuFamily.RUSEFI -> protocol.readTable(pageId, offset, length, EcuFamily.RUSEFI)
                         else -> protocol.readPage(
@@ -1230,13 +1235,14 @@ class EcuClient(
         offset: Int,
         length: Int,
         chunkSize: Int,
+        family: EcuFamily,
     ): ByteArray {
         val data = ByteArray(length)
         var copied = 0
         while (copied < length) {
             val chunkOffset = offset + copied
             val currentSize = minOf(chunkSize, length - copied)
-            val chunk = protocol.readTable(pageId, chunkOffset, currentSize, EcuFamily.RUSEFI)
+            val chunk = protocol.readTable(pageId, chunkOffset, currentSize, family)
             chunk.copyInto(data, copied)
             copied += currentSize
             if (copied < length) {
@@ -1245,6 +1251,9 @@ class EcuClient(
         }
         return data
     }
+
+    private fun isMs2TransferLimited(family: EcuFamily): Boolean =
+        family == EcuFamily.MS2 || family == EcuFamily.MEGASPEED
 
     private fun resolveConfigReadMode(family: EcuFamily): EcuConfigReadMode {
         val baseMode = ecuDefinition?.runtime?.configReadMode ?: EcuConfigReadMode.MODERN_TABLE
@@ -1296,7 +1305,11 @@ class EcuClient(
                 val receivedBytes = partialTimeout.groupValues.getOrNull(2)?.toIntOrNull() ?: return true
                 return receivedBytes in 0 until expectedBytes
             }
+            // Envelope vazio (`code=null`) ou tamanho absurdo (ex.: 0x7201 = 29185 bytes): bytes
+            // atrasados/desalinhados no buffer. O retry limpa o buffer antes de reenviar.
             if (
+                message.contains("unexpected response code=null", ignoreCase = true) ||
+                message.startsWith("Resposta muito grande", ignoreCase = true) ||
                 message.contains("short legacy page response", ignoreCase = true) ||
                 message.contains("short modern page response", ignoreCase = true) ||
                 message.contains("short table response", ignoreCase = true)
@@ -2570,7 +2583,7 @@ class EcuClient(
             val alias = resolveMs2Alias(pageNum, 0, data.size)
             val tableId = alias?.pageId ?: pageNum
             val tableOffset = alias?.offset ?: 0
-            protocol.writeTable(tableId = tableId, offset = tableOffset, data = data, family = getEcuFamily())
+            writeTableLimited(tableId, tableOffset, data, getEcuFamily())
             settleAfterConfigWrite()
             burnTableIfSupported(tableId = tableId, family = getEcuFamily())
         } else {
@@ -2615,7 +2628,7 @@ class EcuClient(
             val alias = resolveMs2Alias(pageNum, 0, data.size)
             val tableId = alias?.pageId ?: pageNum
             val tableOffset = alias?.offset ?: 0
-            protocol.writeTable(tableId = tableId, offset = tableOffset, data = data, family = getEcuFamily())
+            writeTableLimited(tableId, tableOffset, data, getEcuFamily())
         } else {
             writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
         }
@@ -3424,9 +3437,44 @@ class EcuClient(
         writeRegionsVerified(
             regions = regions,
             label = label,
-            write = { protocol.writeTable(it.tableId.toByte(), it.offset, it.data) },
+            write = { region -> writeMsTableRegion(region) },
             burn = { protocol.burnTable(it.toByte()) },
         )
+
+    private suspend fun writeMsTableRegion(region: TableRegion) =
+        writeTableLimited(region.tableId, region.offset, region.data, EcuFamily.MS3)
+
+    /** Tabelas de config do MS2/MegaSpeed (os buffers de logger 0xF0+ aceitam 1024 bytes de uma vez). */
+    private fun ms2TransferLimit(tableId: Int): Int? {
+        val family = firmwareInfo?.family ?: return null
+        return if (isMs2TransferLimited(family) && tableId in 0 until 0xF0) MS2_MAX_TABLE_TRANSFER_SIZE else null
+    }
+
+    /**
+     * protocol.writeTable respeitando o limite de bytes por 'w' do MS2/Extra e MegaSpeed
+     * ([MS2_MAX_TABLE_TRANSFER_SIZE]); demais famílias gravam num comando só.
+     */
+    private suspend fun writeTableLimited(tableId: Int, offset: Int, data: ByteArray, family: EcuFamily) {
+        val limit = ms2TransferLimit(tableId)
+        if (limit == null || data.size <= limit) {
+            protocol.writeTable(tableId, offset, data, family)
+            return
+        }
+        var written = 0
+        while (written < data.size) {
+            val size = minOf(limit, data.size - written)
+            protocol.writeTable(tableId, offset + written, data.copyOfRange(written, written + size), family)
+            written += size
+            if (written < data.size) delay(10)
+        }
+    }
+
+    /** protocol.readTable respeitando o limite de bytes por 'r' do MS2/Extra e MegaSpeed. */
+    private suspend fun readTableLimited(tableId: Int, offset: Int, length: Int, family: EcuFamily): ByteArray {
+        val limit = ms2TransferLimit(tableId)
+        if (limit == null || length <= limit) return protocol.readTable(tableId, offset, length, family)
+        return readConfigChunkChunked(tableId, offset, length, limit, family)
+    }
 
     private suspend fun writeRusefiTableVerified(regions: TableRegions, label: String) =
         writeRegionsVerified(
