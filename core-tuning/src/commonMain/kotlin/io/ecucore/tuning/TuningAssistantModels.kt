@@ -80,3 +80,17 @@ data class AnalyzerResult(
     val clusters: List<SuggestionCluster>,
     val suggestedVeTable: VeTable
 )
+
+/** Textos das regiões/motivos gerados pelo analisador; o app injeta a versão localizada. */
+data class TuningAnalyzerLabels(
+    val leanAverage: String,
+    val richAverage: String,
+    val highLoad: String,
+    val cruise: String,
+    val idle: String,
+    val midLoad: String,
+) {
+    companion object {
+        val ENGLISH = TuningAnalyzerLabels("Lean average", "Rich average", "High load", "Cruise", "Idle", "Mid load")
+    }
+}

@@ -15,7 +15,8 @@ object TuningAssistantAnalyzer {
         veTable: VeTable,
         afrTable: AfrTable,
         strategy: TuningStrategy,
-        settings: AnalyzerSettings = AnalyzerSettings()
+        settings: AnalyzerSettings = AnalyzerSettings(),
+        labels: TuningAnalyzerLabels = TuningAnalyzerLabels.ENGLISH
     ): AnalyzerResult {
         val iterator = lines.iterator()
         if (!iterator.hasNext()) {
@@ -140,7 +141,7 @@ object TuningAssistantAnalyzer {
         for (row in 0 until rows) {
             for (col in 0 until cols) {
                 val acc = accumulators[row][col]
-                if (acc.hitCount < strategy.minHits || acc.weightSum <= 0.0) continue
+                if (acc.hitCount <= 0 || acc.weightSum <= 0.0) continue
                 val meanError = acc.errorSum / acc.weightSum
                 val rawDelta = meanError - 1.0
                 val clamped = clamp(rawDelta, -strategy.maxChangePct, strategy.maxChangePct)
@@ -175,8 +176,8 @@ object TuningAssistantAnalyzer {
             }
         }
 
-        val suggestedVe = applySuggestions(veTable, cellSuggestions)
-        val clusters = buildClusters(cellSuggestions, veTable, settings)
+        val suggestedVe = applySuggestions(veTable, cellSuggestions, strategy.minHits)
+        val clusters = buildClusters(cellSuggestions, veTable, settings, strategy.minHits, labels)
 
         val durationSeconds = if (firstTimestamp != null && lastTimestamp != null) {
             ((lastTimestamp - firstTimestamp) / 1000f).coerceAtLeast(0f)
@@ -226,11 +227,16 @@ object TuningAssistantAnalyzer {
         return veTable.copy(values = newValues)
     }
 
-    private fun applySuggestions(veTable: VeTable, suggestions: List<List<CellSuggestion?>>): VeTable {
+    /** Só aplica sugestões de células com amostras suficientes ([minHits]); as demais ficam só informativas. */
+    private fun applySuggestions(
+        veTable: VeTable,
+        suggestions: List<List<CellSuggestion?>>,
+        minHits: Int
+    ): VeTable {
         val newValues = veTable.values.mapIndexed { row, rowValues ->
             rowValues.mapIndexed { col, value ->
                 val suggestion = suggestions.getOrNull(row)?.getOrNull(col)
-                suggestion?.suggestedValue ?: value
+                if (suggestion == null || suggestion.hitCount < minHits) value else suggestion.suggestedValue
             }
         }
         return veTable.copy(values = newValues)
@@ -239,7 +245,9 @@ object TuningAssistantAnalyzer {
     private fun buildClusters(
         suggestions: List<List<CellSuggestion?>>,
         veTable: VeTable,
-        settings: AnalyzerSettings
+        settings: AnalyzerSettings,
+        minHits: Int,
+        labels: TuningAnalyzerLabels
     ): List<SuggestionCluster> {
         val rows = suggestions.size
         val cols = suggestions.firstOrNull()?.size ?: 0
@@ -259,6 +267,7 @@ object TuningAssistantAnalyzer {
         for (row in 0 until rows) {
             for (col in 0 until cols) {
                 val suggestion = suggestions[row][col] ?: continue
+                if (suggestion.hitCount < minHits) continue
                 if (visited[row][col]) continue
 
                 val sign = if (suggestion.deltaPct >= 0) 1 else -1
@@ -274,6 +283,7 @@ object TuningAssistantAnalyzer {
                     for (next in neighbors(current.row, current.col)) {
                         if (visited[next.row][next.col]) continue
                         val nextSuggestion = suggestions[next.row][next.col] ?: continue
+                        if (nextSuggestion.hitCount < minHits) continue
                         val nextSign = if (nextSuggestion.deltaPct >= 0) 1 else -1
                         if (nextSign != sign) continue
                         if (abs(nextSuggestion.deltaPct - seedDelta) > tolerance) continue
@@ -300,8 +310,8 @@ object TuningAssistantAnalyzer {
                         avgHits = avgHits,
                         rpmRange = rpmRange,
                         loadRange = loadRange,
-                        label = buildRegionLabel(rpmRange, loadRange, veTable.loadType),
-                        reason = if (avgDelta >= 0) "Lean average" else "Rich average"
+                        label = buildRegionLabel(rpmRange, loadRange, veTable.loadType, labels),
+                        reason = if (avgDelta >= 0) labels.leanAverage else labels.richAverage
                     )
                 )
             }
@@ -315,16 +325,17 @@ object TuningAssistantAnalyzer {
     private fun buildRegionLabel(
         rpmRange: IntRange,
         loadRange: IntRange,
-        loadType: VeTable.LoadType
+        loadType: VeTable.LoadType,
+        labels: TuningAnalyzerLabels
     ): String {
         val loadUnit = if (loadType == VeTable.LoadType.MAP) "kPa" else "%"
         val loadMid = (loadRange.first + loadRange.last) / 2
         val rpmMid = (rpmRange.first + rpmRange.last) / 2
         val prefix = when {
-            loadMid >= 85 -> "High load"
-            loadMid <= 40 && rpmMid <= 2000 -> "Cruise"
-            rpmMid <= 1200 -> "Idle"
-            else -> "Mid load"
+            loadMid >= 85 -> labels.highLoad
+            loadMid <= 40 && rpmMid <= 2000 -> labels.cruise
+            rpmMid <= 1200 -> labels.idle
+            else -> labels.midLoad
         }
         return "$prefix (${rpmRange.first}-${rpmRange.last} rpm / ${loadRange.first}-${loadRange.last} $loadUnit)"
     }

@@ -94,7 +94,7 @@ class EcuProtocolWriteBurnTest {
     fun `legacy burn requires a previous write`() = runBlocking {
         val c = conn(null, modern = false)
         val p = newProtocol(c)
-        assertTrue(msgOf { p.burnConfig() }.contains("requer a página"))
+        assertTrue(msgOf { p.burnConfig() }.contains("requires the previously written page"))
         p.writePage(3, 0, data)
         c.sent.clear()
         p.burnConfig()
@@ -112,7 +112,7 @@ class EcuProtocolWriteBurnTest {
 
     @Test
     fun `modern burn rejects empty reply and error codes`() {
-        assertTrue(msgOf { newProtocol(conn(frame(ByteArray(0))), env = true).burnConfig() }.contains("nenhuma resposta"))
+        assertTrue(msgOf { newProtocol(conn(frame(ByteArray(0))), env = true).burnConfig() }.contains("no response"))
         for ((code, text) in mapOf(
             0x84 to "RANGE_ERR", 0x82 to "CRC_ERR", 0x83 to "UKWN_ERR", 0x85 to "BUSY_ERR", 0x01 to "response code = 0x1",
         )) {
@@ -154,7 +154,7 @@ class EcuProtocolWriteBurnTest {
     fun `table write replies`() = runBlocking {
         newProtocol(conn(codeFrame(0x80))).writeTable(1, 0, data, EcuFamily.MS3) // sem ACK é tolerado
         assertTrue(msgOf { newProtocol(conn(codeFrame(0x84))).writeTable(1, 0, data, EcuFamily.MS3) }.contains("code=0x84"))
-        assertTrue(msgOf { newProtocol(conn(frame(ByteArray(0)))).writeTable(1, 0, data, EcuFamily.MS3) }.contains("sem resposta"))
+        assertTrue(msgOf { newProtocol(conn(frame(ByteArray(0)))).writeTable(1, 0, data, EcuFamily.MS3) }.contains("no response"))
     }
 
     // ---- burnTable --------------------------------------------------------------------------------
@@ -182,7 +182,7 @@ class EcuProtocolWriteBurnTest {
             msgOf { newProtocol(ScriptedConnection(modern = false)).burnTable(1, EcuFamily.SPEEDUINO) }
                 .contains("Modern protocol unavailable")
         )
-        assertTrue(msgOf { newProtocol(conn(frame(ByteArray(0)))).burnTable(1, EcuFamily.MS3) }.contains("sem resposta"))
+        assertTrue(msgOf { newProtocol(conn(frame(ByteArray(0)))).burnTable(1, EcuFamily.MS3) }.contains("no response"))
         assertTrue(msgOf { newProtocol(conn(codeFrame(0x84))).burnTable(1, EcuFamily.MS3) }.contains("code=0x84"))
     }
 }

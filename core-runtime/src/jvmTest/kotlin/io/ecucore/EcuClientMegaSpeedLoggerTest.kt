@@ -77,7 +77,7 @@ class EcuClientMegaSpeedLoggerTest {
         val e = assertFailsWith<IllegalStateException> {
             c.captureMegaSpeedLog(MegaSpeedLoggerKind.COMPOSITE, timeoutMs = 300)
         }
-        assertTrue("não completou" in e.message.orEmpty())
+        assertTrue("did not complete" in e.message.orEmpty())
         // só a leitura que arma: ler antes do DONELOG reiniciaria a captura
         assertEquals(1, tables.count { it == 0xF2 })
     }

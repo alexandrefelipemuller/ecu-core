@@ -119,15 +119,15 @@ object FirmwareHandshakeDomain {
         }
 
         val errorMessage = buildString {
-            appendLine("❌ Assinatura de firmware inválida/ilegível")
+            appendLine("❌ Invalid/unreadable firmware signature")
             appendLine()
-            appendLine("Amostras recebidas:")
+            appendLine("Received samples:")
             samples.forEach { sample ->
                 appendLine("- $sample")
             }
             appendLine()
-            appendLine("Isso costuma indicar problema no canal (ruído, baud incorreto, cabo/adaptador, timeout).")
-            append("Tente reconectar e verificar a conexão.")
+            appendLine("This usually indicates a link problem (noise, wrong baud rate, cable/adapter, timeout).")
+            append("Try reconnecting and check the connection.")
         }
         throw UnsupportedFirmwareException(errorMessage)
     }

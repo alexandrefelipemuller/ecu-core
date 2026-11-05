@@ -447,8 +447,8 @@ object EcuTableDefinitions {
             "speeduino 202008 (First Modern, ochBlockSize 114)",
             "speeduino 201609 (Legacy, ochBlockSize 35)",
             "",
-            "📌 Versões intermediárias (202201-202501) inferidas automaticamente",
-            "   Total: 40+ versões suportadas dos últimos 3 anos"
+            "📌 Intermediate versions (202201-202501) inferred automatically",
+            "   Total: 40+ supported versions from the last 3 years"
         )
     }
 

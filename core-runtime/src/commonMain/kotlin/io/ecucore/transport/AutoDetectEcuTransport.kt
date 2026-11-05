@@ -86,8 +86,8 @@ class AutoDetectEcuTransport(
             val primaryMessage = primaryError.message ?: primaryError::class.simpleName
             val fallbackMessage = fallbackError.message ?: fallbackError::class.simpleName
             throw IllegalStateException(
-                "Falha no protocolo padrão e no fallback OBD2. " +
-                    "Padrão: $primaryMessage | OBD2: $fallbackMessage",
+                "Standard protocol and OBD2 fallback both failed. " +
+                    "Standard: $primaryMessage | OBD2: $fallbackMessage",
                 fallbackError
             )
         }

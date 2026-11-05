@@ -162,14 +162,26 @@ class TuningAssistantAnalyzerTest {
     }
 
     @Test
-    fun `cells below the minimum hit count get no suggestion`() {
+    fun `cells below the minimum hit count are informative only and never applied`() {
+        // Poucas amostras: a sugestão aparece (informativa), mas não altera a tabela sugerida nem forma cluster.
         val result = analyze(steady(4, afrValue = 16.17), strategy = TuningStrategy.STANDARD)
-        assertNull(result.cellSuggestions[0][0])
+        assertNotNull(result.cellSuggestions[0][0])
+        assertEquals(100, result.suggestedVeTable.values[0][0])
         assertTrue(result.clusters.isEmpty())
         val aggressive = analyze(steady(4, afrValue = 16.17), strategy = TuningStrategy.AGGRESSIVE)
-        assertNotNull(aggressive.cellSuggestions[0][0])
+        assertTrue(aggressive.suggestedVeTable.values[0][0] > 100)
+        assertTrue(aggressive.clusters.isNotEmpty())
         val conservative = analyze(steady(7, afrValue = 16.17), strategy = TuningStrategy.CONSERVATIVE)
-        assertNull(conservative.cellSuggestions[0][0])
+        assertEquals(100, conservative.suggestedVeTable.values[0][0])
+    }
+
+    @Test
+    fun `labels are injectable`() {
+        val labels = TuningAnalyzerLabels("magra", "rica", "carga alta", "cruzeiro", "marcha lenta", "carga média")
+        val result = TuningAssistantAnalyzer.analyzeLines(
+            "l", (listOf(header) + steady(6, afrValue = 13.2)).asSequence(), ve(), afr(), TuningStrategy.STANDARD, labels = labels,
+        )
+        assertEquals("rica", result.clusters.single().reason)
     }
 
     // ---- filtros -------------------------------------------------------------------------------------------------

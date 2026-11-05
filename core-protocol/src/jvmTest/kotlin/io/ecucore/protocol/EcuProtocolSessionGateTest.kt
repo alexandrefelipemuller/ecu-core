@@ -251,10 +251,10 @@ class EcuProtocolSessionGateTest {
     fun `commands fail fast when the connection is closed`() {
         val c = ScriptedConnection().apply { connected = false }
         val p = newProtocol(c, env = true)
-        assertTrue(assertFailsWith<Exception> { runBlocking { p.getPageCRC(1) } }.message!!.contains("Não conectado"))
+        assertTrue(assertFailsWith<Exception> { runBlocking { p.getPageCRC(1) } }.message!!.contains("Not connected"))
         assertTrue(
             assertFailsWith<Exception> { runBlocking { p.sendLegacyPassthrough(bytes(0x41)) } }
-                .message!!.contains("Não conectado")
+                .message!!.contains("Not connected")
         )
     }
 

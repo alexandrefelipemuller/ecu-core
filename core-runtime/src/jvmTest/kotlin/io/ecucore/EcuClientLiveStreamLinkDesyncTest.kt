@@ -77,7 +77,7 @@ class EcuClientLiveStreamLinkDesyncTest {
         // Sem nenhum frame aceito, 0x82 pode ser defeito real de framing do app: não recebe o
         // marcador de link e continua chegando ao Crashlytics como defeito de protocolo.
         assertFalse(EcuClient.LIVE_DATA_LINK_DESYNC_MARKER in error, error)
-        assertEquals("Erro no stream: Erro ao ler live data modern: response code = 0x82", error)
+        assertEquals("Stream error: Modern live data read failed: response code = 0x82", error)
         assertTrue(connection.isConnected())
         harness.client.stopLiveDataStream()
     }

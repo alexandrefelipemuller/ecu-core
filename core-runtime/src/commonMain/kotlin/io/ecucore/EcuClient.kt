@@ -177,6 +177,11 @@ class EcuClient(
         private const val TABLE_WRITE_VERIFY_MAX_PASSES = 2
         private const val CONFIG_CHUNK_READ_RETRY_DELAY_MS = 40L
         private const val RUSEFI_CONFIG_READ_CHUNK_SIZE = 64
+        // MS2/Extra e MegaSpeed: `blockingFactor = 256 ; 256 is max read/write data size for
+        // MS2/Extra` no .ini. Um 'r'/'w' maior (ex.: advanceTable1 S16 12x12 = 288 bytes) volta
+        // 0x84 (out of range). Achado de campo 2026-11 (MicroSquirt comms342hU): sync inicial
+        // falhava com `page=10 length=288 ... code=84` e a gravação da ignição nunca passava.
+        private const val MS2_MAX_TABLE_TRANSFER_SIZE = 256
         private const val RUSEFI_RECONNECT_SETTLE_DELAY_MS = 3_000L
         private const val GLOBAL_RECONNECT_SETTLE_DELAY_MS = 1_000L
         // TTL padrão do cache de páginas de configuração: 30 dias. Seguro porque um download
@@ -186,7 +191,7 @@ class EcuClient(
         const val PAGE_CACHE_TTL_MS = 30L * 24 * 60 * 60 * 1000
         private val PARTIAL_TIMEOUT_REGEX = Regex("""Timeout: expected (\d+) bytes, received (\d+)""")
         // Lançada por EcuProtocol.readLiveData() quando a resposta legacy vem truncada.
-        private val INCOMPLETE_LIVE_DATA_REGEX = Regex("""Resposta de live data incompleta: (\d+)/(\d+)""")
+        private val INCOMPLETE_LIVE_DATA_REGEX = Regex("""Incomplete live data response: (\d+)/(\d+)""")
 
         @Volatile
         private var lastGlobalDisconnectWasActive: Boolean = false
@@ -296,6 +301,16 @@ class EcuClient(
     }
 
     override suspend fun <T> withEcuIoLock(block: suspend () -> T): T = withEcuIo(block)
+
+    /**
+     * Só diagnóstico (telemetria de [PageWriteAnomaly]): quem tem o canal agora. `foreign_busy`
+     * numa gravação que não está sob [withEcuIo] indica operação paralela (p.ex. live stream).
+     */
+    private suspend fun ioLockState(): String = when {
+        currentCoroutineContext()[EcuIoOwner] != null -> "owned"
+        ioMutex.isLocked -> "foreign_busy"
+        else -> "free"
+    }
 
     override suspend fun drainStaleResponses() {
         withEcuIo {
@@ -561,12 +576,12 @@ class EcuClient(
 
                 val supportedVersions = EcuDefinitionRegistry.getSupportedFamilies()
                 val errorMessage = """
-                ❌ Firmware não suportado: $effectiveFirmwareSignature
+                ❌ Unsupported firmware: $effectiveFirmwareSignature
 
-                Versões suportadas:
+                Supported versions:
                 ${supportedVersions.joinToString("\n") { "  • $it" }}
 
-                Por favor, atualize o firmware da ECU ou entre em contato.
+                Please update the ECU firmware or contact support.
             """.trimIndent()
 
                 Logger.e(TAG, errorMessage)
@@ -1045,7 +1060,7 @@ class EcuClient(
      * @param length Tamanho a ler
      */
     suspend fun readPage(pageNum: Int, offset: Int, length: Int): ByteArray {
-        require(pageNum in 0..0xFF) { "Page read legacy requer id de 8 bits: ${formatPageId(pageNum)}" }
+        require(pageNum in 0..0xFF) { "Legacy page read requires an 8-bit id: ${formatPageId(pageNum)}" }
         pendingSpeeduinoPageReadbacks.remove(pageNum)?.let { cached ->
             if (firmwareInfo?.family == EcuFamily.SPEEDUINO && offset == 0 && length == cached.size) {
                 Logger.d(TAG, "Usando readback em cache para página ${formatPageId(pageNum)}")
@@ -1055,7 +1070,7 @@ class EcuClient(
             }
         }
         resolveMs2Alias(pageNum, offset, length)?.let { alias ->
-            return protocol.readTable(alias.pageId, alias.offset, length, getEcuFamily())
+            return readTableLimited(alias.pageId, alias.offset, length, getEcuFamily())
         }
         val family = firmwareInfo?.family ?: EcuFamily.UNKNOWN
 
@@ -1163,7 +1178,7 @@ class EcuClient(
                     runCatching { connection.clearInputBuffer() }
                 }
                 if (family == EcuFamily.RUSEFI && length > RUSEFI_CONFIG_READ_CHUNK_SIZE) {
-                    return readConfigChunkChunked(pageId, offset, length, RUSEFI_CONFIG_READ_CHUNK_SIZE)
+                    return readConfigChunkChunked(pageId, offset, length, RUSEFI_CONFIG_READ_CHUNK_SIZE, EcuFamily.RUSEFI)
                 }
                 return if (readMode == EcuConfigReadMode.LEGACY_PAGE) {
                     protocol.readPage(
@@ -1174,7 +1189,7 @@ class EcuClient(
                     )
                 } else {
                     when (family) {
-                        EcuFamily.MS2, EcuFamily.MEGASPEED -> protocol.readTable(pageId, offset, length, EcuFamily.MS2)
+                        EcuFamily.MS2, EcuFamily.MEGASPEED -> readTableLimited(pageId, offset, length, EcuFamily.MS2)
                         EcuFamily.MS3 -> protocol.readTable(pageId, offset, length, EcuFamily.MS3)
                         EcuFamily.RUSEFI -> protocol.readTable(pageId, offset, length, EcuFamily.RUSEFI)
                         else -> protocol.readPage(
@@ -1222,13 +1237,14 @@ class EcuClient(
         offset: Int,
         length: Int,
         chunkSize: Int,
+        family: EcuFamily,
     ): ByteArray {
         val data = ByteArray(length)
         var copied = 0
         while (copied < length) {
             val chunkOffset = offset + copied
             val currentSize = minOf(chunkSize, length - copied)
-            val chunk = protocol.readTable(pageId, chunkOffset, currentSize, EcuFamily.RUSEFI)
+            val chunk = protocol.readTable(pageId, chunkOffset, currentSize, family)
             chunk.copyInto(data, copied)
             copied += currentSize
             if (copied < length) {
@@ -1237,6 +1253,9 @@ class EcuClient(
         }
         return data
     }
+
+    private fun isMs2TransferLimited(family: EcuFamily): Boolean =
+        family == EcuFamily.MS2 || family == EcuFamily.MEGASPEED
 
     private fun resolveConfigReadMode(family: EcuFamily): EcuConfigReadMode {
         val baseMode = ecuDefinition?.runtime?.configReadMode ?: EcuConfigReadMode.MODERN_TABLE
@@ -1288,7 +1307,11 @@ class EcuClient(
                 val receivedBytes = partialTimeout.groupValues.getOrNull(2)?.toIntOrNull() ?: return true
                 return receivedBytes in 0 until expectedBytes
             }
+            // Envelope vazio (`code=null`) ou tamanho absurdo (ex.: 0x7201 = 29185 bytes): bytes
+            // atrasados/desalinhados no buffer. O retry limpa o buffer antes de reenviar.
             if (
+                message.contains("unexpected response code=null", ignoreCase = true) ||
+                message.startsWith("Response too large", ignoreCase = true) ||
                 message.contains("short legacy page response", ignoreCase = true) ||
                 message.contains("short modern page response", ignoreCase = true) ||
                 message.contains("short table response", ignoreCase = true)
@@ -1379,7 +1402,7 @@ class EcuClient(
             // ("MS1 page response too short") on the very first chunk and kills the connection.
             // MS1 engine-constants parsing isn't implemented yet, so bail out cleanly instead.
             ecuDefinition?.runtime?.schemaId == "msextra-hr10" ->
-                throw UnsupportedOperationException("Engine Constants MS1/Extra ainda não mapeados nesta versão")
+                throw UnsupportedOperationException("MS1/Extra Engine Constants are not mapped in this version")
 
             firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED || firmwareInfo?.family == EcuFamily.MS3 -> {
                 Logger.d(TAG, "Lendo Engine Constants MS2/MS3 (Page 0x04)...")
@@ -1547,9 +1570,9 @@ class EcuClient(
     }
 
     private fun requireMs3Signature(operation: String): String {
-        val info = firmwareInfo ?: throw IllegalStateException("$operation: ECU não conectada")
+        val info = firmwareInfo ?: throw IllegalStateException("$operation: ECU not connected")
         if (info.family != EcuFamily.MS3) {
-            throw UnsupportedOperationException("$operation: disponível apenas para MS3 (conectado: ${info.family})")
+            throw UnsupportedOperationException("$operation: available only for MS3 (connected: ${info.family})")
         }
         return info.signature
     }
@@ -1559,7 +1582,7 @@ class EcuClient(
      */
     override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
         if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
-            throw UnsupportedOperationException("Controle de marcha lenta simplificado disponível apenas para Speeduino")
+            throw UnsupportedOperationException("Simplified idle control is available only for Speeduino")
         }
         val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
         val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
@@ -1574,7 +1597,7 @@ class EcuClient(
     override suspend fun writeIdleControlSettings(settings: IdleControlSettings, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeIdleControlSettings")
         if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
-            throw UnsupportedOperationException("Controle de marcha lenta simplificado disponível apenas para Speeduino")
+            throw UnsupportedOperationException("Simplified idle control is available only for Speeduino")
         }
         val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
         val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
@@ -1642,7 +1665,7 @@ class EcuClient(
 
     private fun requireMegaSpeedTest() {
         if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Teste de saídas disponível apenas para MegaSpeed")
+            throw UnsupportedOperationException("Output test is available only for MegaSpeed")
         }
     }
 
@@ -1650,7 +1673,7 @@ class EcuClient(
         requireMegaSpeedTest()
         val live = withEcuIo { readLiveData() }
         return MegaSpeedTestStatus.fromOutputChannels(live.rpm, live.outputChannelData)
-            ?: throw IllegalStateException("Bloco de saída sem status3: não dá para confirmar o modo de teste")
+            ?: throw IllegalStateException("Output block has no status3: cannot confirm test mode")
     }
 
     override suspend fun readMegaSpeedTestParams(): MegaSpeedTestParams {
@@ -1762,11 +1785,11 @@ class EcuClient(
         while (true) {
             val block = withEcuIo { readLiveData() }.outputChannelData
             val status3 = MegaSpeedLiveChannels.status3(block)
-                ?: throw IllegalStateException("Bloco de saída sem status3: não dá para saber se o logger terminou")
+                ?: throw IllegalStateException("Output block has no status3: cannot tell whether the logger finished")
             if (status3 and DONELOG_BIT != 0) break
             if (MonotonicClock.nowMillis() >= deadline) {
                 throw IllegalStateException(
-                    "Logger ${kind.label} não completou em ${timeoutMs}ms (sem pulsos de rotação ou buffer não encheu)"
+                    "Logger ${kind.label} did not complete in ${timeoutMs}ms (no RPM pulses or buffer not full)"
                 )
             }
             delay(megaSpeedLogPollMs)
@@ -1778,17 +1801,17 @@ class EcuClient(
 
     private fun requireMegaSpeedLogger() {
         if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Logger de dentes disponível apenas para MegaSpeed")
+            throw UnsupportedOperationException("Tooth logger is available only for MegaSpeed")
         }
     }
 
     override suspend fun readMegaSpeedConfigView(view: MegaSpeedConfigView): IniConfigView {
         val family = firmwareInfo?.family
         if (family != EcuFamily.MEGASPEED && !(family == EcuFamily.MS2 && view == MegaSpeedConfigView.IDLE)) {
-            throw UnsupportedOperationException("Visão de configuração disponível apenas para MegaSpeed (e marcha lenta na MS2)")
+            throw UnsupportedOperationException("Configuration view is available only for MegaSpeed (and idle on MS2)")
         }
         val definition = activeIniDefinition
-            ?: throw UnsupportedOperationException("Esta tela requer o .ini da CostaMegaSpeed carregado")
+            ?: throw UnsupportedOperationException("This screen requires the CostaMegaSpeed .ini to be loaded")
         Logger.d(TAG, "Lendo $view MegaSpeed via .ini (páginas ${view.requiredPages.joinToString { formatPageId(it) }})...")
         val pages = view.requiredPages.associateWith { pageId ->
             readFullPage(pageNum = pageId, pageSize = 1024, blockSize = 256)
@@ -1820,7 +1843,7 @@ class EcuClient(
 
     private fun megaSpeedScalar(name: String, requireWritable: Boolean = true): MegaSpeedScalar {
         if (requireWritable && writableFieldSpec(name) == null) {
-            throw IllegalArgumentException("Campo não permitido para gravação: $name")
+            throw IllegalArgumentException("Field not allowed for writing: $name")
         }
         val definition = activeIniDefinition
             ?: throw UnsupportedOperationException("Esta operação requer o .ini da ECU carregado")
@@ -1828,27 +1851,27 @@ class EcuClient(
             ?: throw UnsupportedOperationException("Campo $name ausente no .ini")
         val type = field.dataType.uppercase()
         val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
-            ?: throw UnsupportedOperationException("Página do campo $name não resolvida")
+            ?: throw UnsupportedOperationException("Page for field $name not resolved")
         val offset = field.offset ?: error("Campo $name sem offset")
         if (field.kind == io.ecucore.definition.IniFieldKind.BITS) {
-            require(type == "U08") { "Campo $name: bits só suportados em U08 ($type)" }
+            require(type == "U08") { "Field $name: bits only supported on U08 ($type)" }
             val low = field.bitLow ?: error("Campo $name sem bit inicial")
             val high = field.bitHigh ?: error("Campo $name sem bit final")
-            require(low in 0..high && high <= 7) { "Campo $name: faixa de bits inválida" }
+            require(low in 0..high && high <= 7) { "Field $name: invalid bit range" }
             return MegaSpeedScalar(pageId, offset, 1, false, 1.0, 0.0, low, high)
         }
         require(field.kind == io.ecucore.definition.IniFieldKind.SCALAR && type in setOf("S08", "U08", "S16", "U16")) {
-            "Campo $name não é escalar de 8 ou 16 bits ($type)"
+            "Field $name is not an 8- or 16-bit scalar ($type)"
         }
         val scale = field.scale ?: 1.0
-        require(scale > 0.0) { "Escala inválida para $name" }
+        require(scale > 0.0) { "Invalid scale for $name" }
         return MegaSpeedScalar(pageId, offset, if (type.endsWith("16")) 2 else 1, type.startsWith("S"), scale, field.translate ?: 0.0)
     }
 
     private fun requireMegaSpeedForFieldAccess() {
         val family = firmwareInfo?.family
         if (family != EcuFamily.MEGASPEED && family != EcuFamily.MS2) {
-            throw UnsupportedOperationException("Campos de configuração disponíveis apenas para MegaSpeed e MS2")
+            throw UnsupportedOperationException("Configuration fields are available only for MegaSpeed and MS2")
         }
     }
 
@@ -1860,7 +1883,7 @@ class EcuClient(
 
     private fun iniCurve(spec: IniWritableCurve): IniCurve {
         val definition = activeIniDefinition
-            ?: throw UnsupportedOperationException("Esta operação requer o .ini carregado")
+            ?: throw UnsupportedOperationException("This operation requires a loaded .ini")
         val candidates = definition.fields.filter {
             it.section.equals("Constants", true) && it.name == spec.name && it.kind == io.ecucore.definition.IniFieldKind.ARRAY
         }
@@ -1869,21 +1892,21 @@ class EcuClient(
             ?: candidates.firstOrNull())
             ?: throw UnsupportedOperationException("Curva ${spec.name} ausente no .ini")
         val type = field.dataType.uppercase()
-        require(type in setOf("S08", "U08", "S16", "U16")) { "Curva ${spec.name}: tipo $type não suportado" }
+        require(type in setOf("S08", "U08", "S16", "U16")) { "Curve ${spec.name}: unsupported type $type" }
         val shape = field.shape ?: error("Curva ${spec.name} sem tamanho")
-        require(shape.columns == 1) { "Curva ${spec.name} não é 1D" }
+        require(shape.columns == 1) { "Curve ${spec.name} is not 1D" }
         val pageId = definition.pageDefinitions.getOrNull((field.page ?: 0) - 1)?.resolvedId
-            ?: throw UnsupportedOperationException("Página da curva ${spec.name} não resolvida")
+            ?: throw UnsupportedOperationException("Page for curve ${spec.name} not resolved")
         val scale = field.scale ?: 1.0
-        require(scale > 0.0) { "Escala inválida para ${spec.name}" }
+        require(scale > 0.0) { "Invalid scale for ${spec.name}" }
         return IniCurve(pageId, field.offset ?: error("Curva ${spec.name} sem offset"), shape.rows,
             if (type.endsWith("16")) 2 else 1, type.startsWith("S"), scale, field.translate ?: 0.0)
     }
 
     private fun curveSpec(name: String): IniWritableCurve {
-        if (firmwareInfo?.family != EcuFamily.MS2) throw UnsupportedOperationException("Curvas .ini disponíveis apenas para MS2")
+        if (firmwareInfo?.family != EcuFamily.MS2) throw UnsupportedOperationException(".ini curves are available only for MS2")
         return Ms2WritableFields.curveByName(name)
-            ?: throw IllegalArgumentException("Curva não permitida para gravação: $name")
+            ?: throw IllegalArgumentException("Curve not allowed for writing: $name")
     }
 
     override suspend fun readIniCurve(name: String): List<Double> {
@@ -1935,7 +1958,7 @@ class EcuClient(
         ensureWritable("writeMegaSpeedConfigField")
         requireMegaSpeedForFieldAccess()
         val spec = writableFieldSpec(field)
-            ?: throw IllegalArgumentException("Campo não permitido para gravação: $field")
+            ?: throw IllegalArgumentException("Field not allowed for writing: $field")
         require(value.isFinite() && value >= spec.min && value <= spec.max) {
             "${spec.label}: valor ${value} fora do limite permitido (${spec.min}..${spec.max} ${spec.unit})"
         }
@@ -2225,7 +2248,7 @@ class EcuClient(
         if (firmwareInfo?.family == EcuFamily.MEGASPEED) {
             // MegaSpeed reaproveita o contêiner de snapshot do rusEFI: a pinagem vem do .ini ativo.
             val definition = activeIniDefinition
-                ?: throw UnsupportedOperationException("Pinagem MegaSpeed requer o .ini da CostaMegaSpeed carregado")
+                ?: throw UnsupportedOperationException("MegaSpeed pinout requires the CostaMegaSpeed .ini to be loaded")
             Logger.d(TAG, "Lendo pinagem MegaSpeed via .ini (páginas ${MegaSpeedIoConfig.REQUIRED_PAGES.joinToString { formatPageId(it) }})...")
             val pages = MegaSpeedIoConfig.REQUIRED_PAGES.associateWith { pageId ->
                 readFullPage(pageNum = pageId, pageSize = 1024, blockSize = 256)
@@ -2233,7 +2256,7 @@ class EcuClient(
             return MegaSpeedIoConfig.parse(definition, pages)
         }
         if (firmwareInfo?.family != EcuFamily.RUSEFI) {
-            throw UnsupportedOperationException("I/O snapshot disponível apenas para rusEFI")
+            throw UnsupportedOperationException("I/O snapshot is available only for rusEFI")
         }
         activeIniDefinition?.let { definition ->
             val length = RusefiIniUiParsers.requiredBytesForInputOutput(definition)
@@ -2272,7 +2295,7 @@ class EcuClient(
      */
     override suspend fun readEngineProtectionConfig(): EngineProtectionConfig {
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
-            throw UnsupportedOperationException("Engine Protection rusEFI ainda não mapeado nesta versão")
+            throw UnsupportedOperationException("rusEFI Engine Protection is not mapped in this version")
         }
         Logger.d(TAG, "Lendo Engine Protection (Page 6)...")
         val pageData = readPage(
@@ -2331,7 +2354,7 @@ class EcuClient(
         requireSpeeduinoLayout("writeEngineProtectionConfig")
         ConfigValidator.requireValid(ConfigValidator.validateEngineProtection(config))
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
-            throw UnsupportedOperationException("Engine Protection rusEFI ainda não mapeado nesta versão")
+            throw UnsupportedOperationException("rusEFI Engine Protection is not mapped in this version")
         }
         Logger.d(TAG, "Gravando Engine Protection (Page 6)...")
         val basePage = readPage(
@@ -2433,7 +2456,7 @@ class EcuClient(
     override suspend fun writeTriggerSettings(settings: TriggerSettings, burn: Boolean) {
         ensureWritable("writeTriggerSettings")
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
-            throw UnsupportedOperationException("Trigger Settings rusEFI ainda não mapeados nesta versão")
+            throw UnsupportedOperationException("rusEFI Trigger Settings are not mapped in this version")
         }
         val isMs2Trigger = firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED
         ConfigValidator.requireValid(ConfigValidator.validateTrigger(settings, ms2 = isMs2Trigger))
@@ -2533,7 +2556,7 @@ class EcuClient(
         if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
             val catalog = msExtraIniCatalog
                 ?: throw UnsupportedOperationException(
-                    "VE Table MS1/Extra requer uma definição .ini carregada (Configurações > Definição .ini)"
+                    "MS1/Extra VE Table requires a loaded .ini definition (Settings > .ini definition)"
                 )
             val layout = catalog.veTable
             val pageSize = ecuDefinition?.pageCatalog?.firstOrNull { it.id == layout.page }?.size ?: 189
@@ -2602,7 +2625,7 @@ class EcuClient(
         if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
             val catalog = msExtraIniCatalog
                 ?: throw UnsupportedOperationException(
-                    "Ignition Table MS1/Extra requer uma definição .ini carregada (Configurações > Definição .ini)"
+                    "MS1/Extra Ignition Table requires a loaded .ini definition (Settings > .ini definition)"
                 )
             val layout = catalog.ignitionTable
             val pageSize = ecuDefinition?.pageCatalog?.firstOrNull { it.id == layout.page }?.size ?: 189
@@ -2681,10 +2704,10 @@ class EcuClient(
     override suspend fun writeEngineConstants(engineConstants: EngineConstants) {
         ensureWritable("writeEngineConstants")
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
-            throw UnsupportedOperationException("Engine Constants rusEFI ainda não mapeados nesta versão")
+            throw UnsupportedOperationException("rusEFI Engine Constants are not mapped in this version")
         }
         if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
-            throw UnsupportedOperationException("Engine Constants MS1/Extra ainda não mapeados nesta versão")
+            throw UnsupportedOperationException("MS1/Extra Engine Constants are not mapped in this version")
         }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED || firmwareInfo?.family == EcuFamily.MS3) {
             Logger.d(TAG, "Gravando Engine Constants MS2/MS3 (Page 0x04)...")
@@ -2748,7 +2771,7 @@ class EcuClient(
             val alias = resolveMs2Alias(pageNum, 0, data.size)
             val tableId = alias?.pageId ?: pageNum
             val tableOffset = alias?.offset ?: 0
-            protocol.writeTable(tableId = tableId, offset = tableOffset, data = data, family = getEcuFamily())
+            writeTableLimited(tableId, tableOffset, data, getEcuFamily())
             settleAfterConfigWrite()
             burnTableIfSupported(tableId = tableId, family = getEcuFamily())
         } else {
@@ -2793,7 +2816,7 @@ class EcuClient(
             val alias = resolveMs2Alias(pageNum, 0, data.size)
             val tableId = alias?.pageId ?: pageNum
             val tableOffset = alias?.offset ?: 0
-            protocol.writeTable(tableId = tableId, offset = tableOffset, data = data, family = getEcuFamily())
+            writeTableLimited(tableId, tableOffset, data, getEcuFamily())
         } else {
             writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
         }
@@ -2943,6 +2966,9 @@ class EcuClient(
                     writeErrorMessage = passError?.message,
                     writeResponseCode = (passError as? EcuProtocol.PageWriteRejectedException)?.responseCode,
                     recovered = false,
+                    readBackSize = readBack.size,
+                    shiftHint = PageWriteDiagnostics.detectShift(data, readBack),
+                    ioLockState = ioLockState(),
                 )
             }
             if (mismatches.isEmpty() && lastWriteError == null) {
@@ -3190,7 +3216,7 @@ class EcuClient(
      */
     override suspend fun readAfrTable(): AfrTable {
         if (ecuDefinition?.runtime?.schemaId == "msextra-hr10") {
-            throw UnsupportedOperationException("AFR Table MS1/Extra ainda não mapeada nesta versão")
+            throw UnsupportedOperationException("MS1/Extra AFR Table is not mapped in this version")
         }
         if (firmwareInfo?.family == EcuFamily.MS2 || firmwareInfo?.family == EcuFamily.MEGASPEED) {
             return readMs2AfrTable()
@@ -3599,9 +3625,44 @@ class EcuClient(
         writeRegionsVerified(
             regions = regions,
             label = label,
-            write = { protocol.writeTable(it.tableId.toByte(), it.offset, it.data) },
+            write = { region -> writeMsTableRegion(region) },
             burn = { protocol.burnTable(it.toByte()) },
         )
+
+    private suspend fun writeMsTableRegion(region: TableRegion) =
+        writeTableLimited(region.tableId, region.offset, region.data, EcuFamily.MS3)
+
+    /** Tabelas de config do MS2/MegaSpeed (os buffers de logger 0xF0+ aceitam 1024 bytes de uma vez). */
+    private fun ms2TransferLimit(tableId: Int): Int? {
+        val family = firmwareInfo?.family ?: return null
+        return if (isMs2TransferLimited(family) && tableId in 0 until 0xF0) MS2_MAX_TABLE_TRANSFER_SIZE else null
+    }
+
+    /**
+     * protocol.writeTable respeitando o limite de bytes por 'w' do MS2/Extra e MegaSpeed
+     * ([MS2_MAX_TABLE_TRANSFER_SIZE]); demais famílias gravam num comando só.
+     */
+    private suspend fun writeTableLimited(tableId: Int, offset: Int, data: ByteArray, family: EcuFamily) {
+        val limit = ms2TransferLimit(tableId)
+        if (limit == null || data.size <= limit) {
+            protocol.writeTable(tableId, offset, data, family)
+            return
+        }
+        var written = 0
+        while (written < data.size) {
+            val size = minOf(limit, data.size - written)
+            protocol.writeTable(tableId, offset + written, data.copyOfRange(written, written + size), family)
+            written += size
+            if (written < data.size) delay(10)
+        }
+    }
+
+    /** protocol.readTable respeitando o limite de bytes por 'r' do MS2/Extra e MegaSpeed. */
+    private suspend fun readTableLimited(tableId: Int, offset: Int, length: Int, family: EcuFamily): ByteArray {
+        val limit = ms2TransferLimit(tableId)
+        if (limit == null || length <= limit) return protocol.readTable(tableId, offset, length, family)
+        return readConfigChunkChunked(tableId, offset, length, limit, family)
+    }
 
     private suspend fun writeRusefiTableVerified(regions: TableRegions, label: String) =
         writeRegionsVerified(
@@ -3677,6 +3738,9 @@ class EcuClient(
                 writeErrorMessage = lastError?.message,
                 writeResponseCode = (writeError as? EcuProtocol.PageWriteRejectedException)?.responseCode,
                 recovered = false,
+                readBackSize = actual?.size ?: -1,
+                shiftHint = PageWriteDiagnostics.detectShift(expected, actual),
+                ioLockState = ioLockState(),
             )
             Logger.w(TAG, "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass; regravando")
         }
@@ -3970,7 +4034,7 @@ class EcuClient(
                 }
                 if (!connection.isConnected()) {
                     Logger.e(TAG, "Conexão perdida durante fallback para modern live data")
-                    throw Exception("Não conectado")
+                    throw Exception("Not connected")
                 }
 
                 Logger.w(TAG, "Legacy live data falhou, tentando modern fallback: ${legacyError.message}")
@@ -3996,7 +4060,7 @@ class EcuClient(
                 }
 
                 modernData ?: throw Exception(
-                    "Legacy live data falhou (${legacyError.message}); modern fallback também falhou (${lastModernError?.message})"
+                    "Legacy live data failed (${legacyError.message}); modern fallback also failed (${lastModernError?.message})"
                 )
             }
         } else if (canTryModern) {
@@ -4017,7 +4081,7 @@ class EcuClient(
                     }
                     if (!connection.isConnected()) {
                         Logger.e(TAG, "Conexão perdida durante leitura de live data")
-                        throw Exception("Não conectado")
+                        throw Exception("Not connected")
                     }
 
                     lastError = e
@@ -4032,7 +4096,7 @@ class EcuClient(
             if (modernData == null && usesModernEnvelope) {
                 // Nunca cair para legacy num firmware com envelope: o 'A' solto seria lido como
                 // byte alto de um comprimento e deixaria a ECU presa esperando payload.
-                throw lastError ?: Exception("Modern live data falhou após $maxAttempts tentativas")
+                throw lastError ?: Exception("Modern live data failed after $maxAttempts attempts")
             } else if (modernData == null) {
                 Logger.w(TAG, "Modern Protocol falhou após $maxAttempts tentativas, tentando Legacy: ${lastError?.message}")
                 // ⚠️ Fallback para Legacy Protocol (versões antigas)
@@ -4206,7 +4270,7 @@ class EcuClient(
                     }
 
                     if (_isStreaming) { // Only report error if still streaming
-                        Logger.e(TAG, "Erro no stream: ${e.message}", e)
+                        Logger.e(TAG, "Stream error: ${e.message}", e)
                         if (packetCount == 0) {
                             ConnectionTrace.error(
                                 "live_data",
@@ -4222,7 +4286,7 @@ class EcuClient(
                         val streamErrorMessage = if (linkDesyncAfterHealthyStream) {
                             buildLinkDesyncStreamErrorMessage(recoverableReadTimeouts, e)
                         } else {
-                            "Erro no stream: ${e.message}"
+                            "Stream error: ${e.message}"
                         }
                         onError(streamErrorMessage)
 
@@ -4303,7 +4367,7 @@ class EcuClient(
         if (isLiveDataLinkDesync(error)) LIVE_DATA_DESYNC_RESYNC_DELAY_MS else 25L
 
     internal fun buildLinkDesyncStreamErrorMessage(attempts: Int, error: Exception): String =
-        "Erro no stream: comunicação instável com a ECU, dados corrompidos no link " +
+        "Stream error: unstable communication with the ECU, corrupted data on the link " +
             "($LIVE_DATA_LINK_DESYNC_MARKER attempts=$attempts: ${error.message}); reconectando"
 
     private fun shouldDisconnectAfterStreamFailure(error: Exception): Boolean {
@@ -4317,7 +4381,7 @@ class EcuClient(
             if (
                 message.startsWith("Timeout:", ignoreCase = true) ||
                 message.contains("Read timed out", ignoreCase = true) ||
-                message.contains("Conexão encerrada pelo remoto", ignoreCase = true) ||
+                message.contains("Connection closed by remote", ignoreCase = true) ||
                 message.contains("Connection reset", ignoreCase = true) ||
                 message.contains("Broken pipe", ignoreCase = true)
             ) {
@@ -4502,10 +4566,10 @@ class EcuClient(
             val message = error.message.orEmpty()
             val notBurnable = message.contains("0x84") ||
                 message.contains("RANGE_ERR", ignoreCase = true) ||
-                message.contains("Valor fora do range", ignoreCase = true) ||
+                message.contains("value out of range", ignoreCase = true) ||
                 message.contains("Incomplete modern response", ignoreCase = true) ||
                 message.contains("received 0 bytes", ignoreCase = true) ||
-                message.contains("sem resposta", ignoreCase = true)
+                message.contains("no response", ignoreCase = true)
             if (family == EcuFamily.MS3 && notBurnable) {
                 Logger.w(
                     TAG,
@@ -4550,7 +4614,7 @@ class EcuClient(
     private fun requireSpeeduinoLayout(operation: String) {
         when (firmwareInfo?.family) {
             EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI ->
-                throw UnsupportedOperationException("$operation usa o layout de página do Speeduino e não é suportado em ${firmwareInfo?.family}")
+                throw UnsupportedOperationException("$operation uses the Speeduino page layout and is not supported on ${firmwareInfo?.family}")
             else -> Unit
         }
     }

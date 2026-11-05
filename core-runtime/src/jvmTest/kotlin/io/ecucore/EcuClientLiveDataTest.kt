@@ -77,7 +77,7 @@ class EcuClientLiveDataTest {
     fun `lost connection during live data read is reported`() = runBlocking<Unit> {
         val (c, ecu) = connect(ClientFakeEcu.Kind.SPEEDUINO_2025)
         ecu.onFrame = { cmd, _ -> if (cmd == 'r') { ecu.connected = false; errorFrame } else null }
-        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Não conectado"))
+        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Not connected"))
     }
 
     @Test
@@ -113,16 +113,16 @@ class EcuClientLiveDataTest {
         val (c, ecu) = connect(ClientFakeEcu.Kind.SPEEDUINO_2020)
         ecu.onLegacy = { cmd, _ -> if (cmd == 'A') throw RuntimeException("boom") else null }
         val message = assertFailsWith<Exception> { c.readLiveData() }.message!!
-        assertTrue(message.contains("modern fallback também falhou"), message)
+        assertTrue(message.contains("modern fallback also failed"), message)
     }
 
     @Test
     fun `legacy-first recoverable errors and lost link are rethrown`() = runBlocking<Unit> {
         val (c, ecu) = connect(ClientFakeEcu.Kind.SPEEDUINO_2020, modernProtocol = true)
         ecu.onLegacy = { cmd, _ -> if (cmd == 'A') ByteArray(0) else null } // resposta incompleta: recuperável
-        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("incompleta"))
+        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Incomplete live data response"))
         ecu.onLegacy = { cmd, _ -> if (cmd == 'A') { ecu.connected = false; throw RuntimeException("boom") } else null }
-        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Não conectado"))
+        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Not connected"))
     }
 
     @Test
@@ -147,7 +147,7 @@ class EcuClientLiveDataTest {
     fun `modern-first lost link and aborted reads are rethrown`() = runBlocking<Unit> {
         val (c, ecu) = connect(ClientFakeEcu.Kind.SPEEDUINO_2020, prefersLegacy = false, modernProtocol = true)
         ecu.onFrame = { cmd, _ -> if (cmd == 'r') { ecu.connected = false; errorFrame } else null }
-        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Não conectado"))
+        assertTrue(assertFailsWith<Exception> { c.readLiveData() }.message!!.contains("Not connected"))
         ecu.connected = true
         c.stopLiveDataStream()
         ecu.onFrame = { cmd, _ -> if (cmd == 'r') errorFrame else null }
@@ -233,7 +233,7 @@ class EcuClientLiveDataTest {
         ecu.onFrame = { cmd, _ -> if (cmd == 'r') listOf(byteArrayOf(0x00, 0x01), byteArrayOf(0x80.toByte()), ByteArray(4)) else null }
         c.startLiveDataStream(intervalMs = 5)
         waitFor(20_000) { synchronized(errors) { errors.isNotEmpty() } }
-        assertTrue(errors.first().startsWith("Erro no stream"))
+        assertTrue(errors.first().startsWith("Stream error"))
         waitFor { !c.isStreaming() }
     }
 

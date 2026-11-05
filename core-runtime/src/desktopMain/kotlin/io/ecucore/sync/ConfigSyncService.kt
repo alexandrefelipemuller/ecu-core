@@ -142,6 +142,14 @@ class ConfigSyncService(
             }
         }
 
+        // MS2/MegaSpeed/MS3/rusEFI não aceitam burn global: cada página gravada é queimada na hora.
+        val pageSpecificBurn = client.getEcuFamily().let {
+            it == EcuFamily.MS2 || it == EcuFamily.MEGASPEED || it == EcuFamily.MS3 || it == EcuFamily.RUSEFI
+        }
+        suspend fun writePage(pageNum: Int, data: ByteArray) {
+            if (pageSpecificBurn) client.writeRawPage(pageNum, data) else client.writeRawPageWithoutBurn(pageNum, data)
+        }
+
         val errors = mutableListOf<String>()
         val warnings = mutableListOf<String>()
         val inconsistentPages = mutableListOf<Byte>()
@@ -179,7 +187,7 @@ class ConfigSyncService(
             while (attempt < 3 && !success) {
                 attempt++
                 try {
-                    client.writeRawPageWithoutBurn(pageNum.toInt() and 0xFF, data)
+                    writePage(pageNum.toInt() and 0xFF, data)
                     wroteAnyPage = true
                     success = true
                 } catch (e: Exception) {
@@ -189,7 +197,7 @@ class ConfigSyncService(
                             val sanitized = Page6Validator.sanitize(data)
                             if (sanitized.changed) {
                                 try {
-                                    client.writeRawPageWithoutBurn(pageNum.toInt() and 0xFF, sanitized.data)
+                                    writePage(pageNum.toInt() and 0xFF, sanitized.data)
                                     wroteAnyPage = true
                                     warnings.add("Página 6 corrigida (sanitização)")
                                     break
@@ -236,7 +244,7 @@ class ConfigSyncService(
             }
         }
 
-        if (!stopDueToRangeErr && wroteAnyPage) {
+        if (!pageSpecificBurn && !stopDueToRangeErr && wroteAnyPage) {
             try {
                 client.burnConfigs()
             } catch (e: Exception) {
