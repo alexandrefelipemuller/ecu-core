@@ -164,7 +164,10 @@ interface EcuTransport {
     suspend fun readAntiTheftLocked(): Boolean =
         throw UnsupportedOperationException("Anti-theft not supported by this transport")
 
-    /** Trava a partida (motor parado), confere e dá burn; devolve o valor original do desafogador. */
+    /**
+     * Trava a partida (motor parado), confere e dá burn; devolve os valores originais da família, num
+     * Int opaco para guardar e passar de volta ao [unlockAntiTheft].
+     */
     suspend fun lockAntiTheft(): Int =
         throw UnsupportedOperationException("Anti-theft not supported by this transport")
 

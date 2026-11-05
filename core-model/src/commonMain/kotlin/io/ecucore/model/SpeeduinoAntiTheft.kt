@@ -1,49 +1,144 @@
 package io.ecucore.model
 
 /**
- * Antifurto do Speeduino: trava a partida com `tpsflood` (página 4, offset 18, U08 x 0,5 %) em 0.
- * O firmware corta a injeção na partida quando `TPS >= floodClear` (corrections.cpp) e só dispara o
- * pulso de escorva quando `TPS < floodClear` (scheduler.cpp), então com 0 não entra combustível nem
- * na escorva. Conferido no 202501 e no 202402.
+ * Antifurto do Speeduino: trava a partida com o limitador de giro fixo em 0 RPM.
  *
- * O campo não tem sinal, então a assinatura e o valor original ficam em dois bytes livres da página 9
- * (`unused10_110` = [MARKER], `unused10_111` = original), que o firmware não usa. Travada = desafogador
- * em 0 com a marca; desafogador em 0 sem a marca é configuração do usuário, não trava do app.
+ * Com `hardRevLim` = 0 o limite vira 0 RPM, e o laço principal corta faísca e injeção sempre que
+ * `RPM > limite` (speeduino.ino, "Hard cut check"), na partida e com o motor funcionando, já que a
+ * ECU só calcula rotação com sincronismo. Para o corte valer qualquer que seja a configuração do
+ * usuário, a trava também força:
+ * - `engineProtectType` = Both: com "Off" o limitador não age;
+ * - `hardRevMode` = Fixed: com "Off" ou "Coolant based" o `hardRevLim` é ignorado;
+ * - `hardCutType` = Full: no Rolling, o limite 0 somado ao delta negativo estoura em `uint16_t` na
+ *   Mega2560 (int de 16 bits) e o corte nunca entra; até o 202305 o Rolling só corta faísca em rodízio;
+ * - `engineProtectMaxRPM` = 0: até o 202305 o limitador só corta acima dessa rotação.
+ * Conferido nos fontes 202207, 202305, 202310, 202402 e 202501. O antigo corte pelo desafogador
+ * (`tpsflood`) só valia enquanto a ECU se via em partida: uma combustão com sobra de combustível
+ * passava do `crankRPM` e o motor pegava.
+ *
+ * A assinatura e os originais ficam nos bytes livres da página 9 presentes do 202207 ao 202501, que o
+ * firmware não usa: `unused10_110` = [MARKER] com os três modos originais nos bits baixos ([Original.packModes]),
+ * `unused10_111` = `hardRevLim` original e `unused10_68` = `engineProtectMaxRPM` original.
+ * Travada = assinatura presente: assim uma trava gravada pela metade continua travada e o
+ * destravamento devolve tudo.
  */
 object SpeeduinoAntiTheft {
-    const val FLOOD_FIELD = "tpsflood"
-    const val FLOOD_PAGE = 4
-    const val FLOOD_OFFSET = 18
-    const val MARKER_FIELD = "unused10_110"
-    const val ORIGINAL_FIELD = "unused10_111"
-    const val MARKER_PAGE = 9
-    const val MARKER_OFFSET = 110
-    const val ORIGINAL_OFFSET = 111
+    /** Campo do .ini que a trava altera ou usa: página, offset e, se for bits, o bit inicial e a largura. */
+    data class Field(val name: String, val page: Int, val offset: Int, val bitLow: Int? = null, val bitCount: Int = 0) {
+        val isBits get() = bitLow != null
+        private val mask get() = (1 shl bitCount) - 1
 
-    const val MARKER = 0xA7
-    const val LOCKED_FLOOD = 0
+        fun read(byte: Int): Int = if (bitLow == null) byte and 0xFF else (byte shr bitLow) and mask
 
-    /** 100,0 % em bruto: usado quando a marca não traz um original válido. */
-    const val DEFAULT_ORIGINAL_RAW = 200
+        fun write(byte: Int, value: Int): Int {
+            if (bitLow == null) return value and 0xFF
+            return ((byte and (mask shl bitLow).inv()) or ((value and mask) shl bitLow)) and 0xFF
+        }
+    }
 
-    fun isLocked(floodRaw: Int, markerRaw: Int): Boolean = floodRaw == LOCKED_FLOOD && markerRaw == MARKER
+    val REV_LIMIT = Field("hardRevLim", page = 4, offset = 22)
+    val PROTECT_MIN_RPM = Field("engineProtectMaxRPM", page = 4, offset = 120)
+    val PROTECT_TYPE = Field("engineProtectType", page = 6, offset = 0, bitLow = 6, bitCount = 2)
+    val REV_MODE = Field("hardRevMode", page = 9, offset = 166, bitLow = 0, bitCount = 2)
+    val CUT_TYPE = Field("hardCutType", page = 1, offset = 26, bitLow = 3, bitCount = 1)
 
-    fun originalFrom(storedRaw: Int): Int = if (storedRaw in 1..0xFF) storedRaw else DEFAULT_ORIGINAL_RAW
+    val MARKER_FIELD = Field("unused10_110", page = 9, offset = 110)
+    val REV_LIMIT_ORIGINAL_FIELD = Field("unused10_111", page = 9, offset = 111)
+    val PROTECT_MIN_RPM_ORIGINAL_FIELD = Field("unused10_68", page = 9, offset = 68)
+
+    /** Campos conferidos no .ini ativo antes de ler ou gravar. */
+    val ALL_FIELDS = listOf(
+        REV_LIMIT, PROTECT_MIN_RPM, PROTECT_TYPE, REV_MODE, CUT_TYPE,
+        MARKER_FIELD, REV_LIMIT_ORIGINAL_FIELD, PROTECT_MIN_RPM_ORIGINAL_FIELD,
+    )
 
     /**
-     * Páginas com a trava trocada pelo valor original e a marca apagada, para backup e restauração.
-     * Precisa das duas páginas; sem elas, ou sem trava, devolve o mapa sem mudança.
+     * Assinatura nos 3 bits altos do `unused10_110` (0xC0..0xDF). Não bate com 0x00 nem 0xFF (byte
+     * livre nunca gravado) nem com 0xA7, a marca da trava antiga pelo desafogador.
+     */
+    const val MARKER = 0xC0
+    private const val MARKER_MASK = 0xE0
+
+    const val LOCKED_REV_LIMIT = 0
+    const val LOCKED_PROTECT_MIN_RPM = 0
+    const val LOCKED_PROTECT_TYPE = 3 // Both
+    const val LOCKED_REV_MODE = 1 // Fixed
+    const val LOCKED_CUT_TYPE = 0 // Full
+
+    /** Valores do usuário trocados pela trava. */
+    data class Original(
+        val revLimit: Int,
+        val protectMinRpm: Int,
+        val protectType: Int,
+        val revMode: Int,
+        val cutType: Int,
+    ) {
+        init {
+            require(revLimit in 1..0xFF) { "hardRevLim original inválido ($revLimit)" }
+            require(protectMinRpm in 0..0xFF) { "engineProtectMaxRPM original inválido ($protectMinRpm)" }
+            require(protectType in 0..3 && revMode in 0..3 && cutType in 0..1) { "modos originais inválidos" }
+        }
+
+        /** Bits 0-1 `hardRevMode`, 2-3 `engineProtectType`, 4 `hardCutType`. */
+        fun packModes(): Int = revMode or (protectType shl 2) or (cutType shl 4)
+
+        /** `unused10_110`: assinatura com os modos originais. */
+        fun markerByte(): Int = MARKER or packModes()
+
+        /** Valor guardado no celular: `hardRevLim`, `engineProtectMaxRPM` e [packModes], um byte cada. */
+        fun toRaw(): Int = revLimit or (protectMinRpm shl 8) or (packModes() shl 16)
+
+        companion object {
+            private fun fromModes(revLimit: Int, protectMinRpm: Int, modes: Int) = Original(
+                revLimit = revLimit,
+                protectMinRpm = protectMinRpm,
+                protectType = (modes shr 2) and 0x3,
+                revMode = modes and 0x3,
+                cutType = (modes shr 4) and 0x1,
+            )
+
+            fun fromStored(markerByte: Int, revLimit: Int, protectMinRpm: Int): Original =
+                fromModes(revLimit, protectMinRpm, markerByte and MARKER_MASK.inv() and 0xFF)
+
+            fun fromRaw(raw: Int): Original {
+                require(raw in 0..0x1FFFFF) { "valor original inválido ($raw)" }
+                return fromModes(raw and 0xFF, (raw shr 8) and 0xFF, raw shr 16)
+            }
+        }
+    }
+
+    fun isLocked(markerRaw: Int): Boolean = (markerRaw and MARKER_MASK) == MARKER
+
+    private fun ByteArray.u8(offset: Int) = this[offset].toInt() and 0xFF
+
+    /**
+     * Páginas com os campos da trava de volta aos originais e a assinatura apagada, para backup e
+     * restauração. Precisa das quatro páginas; sem elas, sem trava ou com original inválido, devolve
+     * o mapa sem mudança.
      */
     fun sanitizePages(pages: Map<Int, ByteArray>): Map<Int, ByteArray> {
-        val flood = pages[FLOOD_PAGE] ?: return pages
-        val marker = pages[MARKER_PAGE] ?: return pages
-        if (flood.size <= FLOOD_OFFSET || marker.size <= ORIGINAL_OFFSET) return pages
-        if (!isLocked(flood[FLOOD_OFFSET].toInt() and 0xFF, marker[MARKER_OFFSET].toInt() and 0xFF)) return pages
-        val cleanFlood = flood.copyOf().also { it[FLOOD_OFFSET] = originalFrom(marker[ORIGINAL_OFFSET].toInt() and 0xFF).toByte() }
-        val cleanMarker = marker.copyOf().also {
-            it[MARKER_OFFSET] = 0
-            it[ORIGINAL_OFFSET] = 0
+        if (ALL_FIELDS.any { f -> (pages[f.page]?.size ?: 0) <= f.offset }) return pages
+        val stash = pages.getValue(MARKER_FIELD.page)
+        if (!isLocked(stash.u8(MARKER_FIELD.offset))) return pages
+        val original = runCatching {
+            Original.fromStored(
+                markerByte = stash.u8(MARKER_FIELD.offset),
+                revLimit = stash.u8(REV_LIMIT_ORIGINAL_FIELD.offset),
+                protectMinRpm = stash.u8(PROTECT_MIN_RPM_ORIGINAL_FIELD.offset),
+            )
+        }.getOrNull() ?: return pages
+
+        val clean = ALL_FIELDS.map { it.page }.distinct().associateWith { pages.getValue(it).copyOf() }
+        fun restore(f: Field, value: Int) {
+            val page = clean.getValue(f.page)
+            page[f.offset] = f.write(page.u8(f.offset), value).toByte()
         }
-        return pages + mapOf(FLOOD_PAGE to cleanFlood, MARKER_PAGE to cleanMarker)
+        restore(REV_LIMIT, original.revLimit)
+        restore(PROTECT_MIN_RPM, original.protectMinRpm)
+        restore(PROTECT_TYPE, original.protectType)
+        restore(REV_MODE, original.revMode)
+        restore(CUT_TYPE, original.cutType)
+        for (f in listOf(MARKER_FIELD, REV_LIMIT_ORIGINAL_FIELD, PROTECT_MIN_RPM_ORIGINAL_FIELD)) restore(f, 0)
+        return pages + clean
     }
 }

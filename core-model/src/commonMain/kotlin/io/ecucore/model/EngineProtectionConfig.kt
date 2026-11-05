@@ -32,7 +32,7 @@ data class EngineProtectionConfig(
 )
 
 const val VALET_MODE_RPM_DEFAULT = 4000
-const val VALET_MODE_RPM_MIN = 2000
+const val VALET_MODE_RPM_MIN = 1000
 const val VALET_MODE_RPM_MAX = 5000
 private const val VALET_SOFT_RPM_OFFSET = 500 // soft cut starts this many RPM before the hard cut
 
