@@ -752,7 +752,7 @@ class Obd2Transport(
 
         val fallbackSummary = attemptSummaries.joinToString(" -> ")
         val reason = lastFailure?.reason ?: "INVALID_RESPONSE"
-        val compactResponse = lastFailure?.compactResponse ?: "sem resposta útil"
+        val compactResponse = lastFailure?.compactResponse ?: "no useful response"
 
         if (allowNonStandardPreflight && shouldBypassPreflightFailure(reason)) {
             preflightBypassReason = reason
@@ -765,8 +765,8 @@ class Obd2Transport(
         }
 
         throw Obd2PreflightFailedException(
-            "Adaptador ELM327 conectado, mas sem comunicação OBD2 válida (PID 0100: $reason). " +
-                "Resposta: $compactResponse. Perfis testados: $fallbackSummary"
+            "ELM327 adapter connected, but no valid OBD2 communication (PID 0100: $reason). " +
+                "Response: $compactResponse. Profiles tested: $fallbackSummary"
         )
     }
 
@@ -878,7 +878,7 @@ class Obd2Transport(
                         .replace(Regex("\\s+"), " ")
                         .trim()
                         .take(80)
-                        .ifBlank { "sem resposta útil" }
+                        .ifBlank { "no useful response" }
                     diagnosticsSink.log(
                         "elm327",
                         "probe",
@@ -899,7 +899,7 @@ class Obd2Transport(
 
     private fun classifyPreflightFailure(response: String): PreflightFailure {
         val normalized = response.uppercase()
-        val compactResponse = compactElmResponse(response) ?: "sem resposta útil"
+        val compactResponse = compactElmResponse(response) ?: "no useful response"
         val compactUpper = compactResponse.uppercase()
 
         val reason = when {
@@ -1439,7 +1439,7 @@ class Obd2Transport(
         suspend fun probe(key: String, command: String, timeoutMs: Long): String {
             val response = runCatching { sendCommand(command, timeoutMs) }
                 .getOrElse { "ERR:${it.message ?: it::class.simpleName}" }
-            entries[key] = compactElmResponse(response) ?: "<sem resposta>"
+            entries[key] = compactElmResponse(response) ?: "<no response>"
             diagnosticsSink.log("elm327", "explore", "$key cmd=$command rsp=${entries[key]}")
             return response
         }
@@ -1591,7 +1591,7 @@ class Obd2Transport(
                 testedCount = testedCount,
                 totalCount = totalCount,
                 currentFeature = null,
-                message = "OBD2 conectado em perfil universal. Iniciando otimizações por recurso…",
+                message = "OBD2 connected with the universal profile. Starting per-feature optimizations…",
                 testing = true
             )
             delay(600)
@@ -1614,7 +1614,7 @@ class Obd2Transport(
                         testedCount = testedCount,
                         totalCount = totalCount,
                         currentFeature = feature,
-                        message = "Recurso ${feature.displayName} instável. Mantendo configuração anterior.",
+                        message = "Feature ${feature.displayName} unstable. Keeping the previous configuration.",
                         testing = false,
                         fallbackOccurred = true
                     )
@@ -1631,7 +1631,7 @@ class Obd2Transport(
                 testedCount = testedCount,
                 totalCount = totalCount,
                 currentFeature = null,
-                message = "Otimização OBD2 concluída. Máscara aplicada: $finalMask (0x${finalMask.toString(16).uppercase()}).",
+                message = "OBD2 optimization finished. Applied mask: $finalMask (0x${finalMask.toString(16).uppercase()}).",
                 testing = false
             )
             delay(1200)

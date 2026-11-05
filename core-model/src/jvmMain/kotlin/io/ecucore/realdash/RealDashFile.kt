@@ -30,7 +30,7 @@ class RdReader(private val buf: ByteBuffer) {
     fun peekU16(at: Int): Int = buf.getShort(position + at).toInt() and 0xFFFF
     fun str(): String {
         val n = i32()
-        require(n in 0..100_000) { "string inválida ($n) em 0x${(position - 4).toString(16)}" }
+        require(n in 0..100_000) { "invalid string ($n) at 0x${(position - 4).toString(16)}" }
         return String(bytes(n * 2), Charsets.UTF_16LE)
     }
 

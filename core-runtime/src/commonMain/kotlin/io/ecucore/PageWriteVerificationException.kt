@@ -14,10 +14,10 @@ class PageWriteVerificationException(
     cause: Throwable? = null,
     val rolledBack: Boolean = false,
 ) : Exception(
-    "$label: gravação não confirmada na página $pageId - ${mismatchedOffsets.size} bytes divergentes " +
-        "no read-back (offsets ${mismatchedOffsets.take(8).joinToString()})" +
-        (cause?.message?.let { "; último erro: $it" } ?: "") +
-        ". Burn não executado" +
-        if (rolledBack) ": valor anterior restaurado na ECU." else ". A RAM da ECU pode estar divergente; regrave ou reinicie a ECU.",
+    "$label: write not confirmed on page $pageId - ${mismatchedOffsets.size} mismatched bytes " +
+        "in read-back (offsets ${mismatchedOffsets.take(8).joinToString()})" +
+        (cause?.message?.let { "; last error: $it" } ?: "") +
+        ". Burn not executed" +
+        if (rolledBack) ": previous value restored on the ECU." else ". ECU RAM may differ; write again or restart the ECU.",
     cause,
 )

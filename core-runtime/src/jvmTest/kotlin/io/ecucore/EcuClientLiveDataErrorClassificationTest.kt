@@ -24,7 +24,7 @@ class EcuClientLiveDataErrorClassificationTest {
     fun `incomplete live data response is recoverable`() {
         assertTrue(
             client.isRecoverableLiveDataTimeout(
-                Exception("Resposta de live data incompleta: 63/127 bytes")
+                Exception("Incomplete live data response: 63/127 bytes")
             )
         )
     }
@@ -42,7 +42,7 @@ class EcuClientLiveDataErrorClassificationTest {
         // Caso de campo (Bluetooth): rajada de timeouts e depois frames "00 00 + CRC zerado".
         assertTrue(
             client.isRecoverableLiveDataTimeout(
-                Exception("Erro ao ler live data modern: response code = null")
+                Exception("Modern live data read failed: response code = null")
             )
         )
     }
@@ -54,7 +54,7 @@ class EcuClientLiveDataErrorClassificationTest {
         // o mesmo padrão em vez de escalar como falha não-fatal (ver crashes/usb_get_status/001-002).
         assertTrue(
             client.isRecoverableLiveDataTimeout(
-                Exception("Erro ao ler live data modern: response code = 0x80")
+                Exception("Modern live data read failed: response code = 0x80")
             )
         )
     }
@@ -64,7 +64,7 @@ class EcuClientLiveDataErrorClassificationTest {
         // Trace real (Speeduino 202501 via HC-05): o mesmo frame 'r' é aceito, depois volta 0x82
         // duas vezes em sequência e em seguida 0x80. O retry de 25ms caía no mesmo lixo do buffer
         // da ECU; é preciso esperar ela descartar o frame parcial.
-        val crcErr = Exception("Erro ao ler live data modern: response code = 0x82")
+        val crcErr = Exception("Modern live data read failed: response code = 0x82")
         assertTrue(client.isLiveDataLinkDesync(crcErr))
         assertFalse(client.isRecoverableLiveDataTimeout(crcErr))
         assertTrue(client.liveDataRetryDelayMs(crcErr) > 400L)
@@ -73,18 +73,18 @@ class EcuClientLiveDataErrorClassificationTest {
 
     @Test
     fun `other response codes are not treated as link desync`() {
-        assertFalse(client.isLiveDataLinkDesync(Exception("Erro ao ler live data modern: response code = 0x80")))
-        assertFalse(client.isLiveDataLinkDesync(Exception("Erro ao ler live data modern: response code = 0x83")))
-        assertFalse(client.isLiveDataLinkDesync(Exception("Erro ao ler live data modern: response code = 0x84")))
+        assertFalse(client.isLiveDataLinkDesync(Exception("Modern live data read failed: response code = 0x80")))
+        assertFalse(client.isLiveDataLinkDesync(Exception("Modern live data read failed: response code = 0x83")))
+        assertFalse(client.isLiveDataLinkDesync(Exception("Modern live data read failed: response code = 0x84")))
     }
 
     @Test
     fun `link desync stream error message carries stable marker and original detail`() {
         val message = client.buildLinkDesyncStreamErrorMessage(
             attempts = 3,
-            error = Exception("Erro ao ler live data modern: response code = 0x82"),
+            error = Exception("Modern live data read failed: response code = 0x82"),
         )
-        assertTrue(message.startsWith("Erro no stream: "))
+        assertTrue(message.startsWith("Stream error: "))
         assertTrue(EcuClient.LIVE_DATA_LINK_DESYNC_MARKER in message)
         assertTrue("response code = 0x82" in message)
     }
@@ -92,7 +92,7 @@ class EcuClientLiveDataErrorClassificationTest {
     @Test
     fun `unrelated errors are not recoverable`() {
         assertFalse(client.isRecoverableLiveDataTimeout(Exception("Broken pipe")))
-        assertFalse(client.isRecoverableLiveDataTimeout(Exception("Não conectado")))
+        assertFalse(client.isRecoverableLiveDataTimeout(Exception("Not connected")))
     }
 
     private class StubConnection : IEcuConnection {

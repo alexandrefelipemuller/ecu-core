@@ -98,12 +98,12 @@ class Sirius32Transport(
 
             val sessionResponse = sendRaw("1029").uppercase()
             if (!sessionResponse.contains("5029") && !sessionResponse.contains("50 29")) {
-                throw IllegalStateException("Sirius 32: sessão KWP2000 não abriu (10 29 -> $sessionResponse)")
+                throw IllegalStateException("Sirius 32: KWP2000 session did not open (10 29 -> $sessionResponse)")
             }
 
             val extendedResponse = sendRaw("236B").uppercase()
             if (!extendedResponse.contains("636B") && !extendedResponse.contains("63 6B")) {
-                throw IllegalStateException("Sirius 32: modo estendido não abriu (23 6B -> $extendedResponse)")
+                throw IllegalStateException("Sirius 32: extended mode did not open (23 6B -> $extendedResponse)")
             }
 
             cachedFirmwareInfo = FirmwareInfo(
@@ -154,7 +154,7 @@ class Sirius32Transport(
                 runCatching { pollLiveDataOnce() }
                     .onFailure { err ->
                         Logger.d(TAG, "poll cycle failed: ${err.message}")
-                        onError(err.message ?: "Sirius 32: falha ao ler dados ao vivo")
+                        onError(err.message ?: "Sirius 32: live data read failed")
                     }
                 delay(intervalMs.coerceAtLeast(200L))
             }

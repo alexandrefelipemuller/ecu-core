@@ -665,7 +665,7 @@ class EcuProtocol(
      * ⚠️ DEPRECATED: Speeduino modernas (202402+) podem ter isso desabilitado
      */
     suspend fun readLiveData(expectedSize: Int = LIVE_DATA_SIZE): ByteArray {
-        require(expectedSize > 0) { "Tamanho inválido de live data: $expectedSize" }
+        require(expectedSize > 0) { "Invalid live data size: $expectedSize" }
         val response = try {
             sendLegacyCommand('A'.code.toByte(), responseSize = expectedSize)
         } catch (e: Exception) {
@@ -685,7 +685,7 @@ class EcuProtocol(
         return if (response.size >= expectedSize) {
             response
         } else {
-            throw Exception("Resposta de live data incompleta: ${response.size}/$expectedSize bytes")
+            throw Exception("Incomplete live data response: ${response.size}/$expectedSize bytes")
         }
     }
 
@@ -705,7 +705,7 @@ class EcuProtocol(
         if (!canAttemptModernLiveData()) {
             throw Exception("Modern protocol unavailable for modern live data on this connection")
         }
-        require(length > 0) { "Live data length inválido: $length" }
+        require(length > 0) { "Invalid live data length: $length" }
 
         val lengthLsb = (length and 0xFF).toByte()
         val lengthMsb = ((length shr 8) and 0xFF).toByte()
@@ -727,13 +727,13 @@ class EcuProtocol(
             response.sliceArray(1 until response.size)
         } else {
             val code = response.getOrNull(0)?.toInt()?.and(0xFF)
-            throw Exception("Erro ao ler live data modern: response code = ${code?.let { "0x${it.toString(16)}" } ?: "null"}")
+            throw Exception("Modern live data read failed: response code = ${code?.let { "0x${it.toString(16)}" } ?: "null"}")
         }
     }
 
     suspend fun readRusefiOutputChannels(length: Int, offset: Int = 0): ByteArray {
         requireModernCommandSupport("rusEFI output channels", ignoreSessionLegacyPreferred = true)
-        require(length > 0) { "rusEFI output length inválido: $length" }
+        require(length > 0) { "Invalid rusEFI output length: $length" }
 
         val payload = byteArrayOf(
             (offset and 0xFF).toByte(),
@@ -752,7 +752,7 @@ class EcuProtocol(
             response.copyOfRange(1, response.size)
         } else {
             val code = response.getOrNull(0)?.toInt()?.and(0xFF)
-            throw Exception("Erro ao ler output channels rusEFI: ${code?.let { "0x${it.toString(16)}" } ?: "null"}")
+            throw Exception("rusEFI output channels read failed: ${code?.let { "0x${it.toString(16)}" } ?: "null"}")
         }
     }
 
@@ -788,7 +788,7 @@ class EcuProtocol(
         expectResponse: Boolean = true
     ): ByteArray {
         if (!connection.isConnected()) {
-            throw Exception("Não conectado")
+            throw Exception("Not connected")
         }
 
         val packet = if (payload.isEmpty()) {
@@ -1206,7 +1206,7 @@ class EcuProtocol(
             throw Exception("Modern protocol disabled for this connection")
         }
         if (!connection.isConnected()) {
-            throw Exception("Não conectado")
+            throw Exception("Not connected")
         }
 
         val payload = byteArrayOf(cmd) + extraPayload
@@ -1273,7 +1273,7 @@ class EcuProtocol(
                 throw LegacyAsciiModernResponseException(lengthBytes)
             }
             connection.clearInputBuffer()
-            throw Exception("Resposta muito grande: $length bytes")
+            throw Exception("Response too large: $length bytes")
         }
 
         // Read payload
@@ -1505,11 +1505,11 @@ class EcuProtocol(
         } else if (response[0] != SERIAL_RC_OK) {
             val responseCode = response[0].toInt() and 0xFF
             val errorMsg = when (response[0]) {
-                SERIAL_RC_RANGE_ERR -> "RANGE_ERR (0x84): Valor fora do range ou bins não estão em ordem crescente. Verifique RPM/Load bins!"
-                SERIAL_RC_CRC_ERR -> "CRC_ERR (0x82): Erro de CRC"
-                SERIAL_RC_UKWN_ERR -> "UKWN_ERR (0x83): Comando desconhecido"
-                SERIAL_RC_BUSY_ERR -> "BUSY_ERR (0x85): ECU ocupada"
-                SERIAL_RC_TIMEOUT -> "TIMEOUT (0x80): ECU não confirmou a escrita; tratando como ACK ausente"
+                SERIAL_RC_RANGE_ERR -> "RANGE_ERR (0x84): value out of range or bins not in ascending order. Check RPM/Load bins!"
+                SERIAL_RC_CRC_ERR -> "CRC_ERR (0x82): CRC error"
+                SERIAL_RC_UKWN_ERR -> "UKWN_ERR (0x83): unknown command"
+                SERIAL_RC_BUSY_ERR -> "BUSY_ERR (0x85): ECU busy"
+                SERIAL_RC_TIMEOUT -> "TIMEOUT (0x80): ECU did not acknowledge the write; treating as missing ACK"
                 else -> "response code = 0x${responseCode.toString(16)}"
             }
             if (responseCode == (SERIAL_RC_TIMEOUT.toInt() and 0xFF)) {
@@ -1521,7 +1521,7 @@ class EcuProtocol(
                 throw PageWriteRejectedException(
                     pageId = pageNum.toInt() and 0xFF,
                     responseCode = responseCode,
-                    message = "Erro ao gravar página ${formatPageId(pageNum)}: $errorMsg",
+                    message = "Page ${formatPageId(pageNum)} write failed: $errorMsg",
                 )
             }
         } else {
@@ -1574,8 +1574,8 @@ class EcuProtocol(
                 )
             } else {
                 throw Exception(
-                    "Erro ao gravar tabela ${formatPageId(tableId)}: " +
-                        (responseCode?.let { "response code=0x${it.toString(16)}" } ?: "sem resposta")
+                    "Table ${formatPageId(tableId)} write failed: " +
+                        (responseCode?.let { "response code=0x${it.toString(16)}" } ?: "no response")
                 )
             }
         }
@@ -1605,7 +1605,7 @@ class EcuProtocol(
             sendModernCommand('b'.code.toByte(), payload, bypassTransportGate = bypassTransportGate)
         }
         if (response.isEmpty()) {
-            throw Exception("Burn da tabela ${formatPageId(tableId)} sem resposta")
+            throw Exception("Table ${formatPageId(tableId)} burn: no response")
         }
 
         val responseCode = response[0].toInt() and 0xFF
@@ -1613,7 +1613,7 @@ class EcuProtocol(
             responseCode != (SERIAL_RC_BURN_OK.toInt() and 0xFF) &&
             responseCode != 0x80) {
             throw Exception(
-                "Erro no burn da tabela ${formatPageId(tableId)}: code=0x${responseCode.toString(16)}"
+                "Table ${formatPageId(tableId)} burn failed: code=0x${responseCode.toString(16)}"
             )
         }
     }
@@ -1626,7 +1626,7 @@ class EcuProtocol(
             !(legacyPageReadUnsupported && connection.supportsModernProtocolFallback())
         if (useLegacyBurn) {
             val pageToBurn = lastLegacyWrittenPage
-                ?: throw Exception("Burn legacy requer a página gravada anteriormente")
+                ?: throw Exception("Legacy burn requires the previously written page")
             sendLegacyCommand(
                 'B'.code.toByte(),
                 expectResponse = false
@@ -1642,7 +1642,7 @@ class EcuProtocol(
         // - 0x04 (BURN_OK) em versões recentes
         // - 0x80 (undocumented) em algumas implementações
         if (response.isEmpty()) {
-            throw Exception("Burn: nenhuma resposta recebida")
+            throw Exception("Burn: no response received")
         }
 
         val responseCode = response[0].toInt() and 0xFF
@@ -1653,14 +1653,14 @@ class EcuProtocol(
             responseCode != (SERIAL_RC_BURN_OK.toInt() and 0xFF) &&
             responseCode != 0x80) {
             val errorMsg = when (response[0]) {
-                SERIAL_RC_RANGE_ERR -> "RANGE_ERR (0x84): Valor fora do range ou bins nÇœo estÇœo em ordem crescente."
-                SERIAL_RC_CRC_ERR -> "CRC_ERR (0x82): Erro de CRC"
-                SERIAL_RC_UKWN_ERR -> "UKWN_ERR (0x83): Comando desconhecido"
-                SERIAL_RC_BUSY_ERR -> "BUSY_ERR (0x85): ECU ocupada"
-                SERIAL_RC_TIMEOUT -> "TIMEOUT (0x80): ECU nÇœo respondeu"
+                SERIAL_RC_RANGE_ERR -> "RANGE_ERR (0x84): value out of range or bins not in ascending order."
+                SERIAL_RC_CRC_ERR -> "CRC_ERR (0x82): CRC error"
+                SERIAL_RC_UKWN_ERR -> "UKWN_ERR (0x83): unknown command"
+                SERIAL_RC_BUSY_ERR -> "BUSY_ERR (0x85): ECU busy"
+                SERIAL_RC_TIMEOUT -> "TIMEOUT (0x80): ECU did not respond"
                 else -> "response code = 0x${responseCode.toString(16)}"
             }
-            throw Exception("Erro ao fazer burn: $errorMsg")
+            throw Exception("Burn failed: $errorMsg")
         }
 
         Logger.d("EcuProtocol", "✅ Burn executado com sucesso (code: 0x${responseCode.toString(16)})")

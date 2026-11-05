@@ -113,7 +113,7 @@ class EcuClientVerifiedTableWriteTest {
         val error = assertFailsWith<PageWriteVerificationException> { client.writeVeTable(veTable(50), 1) }
 
         assertTrue(error.rolledBack, "a RAM deveria ter voltado ao valor anterior")
-        assertTrue(error.message!!.contains("valor anterior restaurado"))
+        assertTrue(error.message!!.contains("previous value restored"))
         assertContentEquals(original, ecu.read(metadata.page, metadata.offset, original.size))
         assertEquals(0, ecu.burns)
     }
@@ -129,7 +129,7 @@ class EcuClientVerifiedTableWriteTest {
         val error = assertFailsWith<PageWriteVerificationException> { client.writeVeTable(veTable(50), 1) }
 
         assertEquals(false, error.rolledBack)
-        assertTrue(error.message!!.contains("pode estar divergente"))
+        assertTrue(error.message!!.contains("RAM may differ"))
         assertEquals(0, ecu.burns)
     }
 

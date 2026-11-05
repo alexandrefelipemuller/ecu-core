@@ -58,7 +58,7 @@ class EcuTcpConnection(
             Logger.i(TAG, "Conexão estabelecida com sucesso")
 
         } catch (e: Exception) {
-            val message = "Falha ao conectar em $host:$port: ${e.message}"
+            val message = "Failed to connect to $host:$port: ${e.message}"
             if (e is ConnectException) {
                 Logger.w(TAG, message)
             } else {
@@ -91,7 +91,7 @@ class EcuTcpConnection(
 
     override fun send(data: ByteArray) {
         if (!isConnected) {
-            throw Exception("Não conectado")
+            throw Exception("Not connected")
         }
 
         try {
@@ -106,19 +106,19 @@ class EcuTcpConnection(
             }
         } catch (e: Exception) {
             if (e !is SocketTimeoutException) {
-                handleError("Erro ao enviar dados: ${e.message}", closeSocket = true)
+                handleError("Error sending data: ${e.message}", closeSocket = true)
             } else {
-                handleError("Erro ao enviar dados: ${e.message}")
+                handleError("Error sending data: ${e.message}")
             }
             Logger.e(TAG, "Erro ao enviar: ${e.javaClass.simpleName} - ${e.message}", e)
-            ConnectionTrace.error("tcp", "erro ao enviar: ${e.javaClass.simpleName}: ${e.message}", e)
+            ConnectionTrace.error("tcp", "send error: ${e.javaClass.simpleName}: ${e.message}", e)
             throw e
         }
     }
 
     override fun receive(size: Int): ByteArray {
         if (!isConnected) {
-            throw Exception("Não conectado")
+            throw Exception("Not connected")
         }
 
         return try {
@@ -156,8 +156,8 @@ class EcuTcpConnection(
                     }
                     if (read == -1) {
                         Logger.w(TAG, "Stream encerrado (-1)")
-                        handleError("Conexão encerrada pelo remoto", closeSocket = true)
-                        throw Exception("Conexão encerrada pelo remoto")
+                        handleError("Connection closed by remote", closeSocket = true)
+                        throw Exception("Connection closed by remote")
                     }
                     totalRead += read
 
@@ -174,8 +174,8 @@ class EcuTcpConnection(
                 val bytesRead = inputStream?.read(buffer) ?: 0
                 if (bytesRead == -1) {
                     Logger.w(TAG, "Stream encerrado (-1)")
-                    handleError("Conexão encerrada pelo remoto", closeSocket = true)
-                    throw Exception("Conexão encerrada pelo remoto")
+                    handleError("Connection closed by remote", closeSocket = true)
+                    throw Exception("Connection closed by remote")
                 }
                 if (verboseLogging) {
                     Logger.d(TAG, "Leu $bytesRead bytes disponíveis")
@@ -194,16 +194,16 @@ class EcuTcpConnection(
                 ConnectionTrace.error("tcp", "timeout ao receber dados: ${e.message}", e)
                 throw e
             }
-            handleError("Erro ao receber dados: ${e.message}", closeSocket = true)
+            handleError("Error receiving data: ${e.message}", closeSocket = true)
             Logger.e(TAG, "Erro ao receber: ${e.javaClass.simpleName} - ${e.message}", e)
-            ConnectionTrace.error("tcp", "erro ao receber: ${e.javaClass.simpleName}: ${e.message}", e)
+            ConnectionTrace.error("tcp", "receive error: ${e.javaClass.simpleName}: ${e.message}", e)
             throw e
         }
     }
 
     override fun readAvailable(maxBytes: Int, timeoutMs: Int?): ByteArray {
         if (!isConnected) {
-            throw Exception("Não conectado")
+            throw Exception("Not connected")
         }
 
         val bufferSize = when {

@@ -359,7 +359,7 @@ class PsaTransport(
             val detection = detected ?: scanPsaCan()
             if (detection == null || detection.hints.isEmpty()) {
                 runCatching { connection.disconnect() }
-                throw IllegalStateException("ECU PSA proprietária não detectada")
+                throw IllegalStateException("Proprietary PSA ECU not detected")
             }
 
             detected = detection

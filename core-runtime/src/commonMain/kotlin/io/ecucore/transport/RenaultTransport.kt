@@ -183,7 +183,7 @@ class RenaultTransport(
             if (detection == null || detection.hints.isEmpty()) {
                 investigationRecorder?.info("campaign", "renault scan finished without positive hints")
                 runCatching { connection.disconnect() }
-                throw IllegalStateException("ECU Renault proprietária não detectada")
+                throw IllegalStateException("Proprietary Renault ECU not detected")
             }
 
             detectedSession = detection

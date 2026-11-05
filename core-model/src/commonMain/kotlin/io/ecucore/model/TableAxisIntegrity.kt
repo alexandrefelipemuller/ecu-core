@@ -14,10 +14,10 @@ object TableAxisIntegrity {
     /** Descrições dos problemas encontrados; lista vazia = eixos íntegros. */
     fun problems(rpmBins: List<Int>, loadBins: List<Int>): List<String> = buildList {
         nonIncreasingIndices(rpmBins).takeIf { it.isNotEmpty() }?.let {
-            add("RPM bins não crescentes nos índices $it: ${rpmBins.joinToString(",")}")
+            add("RPM bins not increasing at indices $it: ${rpmBins.joinToString(",")}")
         }
         nonIncreasingIndices(loadBins).takeIf { it.isNotEmpty() }?.let {
-            add("Load bins não crescentes nos índices $it: ${loadBins.joinToString(",")}")
+            add("Load bins not increasing at indices $it: ${loadBins.joinToString(",")}")
         }
     }
 

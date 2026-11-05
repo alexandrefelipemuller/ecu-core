@@ -546,7 +546,7 @@ class EcuClientEdgeCasesTest {
 
     @Test
     fun `ms3 table burn errors that mean not burnable are ignored`() = runBlocking<Unit> {
-        for (message in listOf("RANGE_ERR", "Valor fora do range", "Incomplete modern response", "expected 1 bytes, received 0 bytes")) {
+        for (message in listOf("RANGE_ERR", "value out of range", "Incomplete modern response", "expected 1 bytes, received 0 bytes")) {
             val (c, ecu) = connected(ClientFakeEcu.Kind.MS3)
             ecu.onFrame = { cmd, _ -> if (cmd == 'b') throw Exception(message) else null }
             c.writeRawPage(0x05, ByteArray(16))

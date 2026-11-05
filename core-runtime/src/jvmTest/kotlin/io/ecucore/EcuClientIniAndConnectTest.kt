@@ -233,7 +233,7 @@ class EcuClientIniAndConnectTest {
     fun `too old firmware is rejected with the supported list`() = runBlocking<Unit> {
         val ecu = ClientFakeEcu(ClientFakeEcu.Kind.SPEEDUINO_2025).apply { signature = "speeduino 201501"; product = "speeduino 201501" }
         val e = assertFailsWith<UnsupportedFirmwareException> { client(ecu).connect() }
-        assertTrue(e.message!!.contains("Firmware não suportado"), e.message)
+        assertTrue(e.message!!.contains("Unsupported firmware"), e.message)
         assertFalse(ecu.connected)
     }
 
