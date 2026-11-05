@@ -26,8 +26,8 @@ object EcuOutputChannels {
     private const val TAG = "OutputChannels"
 
     /** MS2/MS3 mandam temperaturas em °F×10; °C = (raw - 320) * 0.05555, como no ramo CELSIUS do .ini. */
-    private const val MS_TEMP_SCALE = 0.05555
-    private const val MS_TEMP_TRANSLATE = -320.0
+    private const val MS_TEMP_SCALE = MsTemperatureUnits.FAHRENHEIT_SCALE
+    private const val MS_TEMP_TRANSLATE = MsTemperatureUnits.FAHRENHEIT_TRANSLATE
     private val runtimeDefinitions = mutableMapOf<Int, List<OutputField>>()
     private val loggedDefinitionSelections = mutableSetOf<String>()
 
@@ -203,6 +203,18 @@ object EcuOutputChannels {
         val aliases = roleAliases[family].orEmpty()
         // Alias vem antes: getField() pega o primeiro com o nome.
         return if (aliases.isEmpty()) fields else aliases + fields
+    }
+
+    /** Com `tempUnits` em °C a ECU manda °C×10: os canais °F×10 viram `raw * 0.1`. */
+    private fun withMsTemperatureUnits(fields: List<OutputField>): List<OutputField> {
+        if (!MsTemperatureUnits.celsius) return fields
+        return fields.map { field ->
+            if (MsTemperatureUnits.isFahrenheitTemperature(field.scale, field.translate)) {
+                field.copy(scale = MsTemperatureUnits.CELSIUS_SCALE, translate = 0.0)
+            } else {
+                field
+            }
+        }
     }
 
     fun isMs3BlockSize(blockSize: Int): Boolean = blockSize in 509..512
@@ -510,7 +522,7 @@ object EcuOutputChannels {
         return when {
             isMs3BlockSize(blockSize) -> {
                 logDefinitionSelectionOnce("ms3:$blockSize", "Using MS3 output channels ($blockSize bytes)")
-                withRoleAliases(EcuFamily.MS3, MS3_509_FIELDS)
+                withMsTemperatureUnits(withRoleAliases(EcuFamily.MS3, MS3_509_FIELDS))
             }
 
             blockSize == 2068 -> {
@@ -525,12 +537,12 @@ object EcuOutputChannels {
 
             blockSize >= 219 -> {
                 logDefinitionSelectionOnce("megaspeed:$blockSize", "Using MegaSpeed output channels ($blockSize bytes)")
-                MEGASPEED_219_FIELDS
+                withMsTemperatureUnits(MEGASPEED_219_FIELDS)
             }
 
             blockSize >= 212 -> {
                 logDefinitionSelectionOnce("ms2:$blockSize", "Using MS2 output channels ($blockSize bytes)")
-                withRoleAliases(EcuFamily.MS2, MS2_212_FIELDS)
+                withMsTemperatureUnits(withRoleAliases(EcuFamily.MS2, MS2_212_FIELDS))
             }
 
             // Modern 2024-2025 (127-130 bytes)
