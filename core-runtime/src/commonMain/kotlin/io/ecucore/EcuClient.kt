@@ -168,6 +168,18 @@ class EcuClient(
         // EcuProtocol.LegacyAsciiModernResponseException: length lido de bytes ASCII = stream desalinhado.
         private const val LEGACY_ASCII_RESPONSE_MARKER = "Modern response was legacy ASCII"
         private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
+        // MS2/MegaSpeed/MS3 com o stream ativo: o 'A' cru do live data divide o canal com o 'r'
+        // de config, e uma resposta atrasada no buffer desalinha o envelope. 3 tentativas
+        // espaçadas pelo resync (ver readConfigChunkUnlocked).
+        private const val MS_CONFIG_CHUNK_READ_MAX_ATTEMPTS = 3
+        // Espera, ao pausar o stream, pela resposta de live data já em trânsito (ver pauseLiveDataStream).
+        private const val STREAM_PAUSE_DRAIN_SETTLE_MS = 120L
+        // Frame MS isolado com >= 3 campos fora de faixa = desalinhado (ver shouldDropImplausibleMsSample).
+        private const val MS_IMPLAUSIBLE_SAMPLE_MIN_SCORE = 3
+        private const val MS_IMPLAUSIBLE_SAMPLE_MAX_CONSECUTIVE_DROPS = 2
+        // "unexpected response code=1": código < 0x80 não é erro da ECU, é o 1º byte de outra
+        // resposta (0x01 = realtime data, 0x03 = config error no newserial MS).
+        private val FOREIGN_RESPONSE_CODE_REGEX = Regex("""unexpected response code=([0-9a-fA-F]{1,2})\b""")
         // Gravação de tabelas de tuning (VE/Ignição/AFR): chunks pequenos reduzem a chance de
         // perder bytes num frame grande via Bluetooth, e cada página é relida e comparada antes
         // do burn. Um 0x82 (CRC_ERR) deixa o resto do frame chegando na ECU depois do flush dela;
@@ -344,6 +356,13 @@ class EcuClient(
     private var lastFaultRecoveryAtMs = 0L
     @Volatile
     private var liveDataStreamStopRequested = false
+
+    /**
+     * Filtro de frame isolado implausível no stream MS (ver [shouldDropImplausibleMsSample]).
+     * `Int.MAX_VALUE` = ainda sem amostra de referência neste stream.
+     */
+    private var lastAcceptedMsSampleScore = Int.MAX_VALUE
+    private var consecutiveDroppedMsSamples = 0
 
     /** Já recebemos ao menos um frame modern do tamanho exato do OCH nesta conexão. */
     private var fullModernLiveFrameSeen = false
@@ -1202,7 +1221,23 @@ class EcuClient(
         val shouldDrainBeforeAttempt = readMode == EcuConfigReadMode.LEGACY_PAGE &&
             (connection.shouldDrainBeforeLegacyConfigRead() || ecuDefinition?.runtime?.schemaId == "msextra-hr10")
 
-        repeat(CONFIG_CHUNK_READ_MAX_ATTEMPTS) { attempt ->
+        // Achado de campo 2026-11 (MicroSquirt comms342hU, USB, v1.6.7): com o motor ligado e o
+        // stream rodando, abrir WUE/marcha lenta falhava sempre com `code=1` (0x01 = realtime
+        // data no newserial MS, resposta de live data) ou `code=null`. Resto de uma resposta do
+        // 'A' cru no buffer desalinha o envelope do 'r'. Limpa
+        // antes de cada tentativa e, entre tentativas, espera o timeout serial da ECU (~400 ms)
+        // para ela descartar qualquer frame parcial. O drain prévio só vale com o stream ativo
+        // (leitura intercalada com o live data sob o mesmo mutex); quem pausa o stream antes
+        // (download completo, telas de config) já recebe o drain em pauseLiveDataStream().
+        val isMsFamily = family == EcuFamily.MS2 || family == EcuFamily.MEGASPEED || family == EcuFamily.MS3
+        val drainMsBeforeAttempt = isMsFamily && _isStreaming
+        val maxAttempts = if (isMsFamily) MS_CONFIG_CHUNK_READ_MAX_ATTEMPTS else CONFIG_CHUNK_READ_MAX_ATTEMPTS
+        val retryDelayMs = if (isMsFamily) maxOf(configReadDelayMs, LIVE_DATA_DESYNC_RESYNC_DELAY_MS) else configReadDelayMs
+
+        repeat(maxAttempts) { attempt ->
+            if (drainMsBeforeAttempt) {
+                drainInputBufferQuietly()
+            }
             try {
                 if (shouldDrainBeforeAttempt) {
                     runCatching { connection.clearInputBuffer() }
@@ -1234,7 +1269,7 @@ class EcuClient(
                 }
             } catch (e: Exception) {
                 lastError = e
-                val canRetry = attempt < CONFIG_CHUNK_READ_MAX_ATTEMPTS - 1 &&
+                val canRetry = attempt < maxAttempts - 1 &&
                     (isRecoverableConfigChunkReadFailure(e) || family == EcuFamily.RUSEFI)
                 if (!canRetry) {
                     throw Exception(
@@ -1246,10 +1281,10 @@ class EcuClient(
                 Logger.w(
                     TAG,
                     "Leitura parcial/timeout recuperável em config chunk page=$pageLabel offset=$offset length=$length; " +
-                        "retry ${attempt + 2}/$CONFIG_CHUNK_READ_MAX_ATTEMPTS: ${e.message}"
+                        "retry ${attempt + 2}/$maxAttempts: ${e.message}"
                 )
                 runCatching { connection.clearInputBuffer() }
-                delay(configReadDelayMs)
+                delay(retryDelayMs)
             }
         }
 
@@ -1348,6 +1383,11 @@ class EcuClient(
                 message.contains("short modern page response", ignoreCase = true) ||
                 message.contains("short table response", ignoreCase = true)
             ) {
+                return true
+            }
+            val foreignCode = FOREIGN_RESPONSE_CODE_REGEX.find(message)
+                ?.groupValues?.getOrNull(1)?.toIntOrNull(16)
+            if (foreignCode != null && foreignCode in 0x01..0x7F) {
                 return true
             }
             current = current.cause
@@ -4185,6 +4225,8 @@ class EcuClient(
         lastLiveDataStreamStartedAtMs = MonotonicClock.nowMillis()
         consecutiveFaultyLiveDataSamples = 0
         pendingLiveDataRecoveryReason = null
+        lastAcceptedMsSampleScore = Int.MAX_VALUE
+        consecutiveDroppedMsSamples = 0
 
         streamJob = scope.launch {
             val intervalNs = intervalMs.coerceAtLeast(1L) * 1_000_000L
@@ -4195,7 +4237,11 @@ class EcuClient(
             while (_isStreaming && connection.isConnected()) {
                 try {
                     // Se uma operação crítica detém o canal, o stream cede a vez neste ciclo.
-                    val liveData = withEcuIoOrNull { readLiveData() } ?: run {
+                    val sample = withEcuIoOrNull { readStreamSample() } ?: run {
+                        delay(intervalMs)
+                        continue
+                    }
+                    val liveData = sample.data ?: run {
                         delay(intervalMs)
                         continue
                     }
@@ -4653,7 +4699,15 @@ class EcuClient(
 
         streamJob = null
         pendingLiveDataRecoveryReason = null
-        connection.clearInputBuffer()
+        // O abortPendingRead() acima interrompe só a leitura do app: a ECU continua mandando a
+        // resposta do último pedido de live data (no MS2, 212 bytes do 'A' cru, ~20 ms a 115200 +
+        // latência USB/BT). Limpar uma vez só, na hora, deixava esse resto chegar depois e virar o
+        // começo da resposta do próximo comando - provável origem do `Config chunk read failed
+        // ... unexpected response code=1` (0x01 = realtime data) nas telas WUE/marcha lenta do
+        // MS2, que pausam o stream antes de ler (achado de campo 2026-11, MicroSquirt, v1.6.7).
+        runCatching { connection.clearInputBuffer() }
+        delay(STREAM_PAUSE_DRAIN_SETTLE_MS)
+        runCatching { connection.clearInputBuffer() }
         liveDataStreamStopRequested = false
     }
 
@@ -4706,6 +4760,59 @@ class EcuClient(
         if (data.coolantTemp < -40 || data.coolantTemp > 170) score++
         if (data.intakeTemp < -40 || data.intakeTemp > 170) score++
         return score
+    }
+
+    /** Amostra do stream: [data] `null` = frame descartado pelo filtro de plausibilidade. */
+    private class StreamSample(val data: EcuLiveData?)
+
+    /**
+     * Leitura do stream, já sob o canal ([withEcuIoOrNull]). Descartar e limpar o buffer aqui
+     * dentro garante que o `clearInputBuffer` não apague a resposta de outra operação.
+     */
+    private suspend fun readStreamSample(): StreamSample {
+        val liveData = readLiveData()
+        if (!shouldDropImplausibleMsSample(liveData)) {
+            return StreamSample(liveData)
+        }
+        drainInputBufferQuietly()
+        return StreamSample(null)
+    }
+
+    /**
+     * Achado de campo 2026-11 (MicroSquirt "MS2Extra comms342hU", USB, v1.6.7): no meio de um
+     * log estável (secl 293, ~900 rpm, CLT 44 °C) veio UM frame com secl=0, rpm=41175,
+     * bateria=100 V, CLT=-3007 °C e avanço=-2997.7°, e o seguinte já estava normal. O live data
+     * MS vem do 'A' cru (sem cabeçalho nem CRC): bytes sobrando de outra resposta no buffer
+     * desalinham o frame e nada no protocolo acusa. Esse frame ia para dashboard e CSV.
+     *
+     * Só descarta o frame isolado: precisa de uma amostra anterior plausível (score <= 1) e
+     * no máximo [MS_IMPLAUSIBLE_SAMPLE_MAX_CONSECUTIVE_DROPS] descartes seguidos. Um estado
+     * implausível que persiste (bancada sem sensores, chicote solto) passa a ser mostrado,
+     * para o problema real não ficar escondido.
+     */
+    private fun shouldDropImplausibleMsSample(liveData: EcuLiveData): Boolean {
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MS2 && family != EcuFamily.MEGASPEED && family != EcuFamily.MS3) {
+            return false
+        }
+        var score = liveDataOutOfRangeScore(liveData)
+        if (liveData.advance < -90 || liveData.advance > 90) score++
+        val isolatedSpike = score >= MS_IMPLAUSIBLE_SAMPLE_MIN_SCORE &&
+            lastAcceptedMsSampleScore <= 1 &&
+            consecutiveDroppedMsSamples < MS_IMPLAUSIBLE_SAMPLE_MAX_CONSECUTIVE_DROPS
+        if (isolatedSpike) {
+            consecutiveDroppedMsSamples++
+            Logger.w(TAG, "Frame MS implausível descartado (score=$score rpm=${liveData.rpm} clt=${liveData.coolantTemp})")
+            ConnectionTrace.info(
+                "live_data",
+                "dropped implausible ms frame score=$score secl=${liveData.secl} rpm=${liveData.rpm} " +
+                    "clt=${liveData.coolantTemp} batt=${liveData.batteryVoltage} adv=${liveData.advance}"
+            )
+            return true
+        }
+        consecutiveDroppedMsSamples = 0
+        lastAcceptedMsSampleScore = score
+        return false
     }
 
     private var lastFaultSampleAtMs = 0L
