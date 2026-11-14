@@ -72,7 +72,7 @@ data class StateFonts(val ver: Int, val flag: Int, val u: Int, val values: List<
 
 enum class GaugeType(val id: Int) {
     NEEDLE(1), TEXT(2), BAR(3), IMAGE(5), AXIS(7), ARC(8), BUTTON(11), GRAPH(12), MAP(17), SLIDER(20),
-    CONTAINER(22), UNKNOWN(-1);
+    CONTAINER(22), MUSIC_LIST(21), UNKNOWN(-1);
 
     companion object { fun of(id: Int) = entries.firstOrNull { it.id == id } ?: UNKNOWN }
 }
@@ -204,6 +204,9 @@ data class BarExt(val uA: Int, val direction: Int, val scale: AutoScale, val lay
 }
 
 data class GraphExt(val u: IntArray) : GaugeExt
+
+/** Lista de músicas (tipo 21): 7 palavras após o registro, não renderizadas (observado em RealDash 2.1.7). */
+data class MusicListExt(val u: IntArray) : GaugeExt
 
 data class ContainerExt(val u: IntArray, val groups: List<NestedElement>) : GaugeExt {
     val children get() = groups.filterIsInstance<NestedGroup>().flatMap { it.children }
@@ -340,7 +343,8 @@ fun readGauge(r: RdReader): Gauge {
 private fun readTail(r: RdReader, g: Gauge): GaugeExt? {
     val where = "0x${g.offset.toString(16)}"
     return when (g.tailKind) {
-        0, 1 -> null
+        0 -> null
+        1 -> if (g.type == GaugeType.MUSIC_LIST) MusicListExt(r.i32s(7)) else null
         2 -> when (g.type) {
             GaugeType.BAR -> BarExt(r.i32(), r.i32(), AutoScale.read(r), Layers.read(r), r.i32())
             GaugeType.CONTAINER -> ContainerExt(r.i32s(4), List(r.i32()) { readNested(r) })
