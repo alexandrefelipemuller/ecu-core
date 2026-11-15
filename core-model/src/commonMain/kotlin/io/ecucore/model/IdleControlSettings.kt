@@ -18,6 +18,11 @@ data class IdleControlSettings(
     val stepTimeMs: Int = 3,
     val stepHomeSteps: Int = 100,
     val stepMinimumSteps: Int = 3,
+    /**
+     * Curva de RPM alvo da marcha lenta por temperatura do motor (`iacCLValues` x `iacBins`).
+     * `null` = curva não lida; nesse caso a gravação NÃO toca nela (ao contrário de [idleTargetRpm]).
+     */
+    val idleTargetCurve: IdleTargetCurve? = null,
 ) {
     val isPwmMode: Boolean
         get() = controlMode == IdleControlMode.ON_OFF ||
@@ -44,6 +49,7 @@ data class IdleControlSettings(
         private const val OFFSET_IDLE_FREQ = 47
         private const val OFFSET_CL_IDLE_TARGET = 64
         private const val CL_IDLE_TARGET_COUNT = 10
+        private const val OFFSET_IAC_BINS = 94
 
         fun fromPage4(data: ByteArray): IdleControlSettings {
             require(data.size >= PAGE_LENGTH) { "Page 4 deve ter 128 bytes" }
@@ -71,6 +77,15 @@ data class IdleControlSettings(
                 stepTimeMs = stepTime,
                 stepHomeSteps = stepHome,
                 stepMinimumSteps = stepHyster,
+            )
+        }
+
+        /** Lê a curva completa (10 pontos) da mesma página do RPM alvo. */
+        fun readTargetCurveFromPage7(data: ByteArray): IdleTargetCurve {
+            require(data.size >= TARGET_PAGE_LENGTH) { "Page 7 deve ter 240 bytes" }
+            return IdleTargetCurve(
+                tempsC = (0 until CL_IDLE_TARGET_COUNT).map { (data[OFFSET_IAC_BINS + it].toInt() and 0xFF) - 40 },
+                rpm = (0 until CL_IDLE_TARGET_COUNT).map { (data[OFFSET_CL_IDLE_TARGET + it].toInt() and 0xFF) * 10 },
             )
         }
 
@@ -125,12 +140,32 @@ data class IdleControlSettings(
         require(original.size >= TARGET_PAGE_LENGTH) { "Page 7 deve ter 240 bytes" }
 
         val data = original.copyOf()
+        val curve = idleTargetCurve
+        if (curve != null) {
+            // Curva conhecida: grava ponto a ponto, preservando a forma que o usuário montou.
+            for (index in 0 until CL_IDLE_TARGET_COUNT) {
+                data[OFFSET_CL_IDLE_TARGET + index] = (curve.rpm[index].coerceIn(0, 2550) / 10).toByte()
+                data[OFFSET_IAC_BINS + index] = (curve.tempsC[index] + 40).coerceIn(0, 255).toByte()
+            }
+            return data
+        }
         val rawValue = (idleTargetRpm.coerceIn(0, 2550) / 10).toByte()
         for (index in 0 until CL_IDLE_TARGET_COUNT) {
             data[OFFSET_CL_IDLE_TARGET + index] = rawValue
         }
         return data
     }
+}
+
+/** Curva RPM alvo × temperatura (10 pontos, temperaturas crescentes em °C). */
+data class IdleTargetCurve(val tempsC: List<Int>, val rpm: List<Int>) {
+    init {
+        require(tempsC.size == rpm.size) { "tempsC e rpm devem ter o mesmo tamanho" }
+        require(tempsC.size == 10) { "A curva de marcha lenta do Speeduino tem 10 pontos" }
+    }
+
+    /** Média arredondada — mantém compatibilidade com o campo escalar `idleTargetRpm`. */
+    val averageRpm: Int get() = rpm.average().toInt()
 }
 
 enum class IdleControlMode(val rawValue: Int) {

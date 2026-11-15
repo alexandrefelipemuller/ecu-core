@@ -290,7 +290,9 @@ object SessionTableParser {
             ?.let(IdleControlSettings::readTargetRpmFromPage7)
             ?: baseSettings.idleTargetRpm
 
-        return baseSettings.copy(idleTargetRpm = targetRpm)
+        val curve = pages[IdleControlSettings.TARGET_PAGE_NUMBER]?.let(IdleControlSettings::readTargetCurveFromPage7)
+
+        return baseSettings.copy(idleTargetRpm = targetRpm, idleTargetCurve = curve)
     }
 
     fun parseEngineProtectionConfig(

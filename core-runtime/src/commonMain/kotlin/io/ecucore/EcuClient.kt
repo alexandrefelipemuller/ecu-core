@@ -1663,6 +1663,7 @@ class EcuClient(
         val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
         IdleControlSettings.fromPage4(basePage).copy(
             idleTargetRpm = IdleControlSettings.readTargetRpmFromPage7(targetPage),
+            idleTargetCurve = IdleControlSettings.readTargetCurveFromPage7(targetPage),
         )
     }
 
