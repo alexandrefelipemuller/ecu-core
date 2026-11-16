@@ -297,6 +297,38 @@ class SpeeduinoPageContractTest {
         kotlin.test.assertEquals(setOf(2), setOf(ini.fields.first { it.name == "algorithm" }.page), "algorithm no 201609 está na página 2")
     }
 
+    /**
+     * As tabelas VE/ignição/AFR do Speeduino usam `EcuTableDefinitions` (página/offset por era, escritos à mão) quando
+     * nenhum .ini as substitui. Elas têm de bater com o .ini de TODAS as versões, incluindo o 201609 (layout próprio).
+     */
+    @Test fun tableDefinitionsMatchTheIniOfEveryVersion() {
+        val problems = mutableListOf<String>()
+        val versions = listOf("speeduino_201609") + allFirmwares
+        for (fw in versions) {
+            val ini = load(fw)
+            val defs = io.ecucore.model.EcuTableDefinitions.getDefinitions("speeduino ${version(fw)}")
+            fun field(vararg names: String) = ini.fields.firstOrNull { f -> f.name in names && f.page != null }
+            fun check(label: String, meta: io.ecucore.model.TableMetadata, table: Array<String>, rpm: Array<String>, load: Array<String>) {
+                val t = field(*table)
+                val r = field(*rpm)
+                val l = field(*load)
+                if (t == null) { problems += "$fw: $label sem ${table.toList()} no .ini"; return }
+                if (meta.page != t.page) problems += "$fw: $label página código=${meta.page} ini=${t.page}"
+                val tableOffset = t.offset
+                if (tableOffset != null && meta.offset + meta.valuesOffset != tableOffset)
+                    problems += "$fw: $label valores código=${meta.offset + meta.valuesOffset} ini=$tableOffset"
+                if (r != null && r.page == t.page && r.offset != null && meta.offset + meta.rpmBinsOffset != r.offset)
+                    problems += "$fw: $label rpmBins código=${meta.offset + meta.rpmBinsOffset} ini=${r.offset}"
+                if (l != null && l.page == t.page && l.offset != null && meta.offset + meta.loadBinsOffset != l.offset)
+                    problems += "$fw: $label loadBins código=${meta.offset + meta.loadBinsOffset} ini=${l.offset}"
+            }
+            check("VE", defs.veTable, arrayOf("veTable"), arrayOf("rpmBins"), arrayOf("fuelLoadBins", "mapBins"))
+            check("Ignição", defs.ignitionTable, arrayOf("advTable1"), arrayOf("rpmBins2"), arrayOf("mapBins1", "loadBins2"))
+            check("AFR", defs.afrTable, arrayOf("afrTable"), arrayOf("rpmBinsAFR"), arrayOf("loadBinsAFR"))
+        }
+        if (problems.isNotEmpty()) fail("Definições de tabela divergem do .ini:\n" + problems.joinToString("\n"))
+    }
+
     @Test fun idleLayoutResolvedFromIni() {
         for (fw in allFirmwares) {
             val layout = checkNotNull(IdleControlLayout.fromIni(load(fw))) { "$fw: layout da marcha lenta não resolvido" }

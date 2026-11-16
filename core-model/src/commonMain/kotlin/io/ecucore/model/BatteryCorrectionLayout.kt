@@ -15,6 +15,10 @@ data class BatteryCorrectionLayout(
     val binsOffset: Int,
     val ratesOffset: Int,
 ) {
+    /** Bytes da página que a correção de bateria pode alterar: `brvBins` e `injBatRates`. */
+    val ownedOffsets: Set<Int>
+        get() = (0 until POINTS).flatMap { listOf(binsOffset + it, ratesOffset + it) }.toSet()
+
     companion object {
         const val POINTS = 6
         val DEFAULT = BatteryCorrectionLayout(page = 6, pageLength = 128, binsOffset = 15, ratesOffset = 21)

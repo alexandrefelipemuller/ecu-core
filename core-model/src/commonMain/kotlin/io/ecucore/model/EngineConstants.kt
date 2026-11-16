@@ -52,6 +52,14 @@ data class EngineConstants(
 ) {
     companion object {
         /**
+         * Offsets da página 1 do Speeduino que [applyToPage1] pode alterar (conferidos contra o .ini pelo contrato):
+         * battVCorMode 3, pinLayout 15, reqFuel 24, divider 25, alternate/ignAlgorithm 26, injOpen 27, injAng 28..35,
+         * config 36/37/38, dutyLim 40, stoich 50 e oddfire 51..56.
+         */
+        val PAGE1_OWNED_OFFSETS: Set<Int> =
+            setOf(3, 15, 24, 25, 26, 27, 36, 37, 38, 40, 50) + (28..35) + (51..56)
+
+        /**
          * Parse Page 1 (128 bytes) into EngineConstants
          */
         fun fromPage1(data: ByteArray): EngineConstants {

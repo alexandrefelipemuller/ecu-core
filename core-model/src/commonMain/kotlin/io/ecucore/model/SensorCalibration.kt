@@ -21,6 +21,12 @@ data class TpsCalibration(
     }
 }
 
+/** Página 1 do Speeduino 202008+: tpsMin 44 e tpsMax 45 (U08). */
+val SPEEDUINO_TPS_OWNED_OFFSETS: Set<Int> = setOf(44, 45)
+
+/** Página 1 do Speeduino 202008+: mapMin 46, mapMax 47..48, baroMin 64, baroMax 65..66, EMAPMin 67, EMAPMax 68..69. */
+val SPEEDUINO_PRESSURE_OWNED_OFFSETS: Set<Int> = setOf(46, 47, 48, 64, 65, 66, 67, 68, 69)
+
 /** tpsMin/tpsMax da MS2/Extra: tabela 0x04, S16 big-endian em 518 e 520 (ADC 0..1023). */
 const val MS2_TPS_TABLE: Byte = 0x04
 const val MS2_TPS_MIN_OFFSET = 518

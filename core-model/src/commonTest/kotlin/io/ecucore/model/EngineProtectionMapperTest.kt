@@ -180,6 +180,7 @@ class EngineProtectionMapperTest {
         assertTrue(on.revLimiterEnabled)
         assertTrue(on.hardRevLimitEnabled)
         assertFalse(on.coolantProtectionEnabled)
+        assertFalse(on.page9ProtectionAvailable) // as telas desabilitam os interruptores sem efeito
         assertEquals(7000, on.hardRevLimitRpm)
         val off = parse(protectType = 0)
         assertFalse(off.revLimiterEnabled)

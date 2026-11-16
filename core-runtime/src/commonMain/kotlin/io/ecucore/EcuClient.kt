@@ -93,6 +93,9 @@ import io.ecucore.transport.MapSelectionSupport
 import io.ecucore.model.TpsCalibration
 import io.ecucore.model.MS2_TPS_TABLE
 import io.ecucore.model.MS2_TPS_MIN_OFFSET
+import io.ecucore.model.SPEEDUINO_TPS_OWNED_OFFSETS
+import io.ecucore.model.SPEEDUINO_PRESSURE_OWNED_OFFSETS
+import io.ecucore.model.PageWriteGuard
 import io.ecucore.model.MS2_TPS_BYTES
 import io.ecucore.model.encodeMs2TpsCalibration
 import io.ecucore.model.decodeMs2TpsCalibration
@@ -1195,6 +1198,23 @@ class EcuClient(
         }
     }
 
+    /**
+     * Grava só depois de [PageWriteGuard] confirmar que [after] difere de [before] apenas nos offsets em [owned]
+     * (os bytes que o escritor possui). Violação lança [UnownedBytesWriteException] e NADA é enviado à ECU.
+     * [before] deve ser a cópia lida da ECU e não pode ser alterada pelo escritor.
+     */
+    private suspend fun writeOwnedConfigPage(
+        pageNum: Int,
+        offset: Int,
+        before: ByteArray,
+        after: ByteArray,
+        owned: Set<Int>,
+        label: String,
+    ) {
+        PageWriteGuard.requireOnlyOwned(label, pageNum, before, after, owned, offset)
+        writeConfigPageVerified(pageNum.toByte(), offset, after, label)
+    }
+
     suspend fun readPage(pageNum: Byte, offset: Int, length: Int): ByteArray {
         return readPage(pageNum.toInt() and 0xFF, offset, length)
     }
@@ -1560,14 +1580,15 @@ class EcuClient(
         requireSpeeduinoLayout("writePressureCalibration")
         requireModernPageLayout("writePressureCalibration")
         ConfigValidator.requireValid(ConfigValidator.validatePressureCalibration(calibration))
-        val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+        val before = readPage(pageNum = 1, offset = 0, length = 128)
+        val basePage = before.copyOf()
         writeS8(basePage, 46, calibration.mapMin)
         writeU16(basePage, 47, calibration.mapMax)
         writeS8(basePage, 64, calibration.baroMin)
         writeU16(basePage, 65, calibration.baroMax)
         writeS8(basePage, 67, calibration.emapMin)
         writeU16(basePage, 68, calibration.emapMax)
-        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "Pressure Calibration")
+        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_PRESSURE_OWNED_OFFSETS, "Pressure Calibration")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1614,10 +1635,11 @@ class EcuClient(
         requireSpeeduinoLayout("writeTpsCalibration")
         requireModernPageLayout("writeTpsCalibration")
         ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
-        val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+        val before = readPage(pageNum = 1, offset = 0, length = 128)
+        val basePage = before.copyOf()
         writeU8(basePage, 44, calibration.tpsMin)
         writeU8(basePage, 45, calibration.tpsMax)
-        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "TPS Calibration")
+        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_TPS_OWNED_OFFSETS, "TPS Calibration")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1719,10 +1741,8 @@ class EcuClient(
         requireIdleSupported("writeIdleControlSettings")
         val layout = idleLayout()
         val page = readPage(pageNum = layout.page, offset = 0, length = layout.pageLength)
-        writeConfigPageVerified(
-            layout.page.toByte(),
-            0,
-            settings.applyToPage(page, layout),
+        writeOwnedConfigPage(
+            layout.page, 0, page, settings.applyToPage(page, layout), layout.ownedOffsets,
             "Idle Control (Page ${layout.page})",
         )
         if (burn) {
@@ -2447,28 +2467,26 @@ class EcuClient(
         )
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
         val updatedData = EngineProtectionMapper.applyToPage(basePage, config)
-        writeConfigPageVerified(
-            pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
-            offset = 0,
-            data = updatedData,
-            label = "Engine Protection",
+        writeOwnedConfigPage(
+            EngineProtectionMapper.PAGE_NUMBER, 0, basePage, updatedData,
+            EngineProtectionMapper.PAGE6_OWNED_OFFSETS, "Engine Protection",
         )
         // Páginas 1/4/9/10 só são tocadas se a config foi lida delas (extendedPagesLoaded): sem isso os
         // campos estariam em valor padrão e a gravação zeraria limites que o app nunca viu.
         if (era.isModern() && config.extendedPagesLoaded) {
-            writeEngineProtectionExtraPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, EngineProtectionMapper.PAGE1_OWNED_OFFSETS, burn) {
                 EngineProtectionMapper.applyToPage1(it, config)
             }
-            writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, EngineProtectionMapper.PAGE4_OWNED_OFFSETS, burn) {
                 EngineProtectionMapper.applyToPage4(it, config)
             }
             val hasPage9 = EngineProtectionMapper.hasPage9Protection(era, activeIniDefinition)
             if (hasPage9) {
-                writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
+                writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, EngineProtectionMapper.PAGE9_OWNED_OFFSETS, burn) {
                     EngineProtectionMapper.applyToPage9(it, config, era, hasPage9)
                 }
             }
-            writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, EngineProtectionMapper.PAGE10_OWNED_OFFSETS, burn) {
                 EngineProtectionMapper.applyToPage10(it, config)
             }
         }
@@ -2481,9 +2499,16 @@ class EcuClient(
         }
     }
 
-    private suspend fun writeEngineProtectionExtraPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
-        val updated = transform(readPage(pageNum = pageNum, offset = 0, length = size))
-        writeConfigPageVerified(pageNum = pageNum.toByte(), offset = 0, data = updated, label = "Engine Protection page $pageNum")
+    private suspend fun writeEngineProtectionExtraPage(
+        pageNum: Int,
+        size: Int,
+        owned: Set<Int>,
+        burn: Boolean,
+        transform: (ByteArray) -> ByteArray,
+    ) {
+        val before = readPage(pageNum = pageNum, offset = 0, length = size)
+        val updated = transform(before)
+        writeOwnedConfigPage(pageNum, 0, before, updated, owned, "Engine Protection page $pageNum")
         if (burn) {
             delay(200)
             protocol.burnConfig()
@@ -2506,11 +2531,9 @@ class EcuClient(
             length = ClosedLoopCorrectionMapper.PAGE_SIZE
         )
         val updatedData = ClosedLoopCorrectionMapper.applyToPage(basePage, config, era)
-        writeConfigPageVerified(
-            pageNum = ClosedLoopCorrectionMapper.PAGE_NUMBER.toByte(),
-            offset = 0,
-            data = updatedData,
-            label = "Closed Loop Corrections",
+        writeOwnedConfigPage(
+            ClosedLoopCorrectionMapper.PAGE_NUMBER, 0, basePage, updatedData,
+            ClosedLoopCorrectionMapper.PAGE6_OWNED_OFFSETS, "Closed Loop Corrections",
         )
         if (ClosedLoopCorrectionMapper.hasMapWindowPage(era)) {
             val basePage9 = readPage(
@@ -2518,11 +2541,10 @@ class EcuClient(
                 offset = 0,
                 length = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE
             )
-            writeConfigPageVerified(
-                pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
-                offset = 0,
-                data = ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
-                label = "Closed Loop Corrections MAP window",
+            writeOwnedConfigPage(
+                ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER, 0, basePage9,
+                ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
+                ClosedLoopCorrectionMapper.PAGE9_OWNED_OFFSETS, "Closed Loop Corrections MAP window",
             )
         }
         if (burn) {
@@ -2578,11 +2600,8 @@ class EcuClient(
             length = TriggerSettings.PAGE_LENGTH
         )
         val updatedData = settings.toPageData(basePage)
-        writeConfigPageVerified(
-            pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
-            offset = 0,
-            data = updatedData,
-            label = "Trigger Settings",
+        writeOwnedConfigPage(
+            TriggerSettings.PAGE_NUMBER, 0, basePage, updatedData, TriggerSettings.PAGE4_OWNED_OFFSETS, "Trigger Settings",
         )
         if (burn) {
             delay(300)
@@ -2609,11 +2628,10 @@ class EcuClient(
         val original = baseData.firstOrNull()?.toInt()?.and(0xFF) ?: 0
         val updated = config.applyToByte(original)
 
-        writeConfigPageVerified(
-            pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
-            offset = SecondarySerialConfig.OFFSET,
-            data = byteArrayOf(updated.toByte()),
-            label = "Secondary Serial",
+        writeOwnedConfigPage(
+            SecondarySerialConfig.PAGE_NUMBER, SecondarySerialConfig.OFFSET,
+            byteArrayOf(original.toByte()), byteArrayOf(updated.toByte()),
+            SecondarySerialConfig.OWNED_OFFSETS, "Secondary Serial",
         )
 
         if (burn) {
@@ -2816,7 +2834,7 @@ class EcuClient(
             Logger.d(TAG, "Page 1 serializada: ${pageData.size} bytes")
 
             // Write to ECU
-            writeConfigPageVerified(pageNum = 1, offset = 0, data = pageData, label = "Engine Constants (Page 1)")
+            writeOwnedConfigPage(1, 0, basePage, pageData, EngineConstants.PAGE1_OWNED_OFFSETS, "Engine Constants (Page 1)")
             Logger.d(TAG, "Page 1 gravada com sucesso")
 
             // Correção de bateria mora na página 6: só vai se veio da ECU (batteryCorrectionLoaded) e só se algum
@@ -2828,7 +2846,7 @@ class EcuClient(
                 val page = readPage(pageNum = layout.page, offset = 0, length = layout.pageLength)
                 val updated = engineConstants.applyBatteryCorrectionToPage(page, layout)
                 if (!updated.contentEquals(page)) {
-                    writeConfigPageVerified(pageNum = layout.page.toByte(), offset = 0, data = updated, label = "Battery Correction (Page ${layout.page})")
+                    writeOwnedConfigPage(layout.page, 0, page, updated, layout.ownedOffsets, "Battery Correction (Page ${layout.page})")
                 }
             }
 
@@ -3291,10 +3309,12 @@ class EcuClient(
         requireDwellTableSupported("writeDwellTable")
         Logger.d(TAG, "Gravando Dwell Table (Page 12)...")
 
-        val pageData = dwellTable.toByteArray()
+        // A página 12 também guarda WMI e VVT2 (offsets 0..159): lê, troca só a dwell e grava de volta.
+        val before = readPage(pageNum = 12, offset = 0, length = DwellTable.StorageFormat.PAGE_12_192.totalSize)
+        val pageData = dwellTable.applyToPage(before)
         Logger.d(TAG, "Dwell Table serializada: ${pageData.size} bytes")
 
-        writeConfigPageVerified(pageNum = 12.toByte(), offset = 0, data = pageData, label = "Dwell Table")
+        writeOwnedConfigPage(12, 0, before, pageData, DwellTable.PAGE12_OWNED_OFFSETS, "Dwell Table")
         Logger.d(TAG, "Dwell Table enviada")
 
         delay(1000)

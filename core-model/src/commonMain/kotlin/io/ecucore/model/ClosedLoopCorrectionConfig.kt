@@ -42,6 +42,12 @@ object ClosedLoopCorrectionMapper {
     // na página 9 (192 bytes, 202402+); na página 6 os offsets 112/113 são iacCrankBins.
     const val PAGE_NUMBER = 6
     const val PAGE_SIZE = 128
+
+    /** Página 6: egoAlgorithm/egoType 0, egoKP 1, egoKI 2, egoKD 3, egoTemp 4, egoCount 5, egoLimit 7, AFR min/max 8..9, delay 10, RPM 11, TPS 12. */
+    val PAGE6_OWNED_OFFSETS: Set<Int> = setOf(0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
+
+    /** Página 9: egoMAPMax 112 e egoMAPMin 113 (202402+). */
+    val PAGE9_OWNED_OFFSETS: Set<Int> = setOf(112, 113)
     const val MAP_WINDOW_PAGE_NUMBER = 9
     const val MAP_WINDOW_PAGE_SIZE = 192
     const val STOICH_AFR = 14.7

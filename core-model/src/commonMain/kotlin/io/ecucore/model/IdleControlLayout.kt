@@ -25,6 +25,15 @@ data class IdleControlLayout(
     val clValues: Int,
     val bins: Int,
 ) {
+    /** Bytes da página que a tela de marcha lenta pode alterar (ver [IdleControlSettings.applyToPage]). */
+    val ownedOffsets: Set<Int> by lazy {
+        buildSet {
+            add(algorithm); add(fastTemp); add(stepHome); add(stepHyster); add(frequency)
+            pwmRun?.let { add(it) }
+            for (i in 0 until CURVE_POINTS) { add(clValues + i); add(bins + i) }
+        }
+    }
+
     companion object {
         const val CURVE_POINTS = 10
 

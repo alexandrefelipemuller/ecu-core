@@ -25,7 +25,22 @@ data class DwellTable(
         }
     }
 
+    /**
+     * Grava a tabela dwell SOBRE a página 12 lida da ECU e devolve uma cópia. A página guarda também a tabela WMI e a
+     * VVT2 (offsets 0..159): montar a página do zero (como [toByteArray]) as zeraria.
+     */
+    fun applyToPage(basePage: ByteArray): ByteArray {
+        require(basePage.size >= StorageFormat.PAGE_12_192.totalSize) { "Page 12 deve ter 192 bytes" }
+        val data = basePage.copyOf()
+        val table = serializePage12()
+        for (offset in PAGE12_OWNED_OFFSETS) data[offset] = table[offset]
+        return data
+    }
+
     companion object {
+        /** dwellTable 160..175 (4x4), rpmBinsDwell 176..179 e loadBinsDwell 180..183 (.ini 202201+). */
+        val PAGE12_OWNED_OFFSETS: Set<Int> = (160..183).toSet()
+
         private const val TAG = "DwellTable"
         private const val MAP_LOAD_SCALE = 2
         private const val TPS_LOAD_DIVISOR = 2
