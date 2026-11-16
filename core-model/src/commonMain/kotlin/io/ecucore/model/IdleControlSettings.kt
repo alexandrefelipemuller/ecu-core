@@ -1,7 +1,12 @@
 package io.ecucore.model
 
 /**
- * Simplified idle control settings for Speeduino page 4.
+ * Simplified idle control settings for Speeduino (firmware 202008+).
+ *
+ * Todos os campos moram na **página 6** do .ini (128 bytes): `idleFreq` 47, `iacPWMrun` 60 (bit 1),
+ * `iacCLValues` 64, `iacBins` 94 e `iacAlgorithm`/`iacStepTime`/`iacChannels`/`iacPWMdir` 116, `iacFastTemp` 117,
+ * `iacStepHome` 118, `iacStepHyster` 119. Antes da correção o código lia a página 4 (gatilho: o byte 60 é o
+ * `dfcoRPM`) e a 7 (boost/VVT) com esses mesmos offsets; no 201609 o layout é outro e a tela não se aplica.
  *
  * This intentionally exposes only the most useful basic fields:
  * control mode and the small set of PWM/Stepper knobs that are commonly
@@ -36,10 +41,14 @@ data class IdleControlSettings(
             controlMode == IdleControlMode.STEPPER_CLOSED_PLUS_OPEN_LOOP
 
     companion object {
-        const val PAGE_NUMBER: Int = 4
+        const val PAGE_NUMBER: Int = 6
         const val PAGE_LENGTH: Int = 128
-        const val TARGET_PAGE_NUMBER: Int = 7
-        const val TARGET_PAGE_LENGTH: Int = 240
+
+        @Deprecated("O RPM alvo e a curva estão na mesma página dos demais campos: use PAGE_NUMBER (6).", ReplaceWith("PAGE_NUMBER"))
+        const val TARGET_PAGE_NUMBER: Int = PAGE_NUMBER
+
+        @Deprecated("Use PAGE_LENGTH (128).", ReplaceWith("PAGE_LENGTH"))
+        const val TARGET_PAGE_LENGTH: Int = PAGE_LENGTH
 
         private const val OFFSET_IDLE_ALGORITHM = 116
         private const val OFFSET_IDLE_FAST_TEMP = 117
@@ -51,8 +60,9 @@ data class IdleControlSettings(
         private const val CL_IDLE_TARGET_COUNT = 10
         private const val OFFSET_IAC_BINS = 94
 
-        fun fromPage4(data: ByteArray): IdleControlSettings {
-            require(data.size >= PAGE_LENGTH) { "Page 4 deve ter 128 bytes" }
+        /** Lê tudo da página 6: modo, PWM/passo, RPM alvo (média) e a curva. */
+        fun fromPage(data: ByteArray): IdleControlSettings {
+            require(data.size >= PAGE_LENGTH) { "Page 6 deve ter 128 bytes" }
 
             val algorithmByte = data[OFFSET_IDLE_ALGORITHM].toInt() and 0xFF
             val controlMode = IdleControlMode.fromRaw(algorithmByte and 0x07)
@@ -68,7 +78,8 @@ data class IdleControlSettings(
 
             return IdleControlSettings(
                 controlMode = controlMode,
-                idleTargetRpm = 900,
+                idleTargetRpm = readTargetRpm(data),
+                idleTargetCurve = readTargetCurve(data),
                 fastIdleTempC = fastTempRaw - 40,
                 pwmChannels = channels,
                 idleValveFrequencyHz = idleFreqRaw * 2,
@@ -80,17 +91,23 @@ data class IdleControlSettings(
             )
         }
 
-        /** Lê a curva completa (10 pontos) da mesma página do RPM alvo. */
-        fun readTargetCurveFromPage7(data: ByteArray): IdleTargetCurve {
-            require(data.size >= TARGET_PAGE_LENGTH) { "Page 7 deve ter 240 bytes" }
+        @Deprecated("Lê a página 6 (não a 4).", ReplaceWith("fromPage(data)"))
+        fun fromPage4(data: ByteArray): IdleControlSettings = fromPage(data)
+
+        /** Lê a curva completa (10 pontos) da página 6. */
+        fun readTargetCurve(data: ByteArray): IdleTargetCurve {
+            require(data.size >= PAGE_LENGTH) { "Page 6 deve ter 128 bytes" }
             return IdleTargetCurve(
                 tempsC = (0 until CL_IDLE_TARGET_COUNT).map { (data[OFFSET_IAC_BINS + it].toInt() and 0xFF) - 40 },
                 rpm = (0 until CL_IDLE_TARGET_COUNT).map { (data[OFFSET_CL_IDLE_TARGET + it].toInt() and 0xFF) * 10 },
             )
         }
 
-        fun readTargetRpmFromPage7(data: ByteArray): Int {
-            require(data.size >= TARGET_PAGE_LENGTH) { "Page 7 deve ter 240 bytes" }
+        @Deprecated("Lê a página 6 (não a 7).", ReplaceWith("readTargetCurve(data)"))
+        fun readTargetCurveFromPage7(data: ByteArray): IdleTargetCurve = readTargetCurve(data)
+
+        fun readTargetRpm(data: ByteArray): Int {
+            require(data.size >= PAGE_LENGTH) { "Page 6 deve ter 128 bytes" }
 
             val rawValues = (0 until CL_IDLE_TARGET_COUNT).map { index ->
                 data[OFFSET_CL_IDLE_TARGET + index].toInt() and 0xFF
@@ -98,11 +115,21 @@ data class IdleControlSettings(
             val averageRaw = rawValues.average().toInt()
             return (averageRaw * 10).coerceIn(0, 2550)
         }
+
+        @Deprecated("Lê a página 6 (não a 7).", ReplaceWith("readTargetRpm(data)"))
+        fun readTargetRpmFromPage7(data: ByteArray): Int = readTargetRpm(data)
     }
 
-    fun applyToPage4(original: ByteArray): ByteArray {
-        require(original.size >= PAGE_LENGTH) { "Page 4 deve ter 128 bytes" }
+    /** Aplica TODOS os campos (modo, PWM/passo e o RPM alvo/curva) à página 6 e devolve uma cópia. */
+    fun applyToPage(original: ByteArray): ByteArray {
+        require(original.size >= PAGE_LENGTH) { "Page 6 deve ter 128 bytes" }
+        return applyTargetToPage(applyBasicToPage(original))
+    }
 
+    @Deprecated("Grava na página 6 (não na 4) e já inclui o RPM alvo.", ReplaceWith("applyToPage(original)"))
+    fun applyToPage4(original: ByteArray): ByteArray = applyToPage(original)
+
+    private fun applyBasicToPage(original: ByteArray): ByteArray {
         val data = original.copyOf()
         var algorithmByte = data[OFFSET_IDLE_ALGORITHM].toInt() and 0xFF
         algorithmByte = (algorithmByte and 0xF8) or (controlMode.rawValue and 0x07)
@@ -136,8 +163,11 @@ data class IdleControlSettings(
         return data
     }
 
-    fun applyTargetRpmToPage7(original: ByteArray): ByteArray {
-        require(original.size >= TARGET_PAGE_LENGTH) { "Page 7 deve ter 240 bytes" }
+    @Deprecated("Grava na página 6 (não na 7).", ReplaceWith("applyToPage(original)"))
+    fun applyTargetRpmToPage7(original: ByteArray): ByteArray = applyTargetToPage(original)
+
+    private fun applyTargetToPage(original: ByteArray): ByteArray {
+        require(original.size >= PAGE_LENGTH) { "Page 6 deve ter 128 bytes" }
 
         val data = original.copyOf()
         val curve = idleTargetCurve

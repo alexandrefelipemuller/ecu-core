@@ -1652,35 +1652,41 @@ class EcuClient(
         return info.signature
     }
 
-    /**
-     * Lê as configurações básicas de controle de marcha lenta do Speeduino.
-     */
-    override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
+    /** A marcha lenta simplificada segue o .ini do 202008+ (página 6); o 201609 tem outro layout. */
+    private fun requireIdleSupported(operation: String) {
         if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
             throw UnsupportedOperationException("Simplified idle control is available only for Speeduino")
         }
-        val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
-        val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
-        IdleControlSettings.fromPage4(basePage).copy(
-            idleTargetRpm = IdleControlSettings.readTargetRpmFromPage7(targetPage),
-            idleTargetCurve = IdleControlSettings.readTargetCurveFromPage7(targetPage),
+        val era = firmwareInfo?.era
+        if (era != null && !era.isModern()) {
+            throw UnsupportedOperationException("$operation: idle control needs Speeduino 202008 or newer (layout of $era differs)")
+        }
+    }
+
+    /**
+     * Lê as configurações de controle de marcha lenta do Speeduino (página 6: modo, PWM/passo, RPM alvo e curva).
+     */
+    override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
+        requireIdleSupported("readIdleControlSettings")
+        IdleControlSettings.fromPage(
+            readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
         )
     }
 
     /**
-     * Grava as configurações básicas de controle de marcha lenta no Speeduino.
+     * Grava as configurações de marcha lenta no Speeduino: lê a página 6, troca só os campos de marcha lenta
+     * e grava a página uma vez (as demais páginas não são tocadas).
      */
     override suspend fun writeIdleControlSettings(settings: IdleControlSettings, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeIdleControlSettings")
-        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
-            throw UnsupportedOperationException("Simplified idle control is available only for Speeduino")
-        }
-        val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
-        val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
-        val page4Data = settings.applyToPage4(basePage)
-        val page7Data = settings.applyTargetRpmToPage7(targetPage)
-        writeConfigPageVerified(IdleControlSettings.PAGE_NUMBER.toByte(), 0, page4Data, "Idle Control (Page 4)")
-        writeConfigPageVerified(IdleControlSettings.TARGET_PAGE_NUMBER.toByte(), 0, page7Data, "Idle Target (Page 7)")
+        requireIdleSupported("writeIdleControlSettings")
+        val page = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
+        writeConfigPageVerified(
+            IdleControlSettings.PAGE_NUMBER.toByte(),
+            0,
+            settings.applyToPage(page),
+            "Idle Control (Page 6)",
+        )
         if (burn) {
             delay(300)
             protocol.burnConfig()

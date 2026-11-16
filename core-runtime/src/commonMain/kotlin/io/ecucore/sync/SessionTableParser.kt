@@ -284,15 +284,8 @@ object SessionTableParser {
     ): IdleControlSettings? {
         if (ecuFamily != EcuFamily.SPEEDUINO) return null
 
-        val page4 = pages[IdleControlSettings.PAGE_NUMBER] ?: return null
-        val baseSettings = IdleControlSettings.fromPage4(page4)
-        val targetRpm = pages[IdleControlSettings.TARGET_PAGE_NUMBER]
-            ?.let(IdleControlSettings::readTargetRpmFromPage7)
-            ?: baseSettings.idleTargetRpm
-
-        val curve = pages[IdleControlSettings.TARGET_PAGE_NUMBER]?.let(IdleControlSettings::readTargetCurveFromPage7)
-
-        return baseSettings.copy(idleTargetRpm = targetRpm, idleTargetCurve = curve)
+        val page = pages[IdleControlSettings.PAGE_NUMBER] ?: return null
+        return IdleControlSettings.fromPage(page)
     }
 
     fun parseEngineProtectionConfig(
