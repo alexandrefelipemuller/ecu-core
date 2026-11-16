@@ -59,6 +59,7 @@ import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.IgnitionTable
 import io.ecucore.model.AfrTable
 import io.ecucore.model.DwellTable
+import io.ecucore.model.IdleControlLayout
 import io.ecucore.model.IdleControlSettings
 import io.ecucore.model.Ms3TableDefinitions
 import io.ecucore.model.PressureCalibration
@@ -1668,9 +1669,18 @@ class EcuClient(
      */
     override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
         requireIdleSupported("readIdleControlSettings")
+        val layout = idleLayout()
         IdleControlSettings.fromPage(
-            readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
+            readPage(pageNum = layout.page, offset = 0, length = layout.pageLength),
+            layout,
         )
+    }
+
+    /** Página e offsets da marcha lenta vêm do .ini do firmware conectado; sem .ini, vale o layout 202008+. */
+    private fun idleLayout(): IdleControlLayout {
+        val definition = activeIniDefinition ?: return IdleControlLayout.DEFAULT
+        return IdleControlLayout.fromIni(definition)
+            ?: throw UnsupportedOperationException("O .ini ${definition.sourceName} não define os campos de marcha lenta do Speeduino")
     }
 
     /**
@@ -1680,12 +1690,13 @@ class EcuClient(
     override suspend fun writeIdleControlSettings(settings: IdleControlSettings, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeIdleControlSettings")
         requireIdleSupported("writeIdleControlSettings")
-        val page = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
+        val layout = idleLayout()
+        val page = readPage(pageNum = layout.page, offset = 0, length = layout.pageLength)
         writeConfigPageVerified(
-            IdleControlSettings.PAGE_NUMBER.toByte(),
+            layout.page.toByte(),
             0,
-            settings.applyToPage(page),
-            "Idle Control (Page 6)",
+            settings.applyToPage(page, layout),
+            "Idle Control (Page ${layout.page})",
         )
         if (burn) {
             delay(300)
