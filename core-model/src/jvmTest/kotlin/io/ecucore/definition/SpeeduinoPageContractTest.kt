@@ -1,5 +1,6 @@
 package io.ecucore.definition
 
+import io.ecucore.model.BatteryCorrectionLayout
 import io.ecucore.model.ClosedLoopCorrectionMapper
 import io.ecucore.model.EngineProtectionMapper
 import io.ecucore.model.IdleControlLayout
@@ -231,20 +232,14 @@ class SpeeduinoPageContractTest {
     /** O antifurto só vale do 202207 em diante (usa hardRevLim/hardRevMode); antes disso a tela não se aplica. */
     @Test fun antiTheft() = assertContract("Antifurto", allFirmwares.filter { version(it) >= 202207 }.flatMap { check(it, antiTheft) })
 
-    /**
-     * DIVERGÊNCIA CONHECIDA (ainda não corrigida): `EngineConstants` lê e grava `batteryVoltageBins` (offset 15) e
-     * `injectorVoltageCorrectionRates` (offset 21) na PÁGINA 1, mas o .ini os põe na PÁGINA 6 (`brvBins`, `injBatRates`).
-     * Na página 1 esses offsets são `pinLayout`, `tachoPin`, `tachoDuration`, `maeThresh`, `taeThresh`, `aeTime`,
-     * `taeMinChange`... Este teste fixa o que o .ini diz; quando o código for corrigido, troque por `Expect` em `engineConstants`.
-     */
-    @Test fun knownDivergence_batteryCorrectionLivesOnPage6() {
+    /** `brvBins`/`injBatRates` (correção de bateria): página 6 do .ini, resolvida por [BatteryCorrectionLayout]. */
+    @Test fun batteryCorrectionLayoutResolvedFromIni() {
         for (fw in allFirmwares) {
-            val ini = load(fw)
-            for (name in listOf("brvBins", "injBatRates")) {
-                val pages = ini.fields.filter { it.name == name }.map { it.page }.toSet()
-                kotlin.test.assertEquals(setOf(6), pages, "$fw: $name deveria estar só na página 6 do .ini")
-            }
+            val layout = checkNotNull(BatteryCorrectionLayout.fromIni(load(fw))) { "$fw: layout da correção de bateria não resolvido" }
+            kotlin.test.assertEquals(BatteryCorrectionLayout.DEFAULT, layout, fw)
         }
+        // O 201609 também define os campos (página 6, 64 bytes), mas a tela de constantes é bloqueada nele.
+        kotlin.test.assertEquals(64, BatteryCorrectionLayout.fromIni(load("speeduino_201609"))?.pageLength)
     }
 
     /**

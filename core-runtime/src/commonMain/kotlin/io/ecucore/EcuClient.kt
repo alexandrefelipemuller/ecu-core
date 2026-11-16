@@ -23,6 +23,7 @@ import io.ecucore.model.FirmwareEra
 import io.ecucore.model.EcuAntiTheft
 import io.ecucore.model.MegaSpeedAntiTheft
 import io.ecucore.model.SpeeduinoAntiTheft
+import io.ecucore.model.BatteryCorrectionLayout
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.Algorithm
 import io.ecucore.model.EcuCapabilities
@@ -1506,12 +1507,33 @@ class EcuClient(
                 val pageData = readPage(pageNum = 1, offset = 0, length = 128)
                 Logger.d(TAG, "Page 1 recebida: ${pageData.size} bytes")
                 pinLayoutInfo = PinLayoutDetector.fromPage1(pageData)
-                EngineConstants.fromPage1(pageData)
+                withBatteryCorrection(EngineConstants.fromPage1(pageData))
             }
         }
 
         cachedEngineConstants = constants
         return constants
+    }
+
+    /** `brvBins`/`injBatRates` ficam na página 6 do .ini (não na 1); sem .ini vale o layout 202008+. */
+    private fun batteryCorrectionLayout(): BatteryCorrectionLayout? {
+        val definition = activeIniDefinition ?: return BatteryCorrectionLayout.DEFAULT
+        return BatteryCorrectionLayout.fromIni(definition)
+    }
+
+    /**
+     * Completa [constants] com a correção de tensão de bateria. Falha na leitura da página 6 não pode derrubar as
+     * constantes do motor: os campos ficam nos valores padrão, `batteryCorrectionLoaded` fica falso e a gravação
+     * posterior não os envia.
+     */
+    private suspend fun withBatteryCorrection(constants: EngineConstants): EngineConstants {
+        val layout = batteryCorrectionLayout() ?: return constants
+        return runCatching {
+            constants.withBatteryCorrection(readPage(pageNum = layout.page, offset = 0, length = layout.pageLength), layout)
+        }.getOrElse {
+            Logger.w(TAG, "Correção de bateria (página ${layout.page}) indisponível: ${it.message}")
+            constants
+        }
     }
 
     /**
@@ -2792,6 +2814,19 @@ class EcuClient(
             // Write to ECU
             writeConfigPageVerified(pageNum = 1, offset = 0, data = pageData, label = "Engine Constants (Page 1)")
             Logger.d(TAG, "Page 1 gravada com sucesso")
+
+            // Correção de bateria mora na página 6: só vai se veio da ECU (batteryCorrectionLoaded) e só se algum
+            // byte mudou; o resto da página 6 não é tocado.
+            if (!engineConstants.batteryCorrectionLoaded) {
+                Logger.d(TAG, "Correção de bateria não foi lida da ECU: página 6 não é gravada")
+            }
+            batteryCorrectionLayout()?.takeIf { engineConstants.batteryCorrectionLoaded }?.let { layout ->
+                val page = readPage(pageNum = layout.page, offset = 0, length = layout.pageLength)
+                val updated = engineConstants.applyBatteryCorrectionToPage(page, layout)
+                if (!updated.contentEquals(page)) {
+                    writeConfigPageVerified(pageNum = layout.page.toByte(), offset = 0, data = updated, label = "Battery Correction (Page ${layout.page})")
+                }
+            }
 
             // Burn to EEPROM
             protocol.burnConfig()

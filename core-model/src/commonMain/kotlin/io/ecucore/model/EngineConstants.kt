@@ -28,6 +28,11 @@ data class EngineConstants(
     val injectorBatteryCorrectionMode: InjectorBatteryCorrectionMode = InjectorBatteryCorrectionMode.OPEN_TIME_ONLY, // Offset 3 bit 2
     val batteryVoltageBins: List<Float> = DEFAULT_BATTERY_VOLTAGE_BINS,
     val injectorVoltageCorrectionRates: List<Int> = DEFAULT_INJECTOR_VOLTAGE_RATES,
+    /**
+     * `true` quando [batteryVoltageBins]/[injectorVoltageCorrectionRates] vieram da ECU (página 6 do .ini).
+     * Sem isso são valores padrão e a gravação NÃO os envia, para não sobrescrever a correção que a ECU já tem.
+     */
+    val batteryCorrectionLoaded: Boolean = false,
 
     // Board & Advanced Settings
     val boardLayout: String = "Speeduino v0.4", // Not in page 1, using default
@@ -49,12 +54,6 @@ data class EngineConstants(
         /**
          * Parse Page 1 (128 bytes) into EngineConstants
          */
-        private const val BATTERY_BINS_OFFSET = 15
-        private const val VOLTAGE_RATES_OFFSET = 21
-
-        /** Pin layout (15), reqFuel (24), divider (25) e config de staging (26). */
-        private val SHARED_OFFSETS = setOf(15, 24, 25, 26)
-
         fun fromPage1(data: ByteArray): EngineConstants {
             require(data.size >= 128) { "Page 1 deve ter 128 bytes" }
             val pinLayoutInfo = PinLayoutDetector.fromPage1(data)
@@ -64,23 +63,6 @@ data class EngineConstants(
             } else {
                 InjectorBatteryCorrectionMode.WHOLE_PULSE
             }
-            // Os offsets 15, 24, 25 e 26 pertencem a outros campos (pin layout, reqFuel, divider e
-            // config de staging); as entradas que cairiam neles ficam no valor padrão.
-            val batteryVoltageBins = List(6) { index ->
-                if (BATTERY_BINS_OFFSET + index in SHARED_OFFSETS) {
-                    DEFAULT_BATTERY_VOLTAGE_BINS[index]
-                } else {
-                    (data[BATTERY_BINS_OFFSET + index].toInt() and 0xFF) * 0.1f
-                }
-            }
-            val injectorVoltageCorrectionRates = List(6) { index ->
-                if (VOLTAGE_RATES_OFFSET + index in SHARED_OFFSETS) {
-                    DEFAULT_INJECTOR_VOLTAGE_RATES[index]
-                } else {
-                    data[VOLTAGE_RATES_OFFSET + index].toInt() and 0xFF
-                }
-            }
-
             // Offset 24: reqFuel (U08, scale 0.1)
             val reqFuel = (data[24].toInt() and 0xFF) * 0.1f
 
@@ -142,8 +124,6 @@ data class EngineConstants(
                 ignitionFixedTimingEnabled = fixAngEnable,
                 ignitionPerToothEnabled = perToothIgnitionEnabled,
                 injectorBatteryCorrectionMode = injectorBatteryCorrectionMode,
-                batteryVoltageBins = batteryVoltageBins,
-                injectorVoltageCorrectionRates = injectorVoltageCorrectionRates,
                 boardLayout = pinLayoutInfo.name ?: "Speeduino v0.4",
                 stoichiometricRatio = stoich,
                 mapSampleMethod = MapSampleMethod.fromBits(mapSample),
@@ -495,6 +475,31 @@ data class EngineConstants(
     }
 
     /**
+     * Devolve uma cópia com a correção de bateria lida da página [BatteryCorrectionLayout.page] (6): não mora na página 1.
+     */
+    fun withBatteryCorrection(page: ByteArray, layout: BatteryCorrectionLayout = BatteryCorrectionLayout.DEFAULT): EngineConstants {
+        require(page.size >= layout.pageLength) { "Page ${layout.page} deve ter ${layout.pageLength} bytes" }
+        return copy(
+            batteryCorrectionLoaded = true,
+            batteryVoltageBins = List(BatteryCorrectionLayout.POINTS) { (page[layout.binsOffset + it].toInt() and 0xFF) * 0.1f },
+            injectorVoltageCorrectionRates = List(BatteryCorrectionLayout.POINTS) { page[layout.ratesOffset + it].toInt() and 0xFF },
+        )
+    }
+
+    /** Grava só `brvBins`/`injBatRates` sobre [basePage] (página 6) e devolve uma cópia; o resto da página fica intacto. */
+    fun applyBatteryCorrectionToPage(basePage: ByteArray, layout: BatteryCorrectionLayout = BatteryCorrectionLayout.DEFAULT): ByteArray {
+        require(basePage.size >= layout.pageLength) { "Page ${layout.page} deve ter ${layout.pageLength} bytes" }
+        val data = basePage.copyOf()
+        repeat(BatteryCorrectionLayout.POINTS) { index ->
+            val volts = batteryVoltageBins.getOrElse(index) { DEFAULT_BATTERY_VOLTAGE_BINS[index] }
+            data[layout.binsOffset + index] = Math.round(volts / 0.1f).coerceIn(0, 255).toByte()
+            val rate = injectorVoltageCorrectionRates.getOrElse(index) { DEFAULT_INJECTOR_VOLTAGE_RATES[index] }
+            data[layout.ratesOffset + index] = rate.coerceIn(0, 255).toByte()
+        }
+        return data
+    }
+
+    /**
      * Apply EngineConstants changes on top of an existing Page 1 buffer.
      * This avoids zeroing unrelated settings stored in the same page.
      */
@@ -508,22 +513,6 @@ data class EngineConstants(
         data[3] = when (injectorBatteryCorrectionMode) {
             InjectorBatteryCorrectionMode.WHOLE_PULSE -> (correctionModeBase and 0xFB).toByte()
             InjectorBatteryCorrectionMode.OPEN_TIME_ONLY -> (correctionModeBase or 0x04).toByte()
-        }
-
-        // Offsets 15-20: battery voltage bins (U08, scale 0.1) e 21-26: taxas de correção (U08).
-        // Entradas que cairiam em offsets de outros campos (pin layout, reqFuel, divider, config
-        // de staging) não são gravadas: esses campos têm dono e preservam bits não modelados.
-        repeat(6) { index ->
-            val offset = BATTERY_BINS_OFFSET + index
-            if (offset in SHARED_OFFSETS) return@repeat
-            val value = batteryVoltageBins.getOrElse(index) { DEFAULT_BATTERY_VOLTAGE_BINS[index] }
-            data[offset] = (value / 0.1f).toInt().coerceIn(0, 255).toByte()
-        }
-        repeat(6) { index ->
-            val offset = VOLTAGE_RATES_OFFSET + index
-            if (offset in SHARED_OFFSETS) return@repeat
-            val value = injectorVoltageCorrectionRates.getOrElse(index) { DEFAULT_INJECTOR_VOLTAGE_RATES[index] }
-            data[offset] = value.coerceIn(0, 255).toByte()
         }
 
         // Offset 24: reqFuel (U08, scale 0.1)
