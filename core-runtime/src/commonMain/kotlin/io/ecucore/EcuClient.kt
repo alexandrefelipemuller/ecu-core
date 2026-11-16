@@ -1501,6 +1501,7 @@ class EcuClient(
             }
 
             else -> {
+                requireModernPageLayout("readEngineConstants")
                 Logger.d(TAG, "Lendo Engine Constants (Page 1)...")
                 val pageData = readPage(pageNum = 1, offset = 0, length = 128)
                 Logger.d(TAG, "Page 1 recebida: ${pageData.size} bytes")
@@ -1517,6 +1518,7 @@ class EcuClient(
      * Lê calibração de pressão (MAP/Baro/EMAP) em Page 1.
      */
     override suspend fun readPressureCalibration(): PressureCalibration = withContext(Dispatchers.IO) {
+        requireModernPageLayout("readPressureCalibration")
         val pageData = readPage(pageNum = 1, offset = 0, length = 128)
         PressureCalibration(
             mapMin = readS8(pageData, 46),
@@ -1534,6 +1536,7 @@ class EcuClient(
     override suspend fun writePressureCalibration(calibration: PressureCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writePressureCalibration")
         requireSpeeduinoLayout("writePressureCalibration")
+        requireModernPageLayout("writePressureCalibration")
         ConfigValidator.requireValid(ConfigValidator.validatePressureCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeS8(basePage, 46, calibration.mapMin)
@@ -1560,6 +1563,7 @@ class EcuClient(
             val raw = withEcuIo { protocol.readTable(MS2_TPS_TABLE.toInt(), MS2_TPS_MIN_OFFSET, MS2_TPS_BYTES, EcuFamily.MS2) }
             return@withContext decodeMs2TpsCalibration(raw)
         }
+        requireModernPageLayout("readTpsCalibration")
         val pageData = readPage(pageNum = 1, offset = 0, length = 128)
         TpsCalibration(
             tpsMin = readU8(pageData, 44),
@@ -1586,6 +1590,7 @@ class EcuClient(
             return@withContext
         }
         requireSpeeduinoLayout("writeTpsCalibration")
+        requireModernPageLayout("writeTpsCalibration")
         ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
         val basePage = readPage(pageNum = 1, offset = 0, length = 128)
         writeU8(basePage, 44, calibration.tpsMin)
@@ -1737,6 +1742,7 @@ class EcuClient(
             return TriggerSettings.fromMs2PageData(pageData)
         }
 
+        requireModernPageLayout("readTriggerSettings")
         Logger.d(TAG, "Lendo Trigger Settings (Page 4)...")
         val pageData = readPage(
             pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
@@ -2331,6 +2337,7 @@ class EcuClient(
      * Lê configuração do Secondary Serial (Page 9, offset 0)
      */
     override suspend fun readSecondarySerialConfig(): SecondarySerialConfig = withContext(Dispatchers.IO) {
+        requireModernPageLayout("readSecondarySerialConfig")
         Logger.d(TAG, "Lendo Secondary Serial Config (Page 9)...")
         val data = readPage(
             pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
@@ -2506,6 +2513,7 @@ class EcuClient(
      */
     override suspend fun writeTriggerSettings(settings: TriggerSettings, burn: Boolean) {
         ensureWritable("writeTriggerSettings")
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) requireModernPageLayout("writeTriggerSettings")
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("rusEFI Trigger Settings are not mapped in this version")
         }
@@ -2565,6 +2573,7 @@ class EcuClient(
     override suspend fun writeSecondarySerialConfig(config: SecondarySerialConfig, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeSecondarySerialConfig")
         requireSpeeduinoLayout("writeSecondarySerialConfig")
+        requireModernPageLayout("writeSecondarySerialConfig")
         Logger.d(TAG, "Gravando Secondary Serial Config (Page 9)...")
         val baseData = readPage(
             pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
@@ -2739,6 +2748,7 @@ class EcuClient(
             throw UnsupportedOperationException("Dwell Table only supported on Speeduino")
         }
         val loadType = resolveIgnitionLoadType()
+        requireDwellTableSupported("readDwellTable")
         Logger.d(TAG, "Lendo Dwell Table (Page 12, 192 bytes)...")
         val pageData = readPage(
             pageNum = 12,
@@ -2771,6 +2781,7 @@ class EcuClient(
             )
             Logger.d(TAG, "Page 0x04 gravada com sucesso")
         } else {
+            requireModernPageLayout("writeEngineConstants")
             Logger.d(TAG, "Gravando Engine Constants (Page 1)...")
 
             // Preserve existing settings on Page 1 and update only known fields
@@ -3238,6 +3249,7 @@ class EcuClient(
         if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
             throw UnsupportedOperationException("Dwell Table only supported on Speeduino")
         }
+        requireDwellTableSupported("writeDwellTable")
         Logger.d(TAG, "Gravando Dwell Table (Page 12)...")
 
         val pageData = dwellTable.toByteArray()
@@ -4668,6 +4680,24 @@ class EcuClient(
     }
 
     /** Estas páginas usam o layout do Speeduino; gravar em MS/rusEFI escreveria em tabelas erradas. */
+    /**
+     * No Speeduino 201609 a página 1 é a tabela VE (as constantes do motor, calibração de TPS e pressão ficam na
+     * página 2, que tem 64 bytes, e a trigger/serial secundária têm outro layout). Ler ou gravar esses campos pela
+     * página 1 devolveria lixo e a gravação corromperia a VE. Do 202008 em diante o layout é o de página 1.
+     */
+    private fun requireModernPageLayout(operation: String) {
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO && firmwareInfo?.era == FirmwareEra.LEGACY) {
+            throw UnsupportedOperationException("$operation: Speeduino 201609 usa outro layout de páginas (necessário 202008 ou mais novo)")
+        }
+    }
+
+    private fun requireDwellTableSupported(operation: String) {
+        val era = firmwareInfo?.era
+        if (era != null && !era.hasDwellTable()) {
+            throw UnsupportedOperationException("$operation: a tabela de dwell existe a partir do Speeduino 202201 (firmware $era)")
+        }
+    }
+
     private fun requireSpeeduinoLayout(operation: String) {
         when (firmwareInfo?.family) {
             EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI ->
