@@ -123,6 +123,10 @@ class ConfigValidatorTest {
         assertFalse(ConfigValidator.validatePressureCalibration(PressureCalibration(10, 5, 10, 260, 0, 0)).isValid)
         assertFalse(ConfigValidator.validatePressureCalibration(PressureCalibration(-101, 260, 10, 260, 0, 0)).isValid)
         assertFalse(ConfigValidator.validatePressureCalibration(PressureCalibration(10, 260, 10, 260, 50, 40)).isValid)
+        // EMAP com EEPROM não inicializada (0xFF/0xFFFF) = sensor ausente, não erro
+        assertTrue(ConfigValidator.validatePressureCalibration(PressureCalibration(10, 260, 10, 260, -1, 65535)).isValid)
+        // mas um EMAP real com max fora da faixa continua inválido
+        assertFalse(ConfigValidator.validatePressureCalibration(PressureCalibration(10, 260, 10, 260, 10, 65535)).isValid)
     }
 
     @Test
