@@ -2393,7 +2393,10 @@ class EcuClient(
             val page4 = readPage(EngineProtectionMapper.RPM_PAGE_NUMBER, 0, EngineProtectionMapper.RPM_PAGE_SIZE)
             val page9 = readPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 0, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE)
             val page10 = readPage(EngineProtectionMapper.OIL_PAGE_NUMBER, 0, EngineProtectionMapper.OIL_PAGE_SIZE)
-            EngineProtectionMapper.withExtendedPages(base, era, page1, page4, page9, page10)
+            EngineProtectionMapper.withExtendedPages(
+                base, era, page1, page4, page9, page10,
+                hasPage9 = EngineProtectionMapper.hasPage9Protection(era, activeIniDefinition),
+            )
         }.getOrElse {
             Logger.w(TAG, "Engine protection pages (1/4/9/10) unavailable: ${it.message}")
             base
@@ -2459,9 +2462,10 @@ class EcuClient(
             writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
                 EngineProtectionMapper.applyToPage4(it, config)
             }
-            if (EngineProtectionMapper.hasPage9Protection(era)) {
+            val hasPage9 = EngineProtectionMapper.hasPage9Protection(era, activeIniDefinition)
+            if (hasPage9) {
                 writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
-                    EngineProtectionMapper.applyToPage9(it, config, era)
+                    EngineProtectionMapper.applyToPage9(it, config, era, hasPage9)
                 }
             }
             writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, burn) {

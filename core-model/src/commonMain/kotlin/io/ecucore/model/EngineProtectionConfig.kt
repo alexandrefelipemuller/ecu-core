@@ -1,5 +1,7 @@
 package io.ecucore.model
 
+import io.ecucore.definition.IniDefinition
+
 enum class ProtectionCut {
     OFF,
     SPARK_ONLY,
@@ -101,8 +103,20 @@ object EngineProtectionMapper {
     private const val VALET_SOFT_RETARD_DEG = 15
     private const val VALET_SOFT_MAX_TIME = 20 // 2.0 s (0.1 s scale)
 
-    /** hardRevMode/afrProtectEnabled só existem na página 9 a partir do 202207 (era MODERN_2022 em diante). */
+    /**
+     * hardRevMode/afrProtectEnabled só existem na página 9 a partir do 202207. A era é grossa demais: 202201 e 202202
+     * caem na mesma era do 202207 (MODERN_2022) mas NÃO têm esses campos (nelas o offset é `unused`). Use a sobrecarga
+     * com o .ini sempre que ele estiver carregado; esta serve só de reserva sem .ini.
+     */
     fun hasPage9Protection(era: FirmwareEra): Boolean = era.isModern() && era != FirmwareEra.MODERN_2020
+
+    /** Decide pelo .ini do firmware conectado (fonte da verdade); sem .ini, pela era. */
+    fun hasPage9Protection(era: FirmwareEra, definition: IniDefinition?): Boolean {
+        if (definition == null) return hasPage9Protection(era)
+        return definition.fields.any {
+            it.name == "hardRevMode" && it.page == HARD_REV_MODE_PAGE_NUMBER && it.offset == HARD_REV_MODE_OFFSET
+        }
+    }
 
     /** Campos da página 6 (cut type e boost cut). O resto vem de [withExtendedPages]. */
     fun fromPage(page: ByteArray, @Suppress("UNUSED_PARAMETER") era: FirmwareEra): EngineProtectionConfig {
@@ -133,9 +147,10 @@ object EngineProtectionMapper {
         page4: ByteArray,
         page9: ByteArray,
         page10: ByteArray,
+        hasPage9: Boolean = hasPage9Protection(era),
     ): EngineProtectionConfig {
-        val hardRevMode = if (hasPage9Protection(era)) readBits(page9, HARD_REV_MODE_OFFSET, 0, 2) else 0
-        val afrMode = if (hasPage9Protection(era)) readBits(page9, AFR_PROTECT_ENABLED_OFFSET, 0, 2) else 0
+        val hardRevMode = if (hasPage9) readBits(page9, HARD_REV_MODE_OFFSET, 0, 2) else 0
+        val afrMode = if (hasPage9) readBits(page9, AFR_PROTECT_ENABLED_OFFSET, 0, 2) else 0
         val oilEnable = readBits(page10, OIL_PRESSURE_FLAGS_OFFSET, 1, 1) == 1
         val oilProtect = readBits(page10, OIL_PRESSURE_FLAGS_OFFSET, 2, 1) == 1
         return base.copy(
@@ -191,9 +206,14 @@ object EngineProtectionMapper {
     }
 
     /** Página 9: hardRevMode (0 Off, 1 Fixed, 2 Coolant) e afrProtectEnabled (0 Off, 1 Fixed, 2 Table). */
-    fun applyToPage9(base: ByteArray, config: EngineProtectionConfig, era: FirmwareEra): ByteArray {
+    fun applyToPage9(
+        base: ByteArray,
+        config: EngineProtectionConfig,
+        era: FirmwareEra,
+        hasPage9: Boolean = hasPage9Protection(era),
+    ): ByteArray {
         val page = base.copyOf()
-        if (!hasPage9Protection(era)) return page
+        if (!hasPage9) return page
         val newMode = when {
             config.coolantProtectionEnabled -> 2
             config.hardRevLimitEnabled || config.revLimiterEnabled -> 1

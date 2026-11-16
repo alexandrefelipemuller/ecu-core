@@ -97,7 +97,7 @@ class SpeeduinoPageContractTest {
         Expect("SoftRevLim", EngineProtectionMapper.RPM_PAGE_NUMBER, 19),
         Expect("SoftLimRetard", EngineProtectionMapper.RPM_PAGE_NUMBER, 20),
         Expect("SoftLimMax", EngineProtectionMapper.RPM_PAGE_NUMBER, 21),
-        Expect("hardRevLim", EngineProtectionMapper.RPM_PAGE_NUMBER, 22, since = 202207),
+        Expect("hardRevLim", EngineProtectionMapper.RPM_PAGE_NUMBER, 22, alias = "HardRevLim"),
         Expect("engineProtectMaxRPM", EngineProtectionMapper.RPM_PAGE_NUMBER, 120),
         Expect("hardRevMode", EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 166, 0..1, since = 202207),
         Expect("afrProtectEnabled", EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 185, 0..1, since = 202207),
@@ -243,8 +243,9 @@ class SpeeduinoPageContractTest {
     }
 
     /**
-     * As "eras" do código decidem se a tela lê/grava um campo. Aqui a era tem de concordar com o que cada .ini
-     * realmente define; senão o app grava em bytes sem uso ou em outro campo.
+     * As "eras" do código decidem se a tela lê/grava um campo. Aqui a decisão tem de concordar com o que cada .ini
+     * realmente define; senão o app grava em bytes sem uso ou em outro campo. A proteção do motor decide pela presença
+     * do campo no .ini ativo (`hasPage9Protection(era, definition)`), porque a era é grossa demais (ver o teste abaixo).
      */
     @Test fun eraGatesAgreeWithTheIni() {
         val problems = mutableListOf<String>()
@@ -256,22 +257,26 @@ class SpeeduinoPageContractTest {
                 if (code != has(name)) problems += "$fw ($era): $label=$code mas o .ini ${if (has(name)) "define" else "não define"} $name"
             }
             gate("hasDwellTable", era.hasDwellTable(), "dwellTable")
-            gate("hasPage9Protection", EngineProtectionMapper.hasPage9Protection(era), "hardRevMode")
-            gate("hasPage9Protection(afr)", EngineProtectionMapper.hasPage9Protection(era), "afrProtectEnabled")
+            gate("hasPage9Protection(ini)", EngineProtectionMapper.hasPage9Protection(era, ini), "hardRevMode")
+            gate("hasPage9Protection(ini,afr)", EngineProtectionMapper.hasPage9Protection(era, ini), "afrProtectEnabled")
             gate("hasMapWindowPage", ClosedLoopCorrectionMapper.hasMapWindowPage(era), "egoMAPMax")
         }
-        // DIVERGÊNCIA CONHECIDA (não corrigida): 202201 e 202202 caem na mesma era do 202207 (MODERN_2022), mas só o 202207
-        // define hardRevMode/afrProtectEnabled (p9@166/185) e hardRevLim (p4@22); nas duas primeiras esses bytes são `unused`.
-        // A tela de proteção mostra/grava valores sem significado nessas duas versões. Corrigir exige decidir pela presença
-        // do campo no .ini ativo (ou por uma era mais fina). Quando for corrigido, este teste falha e `known` deve sair.
-        val known = setOf(202201, 202202).flatMap { v ->
-            listOf("speeduino_$v (MODERN_2022): hasPage9Protection=true mas o .ini não define hardRevMode",
-                "speeduino_$v (MODERN_2022): hasPage9Protection(afr)=true mas o .ini não define afrProtectEnabled")
-        }.toSet()
-        val unexpected = problems.filterNot { it in known }
-        val fixed = known.filterNot { it in problems }
-        if (unexpected.isNotEmpty()) fail("Era do código diverge do .ini:\n" + unexpected.joinToString("\n"))
-        if (fixed.isNotEmpty()) fail("Divergência conhecida foi corrigida; remova de `known`:\n" + fixed.joinToString("\n"))
+        if (problems.isNotEmpty()) fail("Decisão do código diverge do .ini:\n" + problems.joinToString("\n"))
+    }
+
+    /**
+     * Limite da reserva por era (usada só sem .ini carregado): 202201 e 202202 caem na mesma era do 202207, mas só o 202207
+     * define hardRevMode/afrProtectEnabled. Se este teste quebrar, a era ficou mais fina e a reserva pode ser simplificada.
+     */
+    @Test fun eraOnlyFallbackIsCoarseFor202201And202202() {
+        for (fw in allFirmwares) {
+            val ini = load(fw)
+            val era = io.ecucore.model.EcuTableDefinitions.detectFirmwareEra("speeduino ${version(fw)}")
+            val byEra = EngineProtectionMapper.hasPage9Protection(era)
+            val byIni = EngineProtectionMapper.hasPage9Protection(era, ini)
+            val expectedToDiffer = version(fw) in setOf(202201, 202202)
+            kotlin.test.assertEquals(expectedToDiffer, byEra != byIni, "$fw: era=$byEra ini=$byIni")
+        }
     }
 
     /**

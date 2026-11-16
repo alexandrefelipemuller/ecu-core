@@ -146,4 +146,22 @@ class EngineProtectionMapperTest {
         val p9 = EngineProtectionMapper.applyToPage9(ByteArray(192), valet, era)
         assertEquals(1, p9[166].toInt() and 0b11)
     }
+
+    // 202201/202202: a era é a do 202207, mas o .ini não define hardRevMode/afrProtectEnabled (p9@166/185 são `unused`).
+    @Test
+    fun `page 9 is neither read nor written when the firmware does not define its fields`() {
+        val cfg = config(hardEnabled = true, afr = true, coolant = true)
+        val dirty9 = ByteArray(192) { 0x2B }
+        val written = EngineProtectionMapper.applyToPage9(dirty9, cfg, era, hasPage9 = false)
+        assertContentEquals(dirty9, written, "página 9 não pode ser alterada sem hardRevMode/afrProtectEnabled")
+
+        val p9 = ByteArray(192).also { it[166] = 2; it[185] = 2 }
+        val parsed = EngineProtectionMapper.withExtendedPages(
+            EngineProtectionMapper.fromPage(ByteArray(128), era), era,
+            ByteArray(128), ByteArray(128), p9, ByteArray(192), hasPage9 = false,
+        )
+        assertFalse(parsed.coolantProtectionEnabled)
+        assertFalse(parsed.afrProtectionEnabled)
+        assertFalse(parsed.revLimiterEnabled)
+    }
 }
