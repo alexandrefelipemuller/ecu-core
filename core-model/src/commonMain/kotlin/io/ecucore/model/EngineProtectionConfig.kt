@@ -149,7 +149,14 @@ object EngineProtectionMapper {
         page10: ByteArray,
         hasPage9: Boolean = hasPage9Protection(era),
     ): EngineProtectionConfig {
-        val hardRevMode = if (hasPage9) readBits(page9, HARD_REV_MODE_OFFSET, 0, 2) else 0
+        // Sem hardRevMode (202008..202202) o limitador fixo não tem chave própria: engineProtection.ino `checkRevLimit` o
+        // aplica sempre que engineProtectType != Off (conferido nas tags 202008/202012/202201/202202 do firmware). Então o
+        // estado "limitador ligado" é o da proteção; antes ele aparecia desligado mesmo com o corte ativo. Mode 1 = Fixed.
+        val hardRevMode = when {
+            hasPage9 -> readBits(page9, HARD_REV_MODE_OFFSET, 0, 2)
+            base.engineProtectEnabled -> 1
+            else -> 0
+        }
         val afrMode = if (hasPage9) readBits(page9, AFR_PROTECT_ENABLED_OFFSET, 0, 2) else 0
         val oilEnable = readBits(page10, OIL_PRESSURE_FLAGS_OFFSET, 1, 1) == 1
         val oilProtect = readBits(page10, OIL_PRESSURE_FLAGS_OFFSET, 2, 1) == 1

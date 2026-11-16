@@ -164,4 +164,25 @@ class EngineProtectionMapperTest {
         assertFalse(parsed.afrProtectionEnabled)
         assertFalse(parsed.revLimiterEnabled)
     }
+
+    // 202008..202202: sem hardRevMode, o firmware aplica o HardRevLim sempre que engineProtectType != Off.
+    @Test
+    fun `without hardRevMode the fixed limiter follows the protection cut`() {
+        fun parse(protectType: Int): EngineProtectionConfig {
+            val p6 = ByteArray(128).also { it[0] = (protectType shl 6).toByte() }
+            val p4 = ByteArray(128).also { it[22] = 70; it[19] = 65 } // HardRevLim 7000, SoftRevLim 6500
+            return EngineProtectionMapper.withExtendedPages(
+                EngineProtectionMapper.fromPage(p6, FirmwareEra.MODERN_2020), FirmwareEra.MODERN_2020,
+                ByteArray(128), p4, ByteArray(192), ByteArray(192), hasPage9 = false,
+            )
+        }
+        val on = parse(protectType = 3) // Both
+        assertTrue(on.revLimiterEnabled)
+        assertTrue(on.hardRevLimitEnabled)
+        assertFalse(on.coolantProtectionEnabled)
+        assertEquals(7000, on.hardRevLimitRpm)
+        val off = parse(protectType = 0)
+        assertFalse(off.revLimiterEnabled)
+        assertFalse(off.hardRevLimitEnabled)
+    }
 }
