@@ -162,6 +162,7 @@ class Obd2Transport(
     private var optimizationJob: Job? = null
     private var streaming = false
     private var pollCycleCount = 0L
+    private val seenChannels = mutableSetOf<String>()
     private var connectedAtMs = 0L
     private var firmwareInfo: FirmwareInfo? = null
     private var currentFeatures: Set<Obd2OptimizationFeature> = emptySet()
@@ -242,6 +243,7 @@ class Obd2Transport(
             val promoteToPsa = shouldPromoteToPsa()
             connectedAtMs = MonotonicClock.nowMillis()
             pollCycleCount = 0L
+            seenChannels.clear()
             lastDataFingerprint = ""
             lastDataChangeAtMs = connectedAtMs
             perfWindowStartAtMs = connectedAtMs
@@ -467,6 +469,12 @@ class Obd2Transport(
         var advance: Int? = null
         var battery: Double? = null
         var o2AfrX10: Int? = null
+        var loadPct: Int? = null
+        var speedKph: Int? = null
+        var stftPct: Double? = null
+        var ltftPct: Double? = null
+        var o2UpVolts: Double? = null
+        var o2DownVolts: Double? = null
 
         if (currentFlags.multiPidExperimental && canUseExperimentalBatch()) {
             val batch = readPidBatchExperimental()
@@ -475,7 +483,7 @@ class Obd2Transport(
             map = batch["010B"]?.let { bytes -> bytes[0] }
             intake = batch["010F"]?.let { bytes -> bytes[0] - 40 }
             throttle = batch["0111"]?.let { bytes -> ((bytes[0] * 100.0) / 255.0).roundToInt() }
-            advance = batch["010E"]?.let { bytes -> bytes[0] - 64 }
+            advance = batch["010E"]?.let { bytes -> decodeTimingAdvanceDegrees(bytes[0]) }
             battery = batch["0142"]?.let { bytes ->
                 (((bytes[0] shl 8) or bytes[1]).toDouble() / 1000.0)
             }
@@ -499,7 +507,7 @@ class Obd2Transport(
             throttle = throttle ?: readPidAdaptiveIntValue("0111") { bytes -> ((bytes[0] * 100.0) / 255.0).roundToInt() }
         }
         if (shouldPoll("010E", MEDIUM_POLL_INTERVAL_CYCLES)) {
-            advance = advance ?: readPidAdaptiveIntValue("010E") { bytes -> bytes[0] - 64 }
+            advance = advance ?: readPidAdaptiveIntValue("010E") { bytes -> decodeTimingAdvanceDegrees(bytes[0]) }
         }
 
         if (shouldPoll("0142", SLOW_POLL_INTERVAL_CYCLES)) {
@@ -509,10 +517,10 @@ class Obd2Transport(
         }
 
         if (shouldPoll("0104", MEDIUM_POLL_INTERVAL_CYCLES)) {
-            readPidAdaptiveIntValue("0104") { bytes -> ((bytes[0] * 100.0) / 255.0).roundToInt() }
+            loadPct = readPidAdaptiveIntValue("0104") { bytes -> ((bytes[0] * 100.0) / 255.0).roundToInt() }
         }
         if (shouldPoll("010D", MEDIUM_POLL_INTERVAL_CYCLES)) {
-            readPidAdaptiveIntValue("010D") { bytes -> bytes[0] }
+            speedKph = readPidAdaptiveIntValue("010D") { bytes -> bytes[0] }
         }
         if (shouldPoll("0110", SLOW_POLL_INTERVAL_CYCLES)) {
             readPidAdaptiveDoubleValue("0110") { bytes ->
@@ -523,8 +531,8 @@ class Obd2Transport(
             readPidAdaptiveIntValue("012F") { bytes -> ((bytes[0] * 100.0) / 255.0).roundToInt() }
         }
         if (shouldPoll("0106", SLOW_POLL_INTERVAL_CYCLES)) {
-            readPidAdaptiveDoubleValue("0106") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
-            readPidAdaptiveDoubleValue("0107") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
+            stftPct = readPidAdaptiveDoubleValue("0106") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
+            ltftPct = readPidAdaptiveDoubleValue("0107") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
             readPidAdaptiveDoubleValue("0108") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
             readPidAdaptiveDoubleValue("0109") { bytes -> (bytes[0] - 128) * 100.0 / 128.0 }
         }
@@ -542,6 +550,15 @@ class Obd2Transport(
             }
         }
 
+        // Tensão das sondas O2 (PID 0x14/0x15 = A/200 V). O PID preferido de O2 já é lido
+        // acima para o AFR estimado, então não repetimos a mesma leitura.
+        if (preferredO2PidHex != "0114" && shouldPoll("0114", SLOW_POLL_INTERVAL_CYCLES)) {
+            o2UpVolts = readPidAdaptiveDoubleValue("0114") { bytes -> bytes[0] / 200.0 }
+        }
+        if (shouldPoll("0115", SLOW_POLL_INTERVAL_CYCLES)) {
+            o2DownVolts = readPidAdaptiveDoubleValue("0115") { bytes -> bytes[0] / 200.0 }
+        }
+
         rpm = rpm ?: readPidAdaptiveIntValue("010C") { bytes ->
             (((bytes[0] shl 8) or bytes[1]).toDouble() / 4.0).roundToInt()
         }
@@ -549,7 +566,18 @@ class Obd2Transport(
         map = map ?: readPidAdaptiveIntValue("010B") { bytes -> bytes[0] }
         intake = intake ?: readPidAdaptiveIntValue("010F") { bytes -> bytes[0] - 40 }
         throttle = throttle ?: readPidAdaptiveIntValue("0111") { bytes -> ((bytes[0] * 100.0) / 255.0).roundToInt() }
-        advance = advance ?: readPidAdaptiveIntValue("010E") { bytes -> bytes[0] - 64 }
+        advance = advance ?: readPidAdaptiveIntValue("010E") { bytes -> decodeTimingAdvanceDegrees(bytes[0]) }
+
+        battery?.let { seenChannels += "battery" }
+        advance?.let { seenChannels += "advance" }
+        (o2AfrX10 ?: o2UpVolts)?.let { seenChannels += "o2" }
+        // Só declara "indisponível" depois de dar tempo a todos os PIDs lentos (SLOW_POLL)
+        // de serem tentados pelo menos uma vez.
+        val unavailable = if (pollCycleCount > SLOW_POLL_INTERVAL_CYCLES * 2) {
+            setOf("battery", "advance", "o2") - seenChannels
+        } else {
+            emptySet()
+        }
 
         val updated = currentLiveData.copy(
             secl = ((MonotonicClock.nowMillis() - connectedAtMs) / 1000L).toInt(),
@@ -563,6 +591,13 @@ class Obd2Transport(
             o2 = o2AfrX10 ?: currentLiveData.o2,
             engineStatus = if ((rpm ?: currentLiveData.rpm) > 0) 0x01 else 0x00,
             sparkStatus = if ((rpm ?: currentLiveData.rpm) > 0) 0x01 else 0x00,
+            engineLoadPct = loadPct ?: currentLiveData.engineLoadPct,
+            candidateSpeedKph = speedKph ?: currentLiveData.candidateSpeedKph,
+            shortFuelTrimPct = stftPct ?: currentLiveData.shortFuelTrimPct,
+            longFuelTrimPct = ltftPct ?: currentLiveData.longFuelTrimPct,
+            o2UpstreamVolts = o2UpVolts ?: currentLiveData.o2UpstreamVolts,
+            o2DownstreamVolts = o2DownVolts ?: currentLiveData.o2DownstreamVolts,
+            unavailableChannels = unavailable,
         )
         currentLiveData = updated
         onDataReceived(updated)

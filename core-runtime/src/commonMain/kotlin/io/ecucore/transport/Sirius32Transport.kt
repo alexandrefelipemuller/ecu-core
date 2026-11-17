@@ -18,25 +18,34 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import io.ecucore.transport.EcuTransport
 
 /**
  * Transporte para a Siemens Sirius 32 (Renault Clio K4M).
  *
  * Fala o dialeto KWP2000 "cru" reconstruído por engenharia reversa do firmware
- * (ver `~/Downloads/siemens_sir32/diagnostico_obd.md` seção 6h): a central NÃO
- * implementa SAE J1979 (modo 01 é sempre rejeitado com `7F 01 12`), então este
- * transporte não pode delegar para [Obd2Transport] — ele fala diretamente os
- * serviços proprietários confirmados:
+ * (ver `~/Projects/centrais_oem/Sirius32/core/kline/README.md`): serviços proprietários
  *
  *   10 29        StartDiagnosticSession (única sessão aceita)
- *   23 6B        entra no modo estendido (leitura de memória/grupos)
+ *   23 6B        entra no modo estendido
  *   2A <id 16b>  lê um dos grupos do diretório mestre de diagnóstico
+ *   14 20 / 14 6F  limpa DTC (handshake de 2 passos)
  *
- * Só o grupo `0x0FAA` (RPM/carga/temperaturas) tem mapeamento de campo
- * confirmado com "alta confiança" na engenharia reversa; os demais 27 grupos
- * existem no binário mas o parâmetro exato do serviço 0x2A para acessá-los
- * ainda está em aberto.
+ * ATENÇÃO - evidências conflitantes: a captura de UM Clio K4M
+ * (`EcuManager/logs/device_obd2_investigation/obd2_investigation_2026-04-07_07-22-47_clio_k4m`)
+ * mostra a central respondendo SAE J1979 modo 01 e o ELM327 detectando
+ * "ISO 14230-4 (KWP 5BAUD)" (ATDPN = A4); mas relatos de usuários dizem que o OBD2
+ * genérico só mostra a tensão da bateria (que vem do próprio ELM, não da ECU). Por isso
+ * este transporte continua ANTES do OBD2 genérico na cadeia. Os serviços proprietários
+ * ainda NÃO foram validados em carro (a captura não tem nenhum SID 0x29/0x14/0x2A).
+ *
+ * Só o grupo `0x0FAA` (RPM/carga/temperaturas) tem mapeamento de campo confirmado com
+ * "alta confiança" na engenharia reversa.
+ *
+ * Concorrência: todo acesso ao adaptador passa por [ioMutex]; sequências de vários
+ * comandos (abrir sessão, limpar DTC) seguram o lock do começo ao fim.
  */
 class Sirius32Transport(
     private val connection: IEcuConnection,
@@ -49,27 +58,24 @@ class Sirius32Transport(
     companion object {
         private const val TAG = "Sirius32Transport"
         private const val COMMAND_TIMEOUT_MS = 1200L
+
+        /** O primeiro comando após ATSP4 dispara o init 5-baud (~4,3 s na captura real). */
+        private const val BUS_INIT_TIMEOUT_MS = 6000L
+        private const val ATZ_TIMEOUT_MS = 1800L
+
+        /** Falhas seguidas de leitura antes de considerar a sessão perdida. */
+        private const val SESSION_LOSS_THRESHOLD = 3
         private const val DEFAULT_BATTERY_VOLTAGE = 12.0
         private const val LIVE_DATA_TABLE_ID = "0FAA"
         private const val DTC_STATUS_TABLE_ID = "0893"
 
-        private val INIT_SEQUENCE = listOf(
-            "ATZ", "ATE0", "ATL0", "ATH0", "ATSP5",
-        )
-
         /**
-         * SID 0x2A, local ID 0x0893: única leitura de grupo confirmada por engenharia
-         * reversa que expõe os registradores de status de DTC (0xFDD8=confirmado /
-         * 0xFD36=pendente) - mas só a palavra 0 dos 5 pares de 16 bits reais. Ver
-         * SIRIUS32_DTC_TABLE em simulator/obd2_tcp_simulator.py para a tabela completa
-         * de 60 índices e o porquê só estes 3 têm grupo de leitura conhecido.
+         * ATSP4 = ISO 14230-4 (KWP, init 5-baud): é o protocolo que o ELM327 detectou
+         * (ATDPN = A4) na captura real do K4M. Antes era ATSP5 (fast init), sem evidência.
+         * ATAT1/ATST20 espelham a configuração que funcionou na captura.
          */
-        private data class DtcBit(val mask: Int, val code: String, val description: String)
-
-        private val WORD0_DTCS = listOf(
-            DtcBit(0x0400, "DF003", "Circuito do sensor de temperatura do ar (IAT)"),
-            DtcBit(0x0040, "DF045", "Circuito do sensor de pressão do coletor (MAP)"),
-            DtcBit(0x0002, "DF025", "Circuito do sensor de rotação/virabrequim (CKP)"),
+        private val INIT_SEQUENCE = listOf(
+            "ATE0", "ATL0", "ATH0", "ATS0", "ATSP4", "ATAT1", "ATST20",
         )
     }
 
@@ -81,6 +87,10 @@ class Sirius32Transport(
     private var connected = false
     @Volatile
     private var cachedFirmwareInfo: FirmwareInfo? = null
+    private val ioMutex = Mutex()
+    @Volatile
+    private var sessionOpen = false
+    private var consecutiveReadFailures = 0
 
     override suspend fun connect() {
         try {
@@ -94,17 +104,15 @@ class Sirius32Transport(
                 ),
             )
 
-            INIT_SEQUENCE.forEach { sendRaw(it) }
-
-            val sessionResponse = sendRaw("1029").uppercase()
-            if (!sessionResponse.contains("5029") && !sessionResponse.contains("50 29")) {
-                throw IllegalStateException("Sirius 32: KWP2000 session did not open (10 29 -> $sessionResponse)")
+            val atzResponse = ioMutex.withLock {
+                val atz = sendRawLocked("ATZ", ATZ_TIMEOUT_MS)
+                INIT_SEQUENCE.forEach { sendRawLocked(it) }
+                atz
             }
+            // ATZ já devolve a versão do ELM ("ELM327 v1.5"/"v2.1"); só registramos.
+            investigationRecorder?.info("adapter", "atz=${atzResponse.replace('\r', ' ').trim()}")
 
-            val extendedResponse = sendRaw("236B").uppercase()
-            if (!extendedResponse.contains("636B") && !extendedResponse.contains("63 6B")) {
-                throw IllegalStateException("Sirius 32: extended mode did not open (23 6B -> $extendedResponse)")
-            }
+            val (sessionResponse, extendedResponse) = ioMutex.withLock { openSessionLocked() }
 
             cachedFirmwareInfo = FirmwareInfo(
                 signature = "Siemens Sirius 32 (Renault Clio K4M) KWP2000",
@@ -121,6 +129,7 @@ class Sirius32Transport(
                 ),
             )
             connected = true
+            consecutiveReadFailures = 0
             onConnectionStateChanged(true)
             diagnosticsSink.log("sirius32", "connect", "session and extended mode confirmed")
             investigationRecorder?.info("connect", "sirius32 session=$sessionResponse extended=$extendedResponse")
@@ -136,6 +145,7 @@ class Sirius32Transport(
     override fun disconnect() {
         stopLiveDataStream()
         connected = false
+        sessionOpen = false
         cachedFirmwareInfo = null
         runCatching { connection.disconnect() }
         onConnectionStateChanged(false)
@@ -168,8 +178,11 @@ class Sirius32Transport(
     }
 
     override suspend fun pauseLiveDataStream(timeoutMs: Long) {
+        // Não reabre sessão aqui: um 10 29 repetido com a sessão já aberta é penalizado
+        // pelo firmware (soma no contador de erros 0xF739). A sessão só é reaberta quando
+        // [SESSION_LOSS_THRESHOLD] leituras seguidas falham.
         stopLiveDataStream()
-        runCatching { connection.clearInputBuffer() }
+        ioMutex.withLock { runCatching { connection.clearInputBuffer() } }
     }
 
     override suspend fun getFirmwareInfo(): String =
@@ -193,35 +206,61 @@ class Sirius32Transport(
      * SID 0x14: ClearDiagnosticInformation, handshake de 2 passos - 0x20 "arma" a
      * limpeza, só depois 0x6F executa (proteção contra apagar DTC por ruído na linha).
      * Sucesso confirma com "54" (0x6F) / "54 20" (arme); "7F 14 xx" é resposta negativa.
+     * Os dois passos seguram o lock juntos: um poll intercalado entre eles desarmaria.
      */
-    override suspend fun clearDtcCodes(): Boolean {
-        val armed = sendRaw("1420").uppercase().replace(" ", "")
-        if (!armed.contains("5420")) return false
-        val executed = sendRaw("146F").uppercase().replace(" ", "")
-        return executed.contains("54") && !executed.contains("7F14")
+    override suspend fun clearDtcCodes(): Boolean = ioMutex.withLock {
+        ensureSessionLocked()
+        val armed = sendRawLocked("1420").uppercase().replace(" ", "")
+        if (!armed.contains("5420")) {
+            if (armed.contains("7F1422")) sessionOpen = false
+            return@withLock false
+        }
+        val executed = sendRawLocked("146F").uppercase().replace(" ", "")
+        executed.contains("54") && !executed.contains("7F14")
     }
 
     private suspend fun readDtcCodesForStatus(status: DtcStatus): List<DtcCode> {
-        val words = readDtcStatusWords() ?: return emptyList()
+        val words = readDtcStatusWords()
         val word = if (status == DtcStatus.ACTIVE) words.first else words.second
-        return WORD0_DTCS
-            .filter { (word and it.mask) != 0 }
-            .map { DtcCode(code = it.code, description = it.description, status = status) }
+        return Sirius32Dtc.decodeWord0(word, status)
     }
 
-    private suspend fun readDtcStatusWords(): Pair<Int, Int>? {
-        val response = sendRaw("2A$DTC_STATUS_TABLE_ID")
-        val payload = parseGroupResponse(DTC_STATUS_TABLE_ID, response) ?: return null
-        if (payload.size < 4) return null
-        val confirmedWord = (payload[0] shl 8) or payload[1]
-        val pendingWord = (payload[2] shl 8) or payload[3]
-        return confirmedWord to pendingWord
+    /**
+     * Lê os registradores de status de DTC. Falha de leitura LANÇA exceção em vez de
+     * devolver lista vazia: "sem resposta" não pode ser exibido como "sem falhas".
+     * NRC 0x22 no 2A significa sessão fechada (firmware: sem 10 29 os SIDs respondem 22),
+     * então a sessão é marcada como perdida e reaberta na próxima operação.
+     */
+    private suspend fun readDtcStatusWords(): Pair<Int, Int> = ioMutex.withLock {
+        ensureSessionLocked()
+        val response = sendRawLocked("2A$DTC_STATUS_TABLE_ID")
+        val compact = response.uppercase().replace(" ", "")
+        val payload = parseGroupResponse(DTC_STATUS_TABLE_ID, response)
+        if (payload == null || payload.size < 4) {
+            if (compact.contains("7F2A22")) sessionOpen = false
+            val reason = when {
+                compact.contains("7F2A") -> "resposta negativa (${response.trim()})"
+                compact.isBlank() -> "sem resposta"
+                else -> "resposta inesperada (${response.trim()})"
+            }
+            throw IllegalStateException("Sirius 32: DTC read (2A $DTC_STATUS_TABLE_ID) failed: $reason")
+        }
+        ((payload[0] shl 8) or payload[1]) to ((payload[2] shl 8) or payload[3])
     }
 
     private suspend fun pollLiveDataOnce() {
-        val response = sendRaw("2A$LIVE_DATA_TABLE_ID")
-        val bytes = parseGroupResponse(LIVE_DATA_TABLE_ID, response) ?: return
-        if (bytes.size < 6) return
+        val bytes = ioMutex.withLock {
+            ensureSessionLocked()
+            val response = sendRawLocked("2A$LIVE_DATA_TABLE_ID")
+            val parsed = parseGroupResponse(LIVE_DATA_TABLE_ID, response)
+            if (parsed == null || parsed.size < 6) {
+                registerReadFailureLocked()
+                null
+            } else {
+                consecutiveReadFailures = 0
+                parsed
+            }
+        } ?: return
 
         val rpm = ((bytes[0] shl 8) or bytes[1]).coerceIn(0, 9000)
         val loadPct = bytes[2].coerceIn(0, 255) * 100 / 255
@@ -244,6 +283,37 @@ class Sirius32Transport(
         onDataReceived(sample)
     }
 
+    /** Abre sessão (10 29) e modo estendido (23 6B). Chamar com [ioMutex] preso. */
+    private suspend fun openSessionLocked(): Pair<String, String> {
+        val sessionResponse = sendRawLocked("1029", BUS_INIT_TIMEOUT_MS).uppercase()
+        if (!sessionResponse.contains("5029") && !sessionResponse.contains("50 29")) {
+            throw IllegalStateException("Sirius 32: KWP2000 session did not open (10 29 -> $sessionResponse)")
+        }
+        val extendedResponse = sendRawLocked("236B").uppercase()
+        if (!extendedResponse.contains("636B") && !extendedResponse.contains("63 6B")) {
+            throw IllegalStateException("Sirius 32: extended mode did not open (23 6B -> $extendedResponse)")
+        }
+        sessionOpen = true
+        consecutiveReadFailures = 0
+        return sessionResponse to extendedResponse
+    }
+
+    /** Reabre a sessão só se ela foi dada como perdida. Chamar com [ioMutex] preso. */
+    private suspend fun ensureSessionLocked() {
+        if (!sessionOpen) {
+            investigationRecorder?.info("session", "reabrindo sessão Sirius 32")
+            openSessionLocked()
+        }
+    }
+
+    private fun registerReadFailureLocked() {
+        consecutiveReadFailures++
+        if (consecutiveReadFailures >= SESSION_LOSS_THRESHOLD && sessionOpen) {
+            sessionOpen = false
+            investigationRecorder?.info("session", "sessão considerada perdida após $consecutiveReadFailures falhas")
+        }
+    }
+
     /**
      * Parseia a resposta positiva do serviço 0x2A: `6A <idHi> <idLo> <dados...>`.
      */
@@ -261,26 +331,34 @@ class Sirius32Transport(
         return bytes.drop(idx + 3)
     }
 
-    private suspend fun sendRaw(command: String): String {
+    /**
+     * Envia um comando ao ELM327 e espera o prompt `>`. Chamar com [ioMutex] preso.
+     * Cada leitura respeita o que resta do deadline do comando (receive(0) bloquearia
+     * até o timeout global da conexão, congelando o polling).
+     */
+    private suspend fun sendRawLocked(command: String, timeoutMs: Long = COMMAND_TIMEOUT_MS): String {
         val startedAt = MonotonicClock.nowMillis()
         return runCatching {
             connection.clearInputBuffer()
             connection.send("$command\r".encodeToByteArray())
-            val deadline = MonotonicClock.nowMillis() + COMMAND_TIMEOUT_MS
+            val deadline = startedAt + timeoutMs
             val builder = StringBuilder()
             while (MonotonicClock.nowMillis() < deadline) {
-                val chunk = connection.receive(0)
-                if (chunk.isEmpty()) continue
+                val remainingMs = (deadline - MonotonicClock.nowMillis()).coerceAtLeast(1L)
+                val chunk = runCatching {
+                    connection.readAvailable(maxBytes = 0, timeoutMs = remainingMs.toInt())
+                }.getOrNull()
+                if (chunk == null || chunk.isEmpty()) break
                 builder.append(chunk.decodeToString())
                 if (builder.contains(">")) break
             }
-            builder.toString().trim()
+            builder.toString().replace('\u0000', ' ').trim()
         }.onSuccess { response ->
             investigationRecorder?.recordCommand(
                 transport = "sirius32",
                 command = command,
                 response = response,
-                timeoutMs = COMMAND_TIMEOUT_MS,
+                timeoutMs = timeoutMs,
                 elapsedMs = MonotonicClock.nowMillis() - startedAt,
             )
         }.onFailure { error ->
