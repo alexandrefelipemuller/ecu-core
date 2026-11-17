@@ -1,7 +1,7 @@
 package io.ecucore.transport.sirius32
 
-import io.ecucore.SpeeduinoLiveData
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.EcuLiveData
+import io.ecucore.connection.IEcuConnection
 import io.ecucore.ecu.FirmwareInfo
 import io.ecucore.model.EcuCapabilities
 import io.ecucore.model.EcuFamily
@@ -56,8 +56,8 @@ interface Sirius32Diagnostics {
  * para fast init (ATSP5/ATFI) - mesma receita do perfil ISO do [io.ecucore.transport.RenaultTransport].
  */
 class Sirius32DdtTransport(
-    private val connection: ISpeeduinoConnection,
-    private val onDataReceived: (SpeeduinoLiveData) -> Unit,
+    private val connection: IEcuConnection,
+    private val onDataReceived: (EcuLiveData) -> Unit,
     private val onConnectionStateChanged: (Boolean) -> Unit,
     private val onError: (String) -> Unit,
     private val investigationRecorder: Obd2InvestigationSink? = null,
@@ -77,7 +77,7 @@ class Sirius32DdtTransport(
     @Volatile private var streaming = false
     @Volatile private var connected = false
     @Volatile private var cachedFirmwareInfo: FirmwareInfo? = null
-    private var lastSample: SpeeduinoLiveData? = null
+    private var lastSample: EcuLiveData? = null
 
     // ---- Conexão ------------------------------------------------------------------
 
@@ -209,7 +209,7 @@ class Sirius32DdtTransport(
         val injMs = v(f4, a4, "Temps d injection copie trame 5")
         val afr = o2Up?.let { (14.7 + ((it - 0.45) * 6.0)).coerceIn(10.0, 19.9) }
 
-        val sample = SpeeduinoLiveData(
+        val sample = EcuLiveData(
             secl = 0,
             rpm = rpm.coerceIn(0, 12000),
             coolantTemp = coolant,

@@ -1,6 +1,6 @@
 package io.ecucore.transport
 
-import io.ecucore.SpeeduinoLiveData
+import io.ecucore.EcuLiveData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
@@ -44,7 +44,7 @@ class Obd2K4mReplayTest {
 
     @Test
     fun livedataFromRealK4mCaptureDecodesAndFlagsMissingChannels() = runTest {
-        val samples = mutableListOf<SpeeduinoLiveData>()
+        val samples = mutableListOf<EcuLiveData>()
         val conn = ScriptedElmConnection(k4m)
         val t = Obd2Transport(
             connection = conn,

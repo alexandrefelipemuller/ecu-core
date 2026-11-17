@@ -1,6 +1,6 @@
 package io.ecucore.transport
 
-import io.ecucore.connection.ISpeeduinoConnection
+import io.ecucore.connection.IEcuConnection
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -10,7 +10,7 @@ import kotlin.test.assertTrue
 /** Conexão que responde ao comando ELM327 enviado, como um adaptador real faria. */
 internal class ScriptedElmConnection(
     private val responder: (String) -> String?,
-) : ISpeeduinoConnection {
+) : IEcuConnection {
     val commands = mutableListOf<String>()
     private var pending: ByteArray = ByteArray(0)
     private var connected = false
@@ -33,7 +33,7 @@ internal class ScriptedElmConnection(
 }
 
 class Sirius32TransportTest {
-    private fun transport(conn: ISpeeduinoConnection) =
+    private fun transport(conn: IEcuConnection) =
         Sirius32Transport(conn, onDataReceived = {}, onConnectionStateChanged = {}, onError = {})
 
     private fun healthyEcu(dtcWords: String = "04 40 00 00"): (String) -> String? = { cmd ->
