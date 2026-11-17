@@ -1136,17 +1136,19 @@ class EcuClient(
 
     /**
      * Identidade do cache de páginas: assinatura de firmware + endereço de conexão.
-     * Retorna `null` (cache desabilitado) para famílias diferentes de Speeduino ou quando o firmware
+     * Retorna `null` (cache desabilitado) para famílias diferentes de Speeduino/MS2/MegaSpeed ou quando o firmware
      * ainda não foi identificado.
      */
     private fun cacheIdentity(): String? {
         val info = firmwareInfo ?: return null
-        if (info.family != EcuFamily.SPEEDUINO) return null
+        if (info.family != EcuFamily.SPEEDUINO && !isMs2Cacheable(info.family)) return null
         val signature = info.signature.takeIf { it.isNotBlank() && !it.equals("Unknown", ignoreCase = true) }
             ?: return null
         val address = connection.getConnectionInfo().ifBlank { "unknown" }
         return "${info.family.name}|$signature|$address"
     }
+
+    private fun isMs2Cacheable(family: EcuFamily) = family == EcuFamily.MS2 || family == EcuFamily.MEGASPEED
 
     private fun invalidateCachedPage(pageNum: Int) {
         cacheIdentity()?.let { pageCache.invalidatePage(it, pageNum) }
@@ -1179,6 +1181,22 @@ class EcuClient(
     }
 
     suspend fun readConfigChunk(pageId: Int, offset: Int, length: Int): ByteArray = withEcuIo { readConfigChunkUnlocked(pageId, offset, length) }
+
+    /** Cache-through persistente das tabelas de config do MS2/MegaSpeed (mesmo cache do Speeduino). */
+    private suspend fun readMs2ConfigCached(pageId: Int, offset: Int, length: Int): ByteArray {
+        val identity = cacheIdentity()
+        if (identity != null) {
+            pageCache.read(identity, pageId, offset, length, WallClock.nowEpochMillis(), pageCacheTtlMs)?.let {
+                Logger.d(TAG, "Cache hit tabela ${formatPageId(pageId)} offset=$offset length=$length")
+                return it
+            }
+        }
+        val result = readTableLimited(pageId, offset, length, EcuFamily.MS2)
+        if (identity != null && result.size == length) {
+            pageCache.store(identity, pageId, offset, length, result, WallClock.nowEpochMillis())
+        }
+        return result
+    }
 
     private suspend fun readConfigChunkUnlocked(pageId: Int, offset: Int, length: Int): ByteArray {
         val pageLabel = formatPageId(pageId)
@@ -1221,7 +1239,7 @@ class EcuClient(
                     )
                 } else {
                     when (family) {
-                        EcuFamily.MS2, EcuFamily.MEGASPEED -> readTableLimited(pageId, offset, length, EcuFamily.MS2)
+                        EcuFamily.MS2, EcuFamily.MEGASPEED -> readMs2ConfigCached(pageId, offset, length)
                         EcuFamily.MS3 -> protocol.readTable(pageId, offset, length, EcuFamily.MS3)
                         EcuFamily.RUSEFI -> protocol.readTable(pageId, offset, length, EcuFamily.RUSEFI)
                         else -> protocol.readPage(
@@ -1720,6 +1738,7 @@ class EcuClient(
     override suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams) {
         requireMegaSpeedTest()
         ensureWritable("writeMegaSpeedTestParams")
+        invalidateConfigPageCache()
         // Lê, altera só os campos do teste (preserva outros bits) e grava a faixa 2..10 em RAM, sem burn.
         val current = readConfigChunk(MegaSpeedOutputTest.PARAMS_PAGE, 0, MegaSpeedTestParams.PARAMS_END)
         val updated = params.applyTo(current)
@@ -1992,6 +2011,7 @@ class EcuClient(
     override suspend fun writeMegaSpeedConfigField(field: String, value: Double) {
         ensureWritable("writeMegaSpeedConfigField")
         requireMegaSpeedForFieldAccess()
+        invalidateConfigPageCache() // lê o valor atual direto da ECU antes de decidir o que gravar
         val spec = writableFieldSpec(field)
             ?: throw IllegalArgumentException("Field not allowed for writing: $field")
         require(value.isFinite() && value >= spec.min && value <= spec.max) {
@@ -2105,6 +2125,8 @@ class EcuClient(
 
     private suspend fun readMegaSpeedAntiTheft(): MegaSpeedAntiTheftState {
         requireMegaSpeedAntiTheftLayout()
+        // Estado do antifurto é crítico de segurança: sempre lido da ECU, nunca do cache.
+        invalidateConfigPageCache()
         val stash = readConfigChunk(MegaSpeedAntiTheft.TABLE_ID, MegaSpeedAntiTheft.MARKER_OFFSET, MegaSpeedAntiTheft.STASH_LENGTH)
         return MegaSpeedAntiTheftState(
             marker = stash[0].toInt() and 0xFF,
@@ -3678,6 +3700,7 @@ class EcuClient(
      * ([MS2_MAX_TABLE_TRANSFER_SIZE]); demais famílias gravam num comando só.
      */
     private suspend fun writeTableLimited(tableId: Int, offset: Int, data: ByteArray, family: EcuFamily) {
+        invalidateConfigPageCache()
         val limit = ms2TransferLimit(tableId)
         if (limit == null || data.size <= limit) {
             protocol.writeTable(tableId, offset, data, family)
