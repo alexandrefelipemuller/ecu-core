@@ -54,6 +54,9 @@ data class TriggerSettings(
     companion object {
         const val PAGE_NUMBER: Int = 4
         const val PAGE_LENGTH: Int = 128
+
+        /** Offsets da página 4 que [toPageData] pode alterar: TrigAng 0..1, FixAng 2, CrankAng 3, TrigAngMul 4, 5, 6, 8, SkipCycles 11, 12, numTeeth 15, missingTeeth 16 e 123 (dwellErrCorrect). */
+        val PAGE4_OWNED_OFFSETS: Set<Int> = setOf(0, 1, 2, 3, 4, 5, 6, 8, 11, 12, 15, 16, 123)
         const val MS2_PAGE_NUMBER: Byte = 0x04
 
         // extraFields do MS2/MegaSpeed (page 0x04). Valores brutos da ECU, sem escala:

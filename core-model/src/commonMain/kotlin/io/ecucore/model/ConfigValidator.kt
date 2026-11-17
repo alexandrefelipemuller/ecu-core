@@ -105,8 +105,11 @@ object ConfigValidator {
         val warnings = mutableListOf<String>()
         pressurePair(errors, "MAP", calibration.mapMin, calibration.mapMax)
         pressurePair(errors, "Baro", calibration.baroMin, calibration.baroMax)
-        // EMAP é opcional: 0/0 = sensor não usado, não é erro.
-        if (calibration.emapMin != 0 || calibration.emapMax != 0) {
+        // EMAP é opcional: 0/0 = sensor não usado, não é erro. -1/65535 (0xFF/0xFFFF) é EEPROM
+        // nunca gravada nesses campos (firmwares antigos): também significa "sem EMAP".
+        val emapUnused = (calibration.emapMin == 0 && calibration.emapMax == 0) ||
+            (calibration.emapMin == -1 && calibration.emapMax == 0xFFFF)
+        if (!emapUnused) {
             pressurePair(errors, "EMAP", calibration.emapMin, calibration.emapMax)
         }
         return result(errors, warnings)

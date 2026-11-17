@@ -16,6 +16,9 @@ data class SecondarySerialConfig(
         const val PAGE_NUMBER: Int = 9
         const val OFFSET: Int = 0
 
+        /** Único byte da página 9 que esta config altera (`enable_secondarySerial` e o protocolo). */
+        val OWNED_OFFSETS: Set<Int> = setOf(OFFSET)
+
         fun fromByte(value: Int): SecondarySerialConfig {
             val enabled = (value and 0x01) != 0
             val protocolRaw = (value shr 3) and 0x0F

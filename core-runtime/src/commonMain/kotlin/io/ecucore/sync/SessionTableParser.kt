@@ -5,6 +5,7 @@ import io.ecucore.model.DwellTable
 import io.ecucore.model.ClosedLoopCorrectionConfig
 import io.ecucore.model.ClosedLoopCorrectionMapper
 import io.ecucore.model.EcuFamily
+import io.ecucore.model.BatteryCorrectionLayout
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.EngineProtectionConfig
 import io.ecucore.model.EngineProtectionMapper
@@ -28,7 +29,16 @@ object SessionTableParser {
             EcuFamily.MS2,
             EcuFamily.MEGASPEED -> pages[0x04]?.let(EngineConstants::fromMs2Page1)
             EcuFamily.RUSEFI -> pages[0x0000]?.let(EngineConstants::fromRusefiMainPage)
-            else -> pages[1]?.let(EngineConstants::fromPage1)
+            else -> pages[1]?.let { page1 ->
+                val constants = EngineConstants.fromPage1(page1)
+                // A correção de bateria (brvBins/injBatRates) fica na página 6, não na 1.
+                val page6 = pages[BatteryCorrectionLayout.DEFAULT.page]
+                if (page6 != null && page6.size >= BatteryCorrectionLayout.DEFAULT.pageLength) {
+                    constants.withBatteryCorrection(page6)
+                } else {
+                    constants
+                }
+            }
         }
     }
 
@@ -284,13 +294,8 @@ object SessionTableParser {
     ): IdleControlSettings? {
         if (ecuFamily != EcuFamily.SPEEDUINO) return null
 
-        val page4 = pages[IdleControlSettings.PAGE_NUMBER] ?: return null
-        val baseSettings = IdleControlSettings.fromPage4(page4)
-        val targetRpm = pages[IdleControlSettings.TARGET_PAGE_NUMBER]
-            ?.let(IdleControlSettings::readTargetRpmFromPage7)
-            ?: baseSettings.idleTargetRpm
-
-        return baseSettings.copy(idleTargetRpm = targetRpm)
+        val page = pages[IdleControlSettings.PAGE_NUMBER] ?: return null
+        return IdleControlSettings.fromPage(page)
     }
 
     fun parseEngineProtectionConfig(

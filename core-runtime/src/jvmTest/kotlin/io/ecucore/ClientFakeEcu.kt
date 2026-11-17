@@ -78,6 +78,17 @@ internal class ClientFakeEcu(
     var clearCalls = 0
     private val pending = ArrayDeque<ByteArray>()
 
+    /**
+     * Resposta que a ECU real continua mandando depois de um [abortPendingRead] (o app parou de
+     * ler, a ECU não): o resto chega logo DEPOIS do 1º [clearInputBuffer] seguinte (ainda estava
+     * em trânsito no flush) e, ao contrário de [pending], sobrevive a um novo [send] - só outro
+     * [clearInputBuffer] o descarta.
+     */
+    var lateBytesOnAbort: List<ByteArray>? = null
+    private val late = java.util.concurrent.ConcurrentLinkedDeque<ByteArray>()
+    @Volatile
+    private var lateArmed = false
+
     fun mem(id: Int): ByteArray = tables.getOrPut(id) { ByteArray(70000) }
 
     fun load(id: Int, offset: Int, data: ByteArray) = data.copyInto(mem(id), offset)
@@ -200,7 +211,11 @@ internal class ClientFakeEcu(
         }
     }
 
-    override fun receive(size: Int): ByteArray = pending.removeFirstOrNull() ?: ByteArray(0)
+    override fun receive(size: Int): ByteArray = late.pollFirst() ?: pending.removeFirstOrNull() ?: ByteArray(0)
+
+    override fun abortPendingRead() {
+        if (lateBytesOnAbort != null) lateArmed = true
+    }
 
     override fun isConnected(): Boolean = connected
     override fun getConnectionInfo(): String = info
@@ -219,7 +234,14 @@ internal class ClientFakeEcu(
     override fun legacyFirmwareHandshakeAttempts(): Int = 2
     override fun setOnConnectionStateChanged(callback: (Boolean) -> Unit) = Unit
     override fun setOnError(callback: (String) -> Unit) = Unit
-    override fun clearInputBuffer() { clearCalls++ }
+    override fun clearInputBuffer() {
+        clearCalls++
+        late.clear()
+        if (lateArmed) {
+            lateArmed = false
+            lateBytesOnAbort?.let { late.addAll(it) }
+        }
+    }
 
     private fun u16le(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
     private fun u16be(b: ByteArray, i: Int) = ((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)

@@ -23,6 +23,7 @@ import io.ecucore.model.FirmwareEra
 import io.ecucore.model.EcuAntiTheft
 import io.ecucore.model.MegaSpeedAntiTheft
 import io.ecucore.model.SpeeduinoAntiTheft
+import io.ecucore.model.BatteryCorrectionLayout
 import io.ecucore.model.EngineConstants
 import io.ecucore.model.Algorithm
 import io.ecucore.model.EcuCapabilities
@@ -59,6 +60,7 @@ import io.ecucore.model.SecondarySerialConfig
 import io.ecucore.model.IgnitionTable
 import io.ecucore.model.AfrTable
 import io.ecucore.model.DwellTable
+import io.ecucore.model.IdleControlLayout
 import io.ecucore.model.IdleControlSettings
 import io.ecucore.model.Ms3TableDefinitions
 import io.ecucore.model.PressureCalibration
@@ -91,6 +93,9 @@ import io.ecucore.transport.MapSelectionSupport
 import io.ecucore.model.TpsCalibration
 import io.ecucore.model.MS2_TPS_TABLE
 import io.ecucore.model.MS2_TPS_MIN_OFFSET
+import io.ecucore.model.SPEEDUINO_TPS_OWNED_OFFSETS
+import io.ecucore.model.SPEEDUINO_PRESSURE_OWNED_OFFSETS
+import io.ecucore.model.PageWriteGuard
 import io.ecucore.model.MS2_TPS_BYTES
 import io.ecucore.model.encodeMs2TpsCalibration
 import io.ecucore.model.decodeMs2TpsCalibration
@@ -168,6 +173,18 @@ class EcuClient(
         // EcuProtocol.LegacyAsciiModernResponseException: length lido de bytes ASCII = stream desalinhado.
         private const val LEGACY_ASCII_RESPONSE_MARKER = "Modern response was legacy ASCII"
         private const val CONFIG_CHUNK_READ_MAX_ATTEMPTS = 2
+        // MS2/MegaSpeed/MS3 com o stream ativo: o 'A' cru do live data divide o canal com o 'r'
+        // de config, e uma resposta atrasada no buffer desalinha o envelope. 3 tentativas
+        // espaçadas pelo resync (ver readConfigChunkUnlocked).
+        private const val MS_CONFIG_CHUNK_READ_MAX_ATTEMPTS = 3
+        // Espera, ao pausar o stream, pela resposta de live data já em trânsito (ver pauseLiveDataStream).
+        private const val STREAM_PAUSE_DRAIN_SETTLE_MS = 120L
+        // Frame MS isolado com >= 3 campos fora de faixa = desalinhado (ver shouldDropImplausibleMsSample).
+        private const val MS_IMPLAUSIBLE_SAMPLE_MIN_SCORE = 3
+        private const val MS_IMPLAUSIBLE_SAMPLE_MAX_CONSECUTIVE_DROPS = 2
+        // "unexpected response code=1": código < 0x80 não é erro da ECU, é o 1º byte de outra
+        // resposta (0x01 = realtime data, 0x03 = config error no newserial MS).
+        private val FOREIGN_RESPONSE_CODE_REGEX = Regex("""unexpected response code=([0-9a-fA-F]{1,2})\b""")
         // Gravação de tabelas de tuning (VE/Ignição/AFR): chunks pequenos reduzem a chance de
         // perder bytes num frame grande via Bluetooth, e cada página é relida e comparada antes
         // do burn. Um 0x82 (CRC_ERR) deixa o resto do frame chegando na ECU depois do flush dela;
@@ -344,6 +361,13 @@ class EcuClient(
     private var lastFaultRecoveryAtMs = 0L
     @Volatile
     private var liveDataStreamStopRequested = false
+
+    /**
+     * Filtro de frame isolado implausível no stream MS (ver [shouldDropImplausibleMsSample]).
+     * `Int.MAX_VALUE` = ainda sem amostra de referência neste stream.
+     */
+    private var lastAcceptedMsSampleScore = Int.MAX_VALUE
+    private var consecutiveDroppedMsSamples = 0
 
     /** Já recebemos ao menos um frame modern do tamanho exato do OCH nesta conexão. */
     private var fullModernLiveFrameSeen = false
@@ -1176,6 +1200,23 @@ class EcuClient(
         }
     }
 
+    /**
+     * Grava só depois de [PageWriteGuard] confirmar que [after] difere de [before] apenas nos offsets em [owned]
+     * (os bytes que o escritor possui). Violação lança [UnownedBytesWriteException] e NADA é enviado à ECU.
+     * [before] deve ser a cópia lida da ECU e não pode ser alterada pelo escritor.
+     */
+    private suspend fun writeOwnedConfigPage(
+        pageNum: Int,
+        offset: Int,
+        before: ByteArray,
+        after: ByteArray,
+        owned: Set<Int>,
+        label: String,
+    ) {
+        PageWriteGuard.requireOnlyOwned(label, pageNum, before, after, owned, offset)
+        writeConfigPageVerified(pageNum.toByte(), offset, after, label)
+    }
+
     suspend fun readPage(pageNum: Byte, offset: Int, length: Int): ByteArray {
         return readPage(pageNum.toInt() and 0xFF, offset, length)
     }
@@ -1220,7 +1261,23 @@ class EcuClient(
         val shouldDrainBeforeAttempt = readMode == EcuConfigReadMode.LEGACY_PAGE &&
             (connection.shouldDrainBeforeLegacyConfigRead() || ecuDefinition?.runtime?.schemaId == "msextra-hr10")
 
-        repeat(CONFIG_CHUNK_READ_MAX_ATTEMPTS) { attempt ->
+        // Achado de campo 2026-11 (MicroSquirt comms342hU, USB, v1.6.7): com o motor ligado e o
+        // stream rodando, abrir WUE/marcha lenta falhava sempre com `code=1` (0x01 = realtime
+        // data no newserial MS, resposta de live data) ou `code=null`. Resto de uma resposta do
+        // 'A' cru no buffer desalinha o envelope do 'r'. Limpa
+        // antes de cada tentativa e, entre tentativas, espera o timeout serial da ECU (~400 ms)
+        // para ela descartar qualquer frame parcial. O drain prévio só vale com o stream ativo
+        // (leitura intercalada com o live data sob o mesmo mutex); quem pausa o stream antes
+        // (download completo, telas de config) já recebe o drain em pauseLiveDataStream().
+        val isMsFamily = family == EcuFamily.MS2 || family == EcuFamily.MEGASPEED || family == EcuFamily.MS3
+        val drainMsBeforeAttempt = isMsFamily && _isStreaming
+        val maxAttempts = if (isMsFamily) MS_CONFIG_CHUNK_READ_MAX_ATTEMPTS else CONFIG_CHUNK_READ_MAX_ATTEMPTS
+        val retryDelayMs = if (isMsFamily) maxOf(configReadDelayMs, LIVE_DATA_DESYNC_RESYNC_DELAY_MS) else configReadDelayMs
+
+        repeat(maxAttempts) { attempt ->
+            if (drainMsBeforeAttempt) {
+                drainInputBufferQuietly()
+            }
             try {
                 if (shouldDrainBeforeAttempt) {
                     runCatching { connection.clearInputBuffer() }
@@ -1252,7 +1309,7 @@ class EcuClient(
                 }
             } catch (e: Exception) {
                 lastError = e
-                val canRetry = attempt < CONFIG_CHUNK_READ_MAX_ATTEMPTS - 1 &&
+                val canRetry = attempt < maxAttempts - 1 &&
                     (isRecoverableConfigChunkReadFailure(e) || family == EcuFamily.RUSEFI)
                 if (!canRetry) {
                     throw Exception(
@@ -1264,10 +1321,10 @@ class EcuClient(
                 Logger.w(
                     TAG,
                     "Leitura parcial/timeout recuperável em config chunk page=$pageLabel offset=$offset length=$length; " +
-                        "retry ${attempt + 2}/$CONFIG_CHUNK_READ_MAX_ATTEMPTS: ${e.message}"
+                        "retry ${attempt + 2}/$maxAttempts: ${e.message}"
                 )
                 runCatching { connection.clearInputBuffer() }
-                delay(configReadDelayMs)
+                delay(retryDelayMs)
             }
         }
 
@@ -1366,6 +1423,11 @@ class EcuClient(
                 message.contains("short modern page response", ignoreCase = true) ||
                 message.contains("short table response", ignoreCase = true)
             ) {
+                return true
+            }
+            val foreignCode = FOREIGN_RESPONSE_CODE_REGEX.find(message)
+                ?.groupValues?.getOrNull(1)?.toIntOrNull(16)
+            if (foreignCode != null && foreignCode in 0x01..0x7F) {
                 return true
             }
             current = current.cause
@@ -1478,11 +1540,12 @@ class EcuClient(
             }
 
             else -> {
+                requireModernPageLayout("readEngineConstants")
                 Logger.d(TAG, "Lendo Engine Constants (Page 1)...")
                 val pageData = readPage(pageNum = 1, offset = 0, length = 128)
                 Logger.d(TAG, "Page 1 recebida: ${pageData.size} bytes")
                 pinLayoutInfo = PinLayoutDetector.fromPage1(pageData)
-                EngineConstants.fromPage1(pageData)
+                withBatteryCorrection(EngineConstants.fromPage1(pageData))
             }
         }
 
@@ -1490,10 +1553,32 @@ class EcuClient(
         return constants
     }
 
+    /** `brvBins`/`injBatRates` ficam na página 6 do .ini (não na 1); sem .ini vale o layout 202008+. */
+    private fun batteryCorrectionLayout(): BatteryCorrectionLayout? {
+        val definition = activeIniDefinition ?: return BatteryCorrectionLayout.DEFAULT
+        return BatteryCorrectionLayout.fromIni(definition)
+    }
+
+    /**
+     * Completa [constants] com a correção de tensão de bateria. Falha na leitura da página 6 não pode derrubar as
+     * constantes do motor: os campos ficam nos valores padrão, `batteryCorrectionLoaded` fica falso e a gravação
+     * posterior não os envia.
+     */
+    private suspend fun withBatteryCorrection(constants: EngineConstants): EngineConstants {
+        val layout = batteryCorrectionLayout() ?: return constants
+        return runCatching {
+            constants.withBatteryCorrection(readPage(pageNum = layout.page, offset = 0, length = layout.pageLength), layout)
+        }.getOrElse {
+            Logger.w(TAG, "Correção de bateria (página ${layout.page}) indisponível: ${it.message}")
+            constants
+        }
+    }
+
     /**
      * Lê calibração de pressão (MAP/Baro/EMAP) em Page 1.
      */
     override suspend fun readPressureCalibration(): PressureCalibration = withContext(Dispatchers.IO) {
+        requireModernPageLayout("readPressureCalibration")
         val pageData = readPage(pageNum = 1, offset = 0, length = 128)
         PressureCalibration(
             mapMin = readS8(pageData, 46),
@@ -1511,15 +1596,17 @@ class EcuClient(
     override suspend fun writePressureCalibration(calibration: PressureCalibration, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writePressureCalibration")
         requireSpeeduinoLayout("writePressureCalibration")
+        requireModernPageLayout("writePressureCalibration")
         ConfigValidator.requireValid(ConfigValidator.validatePressureCalibration(calibration))
-        val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+        val before = readPage(pageNum = 1, offset = 0, length = 128)
+        val basePage = before.copyOf()
         writeS8(basePage, 46, calibration.mapMin)
         writeU16(basePage, 47, calibration.mapMax)
         writeS8(basePage, 64, calibration.baroMin)
         writeU16(basePage, 65, calibration.baroMax)
         writeS8(basePage, 67, calibration.emapMin)
         writeU16(basePage, 68, calibration.emapMax)
-        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "Pressure Calibration")
+        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_PRESSURE_OWNED_OFFSETS, "Pressure Calibration")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1537,6 +1624,7 @@ class EcuClient(
             val raw = withEcuIo { protocol.readTable(MS2_TPS_TABLE.toInt(), MS2_TPS_MIN_OFFSET, MS2_TPS_BYTES, EcuFamily.MS2) }
             return@withContext decodeMs2TpsCalibration(raw)
         }
+        requireModernPageLayout("readTpsCalibration")
         val pageData = readPage(pageNum = 1, offset = 0, length = 128)
         TpsCalibration(
             tpsMin = readU8(pageData, 44),
@@ -1563,11 +1651,13 @@ class EcuClient(
             return@withContext
         }
         requireSpeeduinoLayout("writeTpsCalibration")
+        requireModernPageLayout("writeTpsCalibration")
         ConfigValidator.requireValid(ConfigValidator.validateTpsCalibration(calibration))
-        val basePage = readPage(pageNum = 1, offset = 0, length = 128)
+        val before = readPage(pageNum = 1, offset = 0, length = 128)
+        val basePage = before.copyOf()
         writeU8(basePage, 44, calibration.tpsMin)
         writeU8(basePage, 45, calibration.tpsMax)
-        writeConfigPageVerified(pageNum = 1, offset = 0, data = basePage, label = "TPS Calibration")
+        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_TPS_OWNED_OFFSETS, "TPS Calibration")
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1630,34 +1720,49 @@ class EcuClient(
         return info.signature
     }
 
-    /**
-     * Lê as configurações básicas de controle de marcha lenta do Speeduino.
-     */
-    override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
+    /** A marcha lenta simplificada segue o .ini do 202008+ (página 6); o 201609 tem outro layout. */
+    private fun requireIdleSupported(operation: String) {
         if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
             throw UnsupportedOperationException("Simplified idle control is available only for Speeduino")
         }
-        val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
-        val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
-        IdleControlSettings.fromPage4(basePage).copy(
-            idleTargetRpm = IdleControlSettings.readTargetRpmFromPage7(targetPage),
-        )
+        val era = firmwareInfo?.era
+        if (era != null && !era.isModern()) {
+            throw UnsupportedOperationException("$operation: idle control needs Speeduino 202008 or newer (layout of $era differs)")
+        }
     }
 
     /**
-     * Grava as configurações básicas de controle de marcha lenta no Speeduino.
+     * Lê as configurações de controle de marcha lenta do Speeduino (página 6: modo, PWM/passo, RPM alvo e curva).
+     */
+    override suspend fun readIdleControlSettings(): IdleControlSettings = withContext(Dispatchers.IO) {
+        requireIdleSupported("readIdleControlSettings")
+        val layout = idleLayout()
+        IdleControlSettings.fromPage(
+            readPage(pageNum = layout.page, offset = 0, length = layout.pageLength),
+            layout,
+        )
+    }
+
+    /** Página e offsets da marcha lenta vêm do .ini do firmware conectado; sem .ini, vale o layout 202008+. */
+    private fun idleLayout(): IdleControlLayout {
+        val definition = activeIniDefinition ?: return IdleControlLayout.DEFAULT
+        return IdleControlLayout.fromIni(definition)
+            ?: throw UnsupportedOperationException("O .ini ${definition.sourceName} não define os campos de marcha lenta do Speeduino")
+    }
+
+    /**
+     * Grava as configurações de marcha lenta no Speeduino: lê a página 6, troca só os campos de marcha lenta
+     * e grava a página uma vez (as demais páginas não são tocadas).
      */
     override suspend fun writeIdleControlSettings(settings: IdleControlSettings, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeIdleControlSettings")
-        if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
-            throw UnsupportedOperationException("Simplified idle control is available only for Speeduino")
-        }
-        val basePage = readPage(pageNum = IdleControlSettings.PAGE_NUMBER, offset = 0, length = IdleControlSettings.PAGE_LENGTH)
-        val targetPage = readPage(pageNum = IdleControlSettings.TARGET_PAGE_NUMBER, offset = 0, length = IdleControlSettings.TARGET_PAGE_LENGTH)
-        val page4Data = settings.applyToPage4(basePage)
-        val page7Data = settings.applyTargetRpmToPage7(targetPage)
-        writeConfigPageVerified(IdleControlSettings.PAGE_NUMBER.toByte(), 0, page4Data, "Idle Control (Page 4)")
-        writeConfigPageVerified(IdleControlSettings.TARGET_PAGE_NUMBER.toByte(), 0, page7Data, "Idle Target (Page 7)")
+        requireIdleSupported("writeIdleControlSettings")
+        val layout = idleLayout()
+        val page = readPage(pageNum = layout.page, offset = 0, length = layout.pageLength)
+        writeOwnedConfigPage(
+            layout.page, 0, page, settings.applyToPage(page, layout), layout.ownedOffsets,
+            "Idle Control (Page ${layout.page})",
+        )
         if (burn) {
             delay(300)
             protocol.burnConfig()
@@ -1697,6 +1802,7 @@ class EcuClient(
             return TriggerSettings.fromMs2PageData(pageData)
         }
 
+        requireModernPageLayout("readTriggerSettings")
         Logger.d(TAG, "Lendo Trigger Settings (Page 4)...")
         val pageData = readPage(
             pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
@@ -2116,7 +2222,7 @@ class EcuClient(
     /** Travada, a ECU corta a injeção com o motor girando também: trava-se só com o carro parado. */
     private suspend fun requireEngineStoppedForAntiTheft() {
         val rpm = withEcuIo { readLiveData() }.rpm
-        check(rpm == 0) { "Antifurto: desligue o motor para travar (rotação atual $rpm RPM)" }
+        check(rpm == 0) { "Anti-theft: turn the engine off to lock (current speed $rpm RPM)" }
     }
 
     private class MegaSpeedAntiTheftState(val marker: Int, val revLimit: Int, val optionsByte: Int) {
@@ -2211,18 +2317,14 @@ class EcuClient(
         writeMegaSpeedAntiTheftBytes(MegaSpeedAntiTheft.MARKER_OFFSET, ByteArray(MegaSpeedAntiTheft.STASH_LENGTH), "apaga assinatura")
     }
 
-    private class SpeeduinoAntiTheftState(val flood: Int, val marker: Int, val stored: Int) {
-        val locked get() = SpeeduinoAntiTheft.isLocked(flood, marker)
+    private class SpeeduinoAntiTheftState(val marker: Int, val revLimitStored: Int, val protectMinRpmStored: Int) {
+        val locked get() = SpeeduinoAntiTheft.isLocked(marker)
     }
 
     /** Campos do antifurto no .ini ativo; recusa se algum não estiver onde a trava espera. */
     private fun requireSpeeduinoAntiTheftLayout() {
-        val expected = listOf(
-            Triple(SpeeduinoAntiTheft.FLOOD_FIELD, SpeeduinoAntiTheft.FLOOD_PAGE, SpeeduinoAntiTheft.FLOOD_OFFSET),
-            Triple(SpeeduinoAntiTheft.MARKER_FIELD, SpeeduinoAntiTheft.MARKER_PAGE, SpeeduinoAntiTheft.MARKER_OFFSET),
-            Triple(SpeeduinoAntiTheft.ORIGINAL_FIELD, SpeeduinoAntiTheft.MARKER_PAGE, SpeeduinoAntiTheft.ORIGINAL_OFFSET),
-        )
-        for ((name, page, offset) in expected) {
+        for (expected in SpeeduinoAntiTheft.ALL_FIELDS) {
+            val name = expected.name
             val f = try {
                 megaSpeedScalar(name, requireWritable = false)
             } catch (e: IllegalArgumentException) {
@@ -2230,20 +2332,27 @@ class EcuClient(
             } catch (e: IllegalStateException) {
                 throw UnsupportedOperationException("Antifurto: $name inválido no .ini (${e.message})")
             }
-            if (f.pageId != page || f.offset != offset || f.width != 1 || f.signed || f.isBits) {
+            val bitsMatch = if (expected.isBits) {
+                f.bitLow == expected.bitLow && f.bitHigh == expected.bitLow!! + expected.bitCount - 1
+            } else {
+                !f.isBits && !f.signed
+            }
+            if (f.pageId != expected.page || f.offset != expected.offset || f.width != 1 || !bitsMatch) {
                 throw UnsupportedOperationException("Antifurto: $name do .ini não confere com o esperado")
             }
         }
     }
 
+    private suspend fun readSpeeduinoByte(field: SpeeduinoAntiTheft.Field): Int =
+        readConfigChunk(field.page, field.offset, 1)[0].toInt() and 0xFF
+
     private suspend fun readSpeeduinoAntiTheft(): SpeeduinoAntiTheftState {
         requireSpeeduinoAntiTheftLayout()
-        val flood = readConfigChunk(SpeeduinoAntiTheft.FLOOD_PAGE, SpeeduinoAntiTheft.FLOOD_OFFSET, 1)
-        val marker = readConfigChunk(SpeeduinoAntiTheft.MARKER_PAGE, SpeeduinoAntiTheft.MARKER_OFFSET, 2)
+        val stash = readConfigChunk(SpeeduinoAntiTheft.MARKER_FIELD.page, SpeeduinoAntiTheft.MARKER_FIELD.offset, 2)
         return SpeeduinoAntiTheftState(
-            flood = flood[0].toInt() and 0xFF,
-            marker = marker[0].toInt() and 0xFF,
-            stored = marker[1].toInt() and 0xFF,
+            marker = stash[0].toInt() and 0xFF,
+            revLimitStored = stash[1].toInt() and 0xFF,
+            protectMinRpmStored = readSpeeduinoByte(SpeeduinoAntiTheft.PROTECT_MIN_RPM_ORIGINAL_FIELD),
         )
     }
 
@@ -2253,52 +2362,78 @@ class EcuClient(
         protocol.burnConfig()
     }
 
+    /** Grava o campo (bits sem mexer nos vizinhos do mesmo byte); pula se já estiver no valor. */
+    private suspend fun writeSpeeduinoAntiTheftField(field: SpeeduinoAntiTheft.Field, value: Int, label: String) {
+        val current = readSpeeduinoByte(field)
+        val updated = field.write(current, value)
+        if (updated == current) return
+        writeSpeeduinoAntiTheftBytes(field.page, field.offset, byteArrayOf(updated.toByte()), "Speeduino antifurto ($label)")
+    }
+
     /**
-     * Marca antes do desafogador: se a segunda gravação falhar, a marca sozinha não trava nada.
-     * Na volta, o desafogador antes da marca, pelo mesmo motivo.
+     * Originais antes da assinatura: ela é o que diz "travada", então só entra com os originais já
+     * gravados. Depois os campos, com o limite em 0 por último.
      */
     private suspend fun lockSpeeduinoAntiTheft(): Int {
         val state = readSpeeduinoAntiTheft()
         requireEngineStoppedForAntiTheft()
         check(!state.locked) { "Antifurto: a ECU já está travada" }
-        require(state.flood != SpeeduinoAntiTheft.LOCKED_FLOOD) {
-            "Antifurto: o desafogador (${SpeeduinoAntiTheft.FLOOD_FIELD}) já está em 0 %; confira a configuração de partida"
+        val revLimit = readSpeeduinoByte(SpeeduinoAntiTheft.REV_LIMIT)
+        require(revLimit != SpeeduinoAntiTheft.LOCKED_REV_LIMIT) {
+            "Antifurto: o limitador de giro (${SpeeduinoAntiTheft.REV_LIMIT.name}) já está em 0 RPM; confira a configuração"
         }
-        writeSpeeduinoAntiTheftBytes(
-            SpeeduinoAntiTheft.MARKER_PAGE,
-            SpeeduinoAntiTheft.MARKER_OFFSET,
-            byteArrayOf(SpeeduinoAntiTheft.MARKER.toByte(), state.flood.toByte()),
-            "Speeduino antifurto (marca)",
+        val original = SpeeduinoAntiTheft.Original(
+            revLimit = revLimit,
+            protectMinRpm = readSpeeduinoByte(SpeeduinoAntiTheft.PROTECT_MIN_RPM),
+            protectType = SpeeduinoAntiTheft.PROTECT_TYPE.read(readSpeeduinoByte(SpeeduinoAntiTheft.PROTECT_TYPE)),
+            revMode = SpeeduinoAntiTheft.REV_MODE.read(readSpeeduinoByte(SpeeduinoAntiTheft.REV_MODE)),
+            cutType = SpeeduinoAntiTheft.CUT_TYPE.read(readSpeeduinoByte(SpeeduinoAntiTheft.CUT_TYPE)),
         )
         writeSpeeduinoAntiTheftBytes(
-            SpeeduinoAntiTheft.FLOOD_PAGE,
-            SpeeduinoAntiTheft.FLOOD_OFFSET,
-            byteArrayOf(SpeeduinoAntiTheft.LOCKED_FLOOD.toByte()),
-            "Speeduino antifurto (travar)",
+            SpeeduinoAntiTheft.PROTECT_MIN_RPM_ORIGINAL_FIELD.page,
+            SpeeduinoAntiTheft.PROTECT_MIN_RPM_ORIGINAL_FIELD.offset,
+            byteArrayOf(original.protectMinRpm.toByte()),
+            "Speeduino antifurto (rotação mínima da proteção original)",
         )
-        return state.flood
+        writeSpeeduinoAntiTheftBytes(
+            SpeeduinoAntiTheft.MARKER_FIELD.page,
+            SpeeduinoAntiTheft.MARKER_FIELD.offset,
+            byteArrayOf(original.markerByte().toByte(), original.revLimit.toByte()),
+            "Speeduino antifurto (assinatura)",
+        )
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.CUT_TYPE, SpeeduinoAntiTheft.LOCKED_CUT_TYPE, "corte total")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.PROTECT_TYPE, SpeeduinoAntiTheft.LOCKED_PROTECT_TYPE, "corta faísca e injeção")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.REV_MODE, SpeeduinoAntiTheft.LOCKED_REV_MODE, "limite fixo")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.PROTECT_MIN_RPM, SpeeduinoAntiTheft.LOCKED_PROTECT_MIN_RPM, "proteção desde 0 RPM")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.REV_LIMIT, SpeeduinoAntiTheft.LOCKED_REV_LIMIT, "travar")
+        return original.toRaw()
     }
 
+    /** Campos de volta aos originais e só então a assinatura apagada, pelo mesmo motivo da trava. */
     private suspend fun unlockSpeeduinoAntiTheft(originalRaw: Int?) {
         val state = readSpeeduinoAntiTheft()
         if (!state.locked) {
             Logger.d(TAG, "Antifurto: ECU já destravada; nada a gravar")
             return
         }
-        val restored = originalRaw ?: SpeeduinoAntiTheft.originalFrom(state.stored)
-        require(restored in 1..0xFF) { "Antifurto: valor original inválido ($restored)" }
+        val original = try {
+            originalRaw?.let { SpeeduinoAntiTheft.Original.fromRaw(it) }
+                ?: SpeeduinoAntiTheft.Original.fromStored(state.marker, state.revLimitStored, state.protectMinRpmStored)
+        } catch (e: IllegalArgumentException) {
+            throw IllegalArgumentException("Antifurto: ${e.message}", e)
+        }
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.REV_LIMIT, original.revLimit, "destravar")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.PROTECT_MIN_RPM, original.protectMinRpm, "rotação mínima da proteção")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.REV_MODE, original.revMode, "modo do limitador")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.PROTECT_TYPE, original.protectType, "tipo de proteção")
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.CUT_TYPE, original.cutType, "tipo de corte")
         writeSpeeduinoAntiTheftBytes(
-            SpeeduinoAntiTheft.FLOOD_PAGE,
-            SpeeduinoAntiTheft.FLOOD_OFFSET,
-            byteArrayOf(restored.toByte()),
-            "Speeduino antifurto (destravar)",
-        )
-        writeSpeeduinoAntiTheftBytes(
-            SpeeduinoAntiTheft.MARKER_PAGE,
-            SpeeduinoAntiTheft.MARKER_OFFSET,
+            SpeeduinoAntiTheft.MARKER_FIELD.page,
+            SpeeduinoAntiTheft.MARKER_FIELD.offset,
             byteArrayOf(0, 0),
-            "Speeduino antifurto (limpar marca)",
+            "Speeduino antifurto (limpar assinatura)",
         )
+        writeSpeeduinoAntiTheftField(SpeeduinoAntiTheft.PROTECT_MIN_RPM_ORIGINAL_FIELD, 0, "limpar rotação mínima original")
     }
 
     override suspend fun readRusefiInputOutputSnapshot(): RusefiInputOutputSnapshot {
@@ -2337,6 +2472,7 @@ class EcuClient(
      * Lê configuração do Secondary Serial (Page 9, offset 0)
      */
     override suspend fun readSecondarySerialConfig(): SecondarySerialConfig = withContext(Dispatchers.IO) {
+        requireModernPageLayout("readSecondarySerialConfig")
         Logger.d(TAG, "Lendo Secondary Serial Config (Page 9)...")
         val data = readPage(
             pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
@@ -2370,7 +2506,10 @@ class EcuClient(
             val page4 = readPage(EngineProtectionMapper.RPM_PAGE_NUMBER, 0, EngineProtectionMapper.RPM_PAGE_SIZE)
             val page9 = readPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 0, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE)
             val page10 = readPage(EngineProtectionMapper.OIL_PAGE_NUMBER, 0, EngineProtectionMapper.OIL_PAGE_SIZE)
-            EngineProtectionMapper.withExtendedPages(base, era, page1, page4, page9, page10)
+            EngineProtectionMapper.withExtendedPages(
+                base, era, page1, page4, page9, page10,
+                hasPage9 = EngineProtectionMapper.hasPage9Protection(era, activeIniDefinition),
+            )
         }.getOrElse {
             Logger.w(TAG, "Engine protection pages (1/4/9/10) unavailable: ${it.message}")
             base
@@ -2421,27 +2560,26 @@ class EcuClient(
         )
         val era = firmwareInfo?.era ?: FirmwareEra.MODERN_2025
         val updatedData = EngineProtectionMapper.applyToPage(basePage, config)
-        writeConfigPageVerified(
-            pageNum = EngineProtectionMapper.PAGE_NUMBER.toByte(),
-            offset = 0,
-            data = updatedData,
-            label = "Engine Protection",
+        writeOwnedConfigPage(
+            EngineProtectionMapper.PAGE_NUMBER, 0, basePage, updatedData,
+            EngineProtectionMapper.PAGE6_OWNED_OFFSETS, "Engine Protection",
         )
         // Páginas 1/4/9/10 só são tocadas se a config foi lida delas (extendedPagesLoaded): sem isso os
         // campos estariam em valor padrão e a gravação zeraria limites que o app nunca viu.
         if (era.isModern() && config.extendedPagesLoaded) {
-            writeEngineProtectionExtraPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, EngineProtectionMapper.CUT_TYPE_PAGE_SIZE, EngineProtectionMapper.PAGE1_OWNED_OFFSETS, burn) {
                 EngineProtectionMapper.applyToPage1(it, config)
             }
-            writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.RPM_PAGE_NUMBER, EngineProtectionMapper.RPM_PAGE_SIZE, EngineProtectionMapper.PAGE4_OWNED_OFFSETS, burn) {
                 EngineProtectionMapper.applyToPage4(it, config)
             }
-            if (EngineProtectionMapper.hasPage9Protection(era)) {
-                writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, burn) {
-                    EngineProtectionMapper.applyToPage9(it, config, era)
+            val hasPage9 = EngineProtectionMapper.hasPage9Protection(era, activeIniDefinition)
+            if (hasPage9) {
+                writeEngineProtectionExtraPage(EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, EngineProtectionMapper.HARD_REV_MODE_PAGE_SIZE, EngineProtectionMapper.PAGE9_OWNED_OFFSETS, burn) {
+                    EngineProtectionMapper.applyToPage9(it, config, era, hasPage9)
                 }
             }
-            writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, burn) {
+            writeEngineProtectionExtraPage(EngineProtectionMapper.OIL_PAGE_NUMBER, EngineProtectionMapper.OIL_PAGE_SIZE, EngineProtectionMapper.PAGE10_OWNED_OFFSETS, burn) {
                 EngineProtectionMapper.applyToPage10(it, config)
             }
         }
@@ -2454,9 +2592,16 @@ class EcuClient(
         }
     }
 
-    private suspend fun writeEngineProtectionExtraPage(pageNum: Int, size: Int, burn: Boolean, transform: (ByteArray) -> ByteArray) {
-        val updated = transform(readPage(pageNum = pageNum, offset = 0, length = size))
-        writeConfigPageVerified(pageNum = pageNum.toByte(), offset = 0, data = updated, label = "Engine Protection page $pageNum")
+    private suspend fun writeEngineProtectionExtraPage(
+        pageNum: Int,
+        size: Int,
+        owned: Set<Int>,
+        burn: Boolean,
+        transform: (ByteArray) -> ByteArray,
+    ) {
+        val before = readPage(pageNum = pageNum, offset = 0, length = size)
+        val updated = transform(before)
+        writeOwnedConfigPage(pageNum, 0, before, updated, owned, "Engine Protection page $pageNum")
         if (burn) {
             delay(200)
             protocol.burnConfig()
@@ -2479,11 +2624,9 @@ class EcuClient(
             length = ClosedLoopCorrectionMapper.PAGE_SIZE
         )
         val updatedData = ClosedLoopCorrectionMapper.applyToPage(basePage, config, era)
-        writeConfigPageVerified(
-            pageNum = ClosedLoopCorrectionMapper.PAGE_NUMBER.toByte(),
-            offset = 0,
-            data = updatedData,
-            label = "Closed Loop Corrections",
+        writeOwnedConfigPage(
+            ClosedLoopCorrectionMapper.PAGE_NUMBER, 0, basePage, updatedData,
+            ClosedLoopCorrectionMapper.PAGE6_OWNED_OFFSETS, "Closed Loop Corrections",
         )
         if (ClosedLoopCorrectionMapper.hasMapWindowPage(era)) {
             val basePage9 = readPage(
@@ -2491,11 +2634,10 @@ class EcuClient(
                 offset = 0,
                 length = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_SIZE
             )
-            writeConfigPageVerified(
-                pageNum = ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER.toByte(),
-                offset = 0,
-                data = ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
-                label = "Closed Loop Corrections MAP window",
+            writeOwnedConfigPage(
+                ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER, 0, basePage9,
+                ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
+                ClosedLoopCorrectionMapper.PAGE9_OWNED_OFFSETS, "Closed Loop Corrections MAP window",
             )
         }
         if (burn) {
@@ -2512,6 +2654,7 @@ class EcuClient(
      */
     override suspend fun writeTriggerSettings(settings: TriggerSettings, burn: Boolean) {
         ensureWritable("writeTriggerSettings")
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) requireModernPageLayout("writeTriggerSettings")
         if (firmwareInfo?.family == EcuFamily.RUSEFI) {
             throw UnsupportedOperationException("rusEFI Trigger Settings are not mapped in this version")
         }
@@ -2550,11 +2693,8 @@ class EcuClient(
             length = TriggerSettings.PAGE_LENGTH
         )
         val updatedData = settings.toPageData(basePage)
-        writeConfigPageVerified(
-            pageNum = TriggerSettings.PAGE_NUMBER.toByte(),
-            offset = 0,
-            data = updatedData,
-            label = "Trigger Settings",
+        writeOwnedConfigPage(
+            TriggerSettings.PAGE_NUMBER, 0, basePage, updatedData, TriggerSettings.PAGE4_OWNED_OFFSETS, "Trigger Settings",
         )
         if (burn) {
             delay(300)
@@ -2571,6 +2711,7 @@ class EcuClient(
     override suspend fun writeSecondarySerialConfig(config: SecondarySerialConfig, burn: Boolean) = withContext(Dispatchers.IO) {
         ensureWritable("writeSecondarySerialConfig")
         requireSpeeduinoLayout("writeSecondarySerialConfig")
+        requireModernPageLayout("writeSecondarySerialConfig")
         Logger.d(TAG, "Gravando Secondary Serial Config (Page 9)...")
         val baseData = readPage(
             pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
@@ -2580,11 +2721,10 @@ class EcuClient(
         val original = baseData.firstOrNull()?.toInt()?.and(0xFF) ?: 0
         val updated = config.applyToByte(original)
 
-        writeConfigPageVerified(
-            pageNum = SecondarySerialConfig.PAGE_NUMBER.toByte(),
-            offset = SecondarySerialConfig.OFFSET,
-            data = byteArrayOf(updated.toByte()),
-            label = "Secondary Serial",
+        writeOwnedConfigPage(
+            SecondarySerialConfig.PAGE_NUMBER, SecondarySerialConfig.OFFSET,
+            byteArrayOf(original.toByte()), byteArrayOf(updated.toByte()),
+            SecondarySerialConfig.OWNED_OFFSETS, "Secondary Serial",
         )
 
         if (burn) {
@@ -2745,6 +2885,7 @@ class EcuClient(
             throw UnsupportedOperationException("Dwell Table only supported on Speeduino")
         }
         val loadType = resolveIgnitionLoadType()
+        requireDwellTableSupported("readDwellTable")
         Logger.d(TAG, "Lendo Dwell Table (Page 12, 192 bytes)...")
         val pageData = readPage(
             pageNum = 12,
@@ -2777,6 +2918,7 @@ class EcuClient(
             )
             Logger.d(TAG, "Page 0x04 gravada com sucesso")
         } else {
+            requireModernPageLayout("writeEngineConstants")
             Logger.d(TAG, "Gravando Engine Constants (Page 1)...")
 
             // Preserve existing settings on Page 1 and update only known fields
@@ -2785,8 +2927,21 @@ class EcuClient(
             Logger.d(TAG, "Page 1 serializada: ${pageData.size} bytes")
 
             // Write to ECU
-            writeConfigPageVerified(pageNum = 1, offset = 0, data = pageData, label = "Engine Constants (Page 1)")
+            writeOwnedConfigPage(1, 0, basePage, pageData, EngineConstants.PAGE1_OWNED_OFFSETS, "Engine Constants (Page 1)")
             Logger.d(TAG, "Page 1 gravada com sucesso")
+
+            // Correção de bateria mora na página 6: só vai se veio da ECU (batteryCorrectionLoaded) e só se algum
+            // byte mudou; o resto da página 6 não é tocado.
+            if (!engineConstants.batteryCorrectionLoaded) {
+                Logger.d(TAG, "Correção de bateria não foi lida da ECU: página 6 não é gravada")
+            }
+            batteryCorrectionLayout()?.takeIf { engineConstants.batteryCorrectionLoaded }?.let { layout ->
+                val page = readPage(pageNum = layout.page, offset = 0, length = layout.pageLength)
+                val updated = engineConstants.applyBatteryCorrectionToPage(page, layout)
+                if (!updated.contentEquals(page)) {
+                    writeOwnedConfigPage(layout.page, 0, page, updated, layout.ownedOffsets, "Battery Correction (Page ${layout.page})")
+                }
+            }
 
             // Burn to EEPROM
             protocol.burnConfig()
@@ -3244,12 +3399,15 @@ class EcuClient(
         if (firmwareInfo?.family != EcuFamily.SPEEDUINO) {
             throw UnsupportedOperationException("Dwell Table only supported on Speeduino")
         }
+        requireDwellTableSupported("writeDwellTable")
         Logger.d(TAG, "Gravando Dwell Table (Page 12)...")
 
-        val pageData = dwellTable.toByteArray()
+        // A página 12 também guarda WMI e VVT2 (offsets 0..159): lê, troca só a dwell e grava de volta.
+        val before = readPage(pageNum = 12, offset = 0, length = DwellTable.StorageFormat.PAGE_12_192.totalSize)
+        val pageData = dwellTable.applyToPage(before)
         Logger.d(TAG, "Dwell Table serializada: ${pageData.size} bytes")
 
-        writeConfigPageVerified(pageNum = 12.toByte(), offset = 0, data = pageData, label = "Dwell Table")
+        writeOwnedConfigPage(12, 0, before, pageData, DwellTable.PAGE12_OWNED_OFFSETS, "Dwell Table")
         Logger.d(TAG, "Dwell Table enviada")
 
         delay(1000)
@@ -4250,6 +4408,8 @@ class EcuClient(
         lastLiveDataStreamStartedAtMs = MonotonicClock.nowMillis()
         consecutiveFaultyLiveDataSamples = 0
         pendingLiveDataRecoveryReason = null
+        lastAcceptedMsSampleScore = Int.MAX_VALUE
+        consecutiveDroppedMsSamples = 0
 
         streamJob = scope.launch {
             val intervalNs = intervalMs.coerceAtLeast(1L) * 1_000_000L
@@ -4260,7 +4420,11 @@ class EcuClient(
             while (_isStreaming && connection.isConnected()) {
                 try {
                     // Se uma operação crítica detém o canal, o stream cede a vez neste ciclo.
-                    val liveData = withEcuIoOrNull { readLiveData() } ?: run {
+                    val sample = withEcuIoOrNull { readStreamSample() } ?: run {
+                        delay(intervalMs)
+                        continue
+                    }
+                    val liveData = sample.data ?: run {
                         delay(intervalMs)
                         continue
                     }
@@ -4669,6 +4833,24 @@ class EcuClient(
     }
 
     /** Estas páginas usam o layout do Speeduino; gravar em MS/rusEFI escreveria em tabelas erradas. */
+    /**
+     * No Speeduino 201609 a página 1 é a tabela VE (as constantes do motor, calibração de TPS e pressão ficam na
+     * página 2, que tem 64 bytes, e a trigger/serial secundária têm outro layout). Ler ou gravar esses campos pela
+     * página 1 devolveria lixo e a gravação corromperia a VE. Do 202008 em diante o layout é o de página 1.
+     */
+    private fun requireModernPageLayout(operation: String) {
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO && firmwareInfo?.era == FirmwareEra.LEGACY) {
+            throw UnsupportedOperationException("$operation: Speeduino 201609 usa outro layout de páginas (necessário 202008 ou mais novo)")
+        }
+    }
+
+    private fun requireDwellTableSupported(operation: String) {
+        val era = firmwareInfo?.era
+        if (era != null && !era.hasDwellTable()) {
+            throw UnsupportedOperationException("$operation: a tabela de dwell existe a partir do Speeduino 202201 (firmware $era)")
+        }
+    }
+
     private fun requireSpeeduinoLayout(operation: String) {
         when (firmwareInfo?.family) {
             EcuFamily.MS2, EcuFamily.MEGASPEED, EcuFamily.MS3, EcuFamily.RUSEFI ->
@@ -4718,7 +4900,15 @@ class EcuClient(
 
         streamJob = null
         pendingLiveDataRecoveryReason = null
-        connection.clearInputBuffer()
+        // O abortPendingRead() acima interrompe só a leitura do app: a ECU continua mandando a
+        // resposta do último pedido de live data (no MS2, 212 bytes do 'A' cru, ~20 ms a 115200 +
+        // latência USB/BT). Limpar uma vez só, na hora, deixava esse resto chegar depois e virar o
+        // começo da resposta do próximo comando - provável origem do `Config chunk read failed
+        // ... unexpected response code=1` (0x01 = realtime data) nas telas WUE/marcha lenta do
+        // MS2, que pausam o stream antes de ler (achado de campo 2026-11, MicroSquirt, v1.6.7).
+        runCatching { connection.clearInputBuffer() }
+        delay(STREAM_PAUSE_DRAIN_SETTLE_MS)
+        runCatching { connection.clearInputBuffer() }
         liveDataStreamStopRequested = false
     }
 
@@ -4771,6 +4961,59 @@ class EcuClient(
         if (data.coolantTemp < -40 || data.coolantTemp > 170) score++
         if (data.intakeTemp < -40 || data.intakeTemp > 170) score++
         return score
+    }
+
+    /** Amostra do stream: [data] `null` = frame descartado pelo filtro de plausibilidade. */
+    private class StreamSample(val data: EcuLiveData?)
+
+    /**
+     * Leitura do stream, já sob o canal ([withEcuIoOrNull]). Descartar e limpar o buffer aqui
+     * dentro garante que o `clearInputBuffer` não apague a resposta de outra operação.
+     */
+    private suspend fun readStreamSample(): StreamSample {
+        val liveData = readLiveData()
+        if (!shouldDropImplausibleMsSample(liveData)) {
+            return StreamSample(liveData)
+        }
+        drainInputBufferQuietly()
+        return StreamSample(null)
+    }
+
+    /**
+     * Achado de campo 2026-11 (MicroSquirt "MS2Extra comms342hU", USB, v1.6.7): no meio de um
+     * log estável (secl 293, ~900 rpm, CLT 44 °C) veio UM frame com secl=0, rpm=41175,
+     * bateria=100 V, CLT=-3007 °C e avanço=-2997.7°, e o seguinte já estava normal. O live data
+     * MS vem do 'A' cru (sem cabeçalho nem CRC): bytes sobrando de outra resposta no buffer
+     * desalinham o frame e nada no protocolo acusa. Esse frame ia para dashboard e CSV.
+     *
+     * Só descarta o frame isolado: precisa de uma amostra anterior plausível (score <= 1) e
+     * no máximo [MS_IMPLAUSIBLE_SAMPLE_MAX_CONSECUTIVE_DROPS] descartes seguidos. Um estado
+     * implausível que persiste (bancada sem sensores, chicote solto) passa a ser mostrado,
+     * para o problema real não ficar escondido.
+     */
+    private fun shouldDropImplausibleMsSample(liveData: EcuLiveData): Boolean {
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MS2 && family != EcuFamily.MEGASPEED && family != EcuFamily.MS3) {
+            return false
+        }
+        var score = liveDataOutOfRangeScore(liveData)
+        if (liveData.advance < -90 || liveData.advance > 90) score++
+        val isolatedSpike = score >= MS_IMPLAUSIBLE_SAMPLE_MIN_SCORE &&
+            lastAcceptedMsSampleScore <= 1 &&
+            consecutiveDroppedMsSamples < MS_IMPLAUSIBLE_SAMPLE_MAX_CONSECUTIVE_DROPS
+        if (isolatedSpike) {
+            consecutiveDroppedMsSamples++
+            Logger.w(TAG, "Frame MS implausível descartado (score=$score rpm=${liveData.rpm} clt=${liveData.coolantTemp})")
+            ConnectionTrace.info(
+                "live_data",
+                "dropped implausible ms frame score=$score secl=${liveData.secl} rpm=${liveData.rpm} " +
+                    "clt=${liveData.coolantTemp} batt=${liveData.batteryVoltage} adv=${liveData.advance}"
+            )
+            return true
+        }
+        consecutiveDroppedMsSamples = 0
+        lastAcceptedMsSampleScore = score
+        return false
     }
 
     private var lastFaultSampleAtMs = 0L

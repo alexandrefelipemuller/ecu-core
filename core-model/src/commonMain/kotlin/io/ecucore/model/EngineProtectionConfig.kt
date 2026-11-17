@@ -1,5 +1,7 @@
 package io.ecucore.model
 
+import io.ecucore.definition.IniDefinition
+
 enum class ProtectionCut {
     OFF,
     SPARK_ONLY,
@@ -29,6 +31,12 @@ data class EngineProtectionConfig(
     // true quando as páginas 1/4/9/10 foram lidas da ECU. Sem isso a config só conhece a página 6,
     // e gravar as demais zeraria campos que o app nunca viu.
     val extendedPagesLoaded: Boolean = false,
+    /**
+     * `false` em firmwares sem a página 9 de proteção (202008..202202: sem hardRevMode/afrProtectEnabled). Nelas o
+     * limitador fixo segue a proteção do motor e não há chave própria, nem proteção por temperatura ou AFR: as telas
+     * devem desabilitar esses interruptores em vez de deixá-los sem efeito.
+     */
+    val page9ProtectionAvailable: Boolean = true,
 )
 
 const val VALET_MODE_RPM_DEFAULT = 4000
@@ -98,11 +106,32 @@ object EngineProtectionMapper {
     const val OIL_PAGE_SIZE = 192
     private const val OIL_PRESSURE_FLAGS_OFFSET = 135
 
+    /** Offsets que cada página de proteção pode alterar (cada um conferido contra o .ini pelo contrato). */
+    val PAGE6_OWNED_OFFSETS: Set<Int> = setOf(ENGINE_PROTECT_TYPE_OFFSET, BOOST_CUT_ENABLED_OFFSET)
+    val PAGE1_OWNED_OFFSETS: Set<Int> = setOf(HARD_CUT_TYPE_OFFSET, SOFT_LIMIT_MODE_OFFSET)
+    val PAGE4_OWNED_OFFSETS: Set<Int> = setOf(
+        SOFT_REV_LIM_OFFSET, SOFT_LIM_RETARD_OFFSET, SOFT_LIM_MAX_OFFSET, HARD_REV_LIM_OFFSET, ENGINE_PROTECT_MAX_RPM_OFFSET,
+    )
+    val PAGE9_OWNED_OFFSETS: Set<Int> = setOf(HARD_REV_MODE_OFFSET, AFR_PROTECT_ENABLED_OFFSET)
+    val PAGE10_OWNED_OFFSETS: Set<Int> = setOf(OIL_PRESSURE_FLAGS_OFFSET)
+
     private const val VALET_SOFT_RETARD_DEG = 15
     private const val VALET_SOFT_MAX_TIME = 20 // 2.0 s (0.1 s scale)
 
-    /** hardRevMode/afrProtectEnabled só existem na página 9 a partir do 202207 (era MODERN_2022 em diante). */
+    /**
+     * hardRevMode/afrProtectEnabled só existem na página 9 a partir do 202207. A era é grossa demais: 202201 e 202202
+     * caem na mesma era do 202207 (MODERN_2022) mas NÃO têm esses campos (nelas o offset é `unused`). Use a sobrecarga
+     * com o .ini sempre que ele estiver carregado; esta serve só de reserva sem .ini.
+     */
     fun hasPage9Protection(era: FirmwareEra): Boolean = era.isModern() && era != FirmwareEra.MODERN_2020
+
+    /** Decide pelo .ini do firmware conectado (fonte da verdade); sem .ini, pela era. */
+    fun hasPage9Protection(era: FirmwareEra, definition: IniDefinition?): Boolean {
+        if (definition == null) return hasPage9Protection(era)
+        return definition.fields.any {
+            it.name == "hardRevMode" && it.page == HARD_REV_MODE_PAGE_NUMBER && it.offset == HARD_REV_MODE_OFFSET
+        }
+    }
 
     /** Campos da página 6 (cut type e boost cut). O resto vem de [withExtendedPages]. */
     fun fromPage(page: ByteArray, @Suppress("UNUSED_PARAMETER") era: FirmwareEra): EngineProtectionConfig {
@@ -133,9 +162,17 @@ object EngineProtectionMapper {
         page4: ByteArray,
         page9: ByteArray,
         page10: ByteArray,
+        hasPage9: Boolean = hasPage9Protection(era),
     ): EngineProtectionConfig {
-        val hardRevMode = if (hasPage9Protection(era)) readBits(page9, HARD_REV_MODE_OFFSET, 0, 2) else 0
-        val afrMode = if (hasPage9Protection(era)) readBits(page9, AFR_PROTECT_ENABLED_OFFSET, 0, 2) else 0
+        // Sem hardRevMode (202008..202202) o limitador fixo não tem chave própria: engineProtection.ino `checkRevLimit` o
+        // aplica sempre que engineProtectType != Off (conferido nas tags 202008/202012/202201/202202 do firmware). Então o
+        // estado "limitador ligado" é o da proteção; antes ele aparecia desligado mesmo com o corte ativo. Mode 1 = Fixed.
+        val hardRevMode = when {
+            hasPage9 -> readBits(page9, HARD_REV_MODE_OFFSET, 0, 2)
+            base.engineProtectEnabled -> 1
+            else -> 0
+        }
+        val afrMode = if (hasPage9) readBits(page9, AFR_PROTECT_ENABLED_OFFSET, 0, 2) else 0
         val oilEnable = readBits(page10, OIL_PRESSURE_FLAGS_OFFSET, 1, 1) == 1
         val oilProtect = readBits(page10, OIL_PRESSURE_FLAGS_OFFSET, 2, 1) == 1
         return base.copy(
@@ -149,6 +186,7 @@ object EngineProtectionMapper {
             hardRevLimitRpm = readU8(page4, HARD_REV_LIM_OFFSET) * 100,
             softRevLimitRpm = readU8(page4, SOFT_REV_LIM_OFFSET) * 100,
             extendedPagesLoaded = true,
+            page9ProtectionAvailable = hasPage9,
         )
     }
 
@@ -191,9 +229,14 @@ object EngineProtectionMapper {
     }
 
     /** Página 9: hardRevMode (0 Off, 1 Fixed, 2 Coolant) e afrProtectEnabled (0 Off, 1 Fixed, 2 Table). */
-    fun applyToPage9(base: ByteArray, config: EngineProtectionConfig, era: FirmwareEra): ByteArray {
+    fun applyToPage9(
+        base: ByteArray,
+        config: EngineProtectionConfig,
+        era: FirmwareEra,
+        hasPage9: Boolean = hasPage9Protection(era),
+    ): ByteArray {
         val page = base.copyOf()
-        if (!hasPage9Protection(era)) return page
+        if (!hasPage9) return page
         val newMode = when {
             config.coolantProtectionEnabled -> 2
             config.hardRevLimitEnabled || config.revLimiterEnabled -> 1

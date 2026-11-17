@@ -48,6 +48,15 @@ enum class FirmwareEra {
     MODERN_2025;
 
     /** Backward compatibility - apenas eras Speeduino 2020+ são "Modern" */
+    /**
+     * `dwellTable` (página 12, offset 160) só existe a partir do 202201; no 202008/202012 a página 12 é a
+     * tabela WMI e no 201609 nem existe (conferido nos .ini).
+     */
+    fun hasDwellTable(): Boolean = when (this) {
+        MODERN_2022, MODERN_2023, MODERN_2024, MODERN_2025 -> true
+        LEGACY, MS2, MS3, RUSEFI, MODERN_2020 -> false
+    }
+
     fun isModern(): Boolean = when (this) {
         MODERN_2020, MODERN_2022, MODERN_2023, MODERN_2024, MODERN_2025 -> true
         LEGACY, MS2, MS3, RUSEFI -> false
