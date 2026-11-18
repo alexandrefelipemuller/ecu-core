@@ -852,6 +852,8 @@ class EcuClient(
     /**
      * Obtém informações do pin layout detectado (Page 1).
      */
+    override fun getHandshakeFallbackReason(): String? = protocol.getHandshakeFallbackReason()
+
     override fun getPinLayoutInfoCached(): PinLayoutInfo? = pinLayoutInfo
 
     /**
@@ -1042,6 +1044,10 @@ class EcuClient(
      * tabela/canais, readbacks pendentes). Chamado no início de [connect] e em [disconnect].
      */
     private fun clearEcuIdentity() {
+        protocol.resetHandshakeFallbackReason()
+        firmwareInfo = null
+        ecuDefinition = null
+        tableDefinitions = null
         outputChannelFields = null
         activeIniDefinition = null
         pendingRusefiVeTableReadback = null

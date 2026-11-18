@@ -120,6 +120,7 @@ class AutoDetectEcuTransport(
     override fun getEcuFamily(): EcuFamily = selected().getEcuFamily()
 
     override fun getEcuCapabilities(): EcuCapabilities? = selected().getEcuCapabilities()
+    override fun getHandshakeFallbackReason(): String? = selected().getHandshakeFallbackReason()
 
     override fun getTableDefinitions(): TableDefinitions? = selected().getTableDefinitions()
 

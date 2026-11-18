@@ -73,6 +73,13 @@ interface EcuTransport {
 
     fun getEcuCapabilities(): EcuCapabilities?
 
+    /**
+     * Motivo pelo qual o handshake caiu para legacy depois de falhar no envelope moderno
+     * (`legacy_ascii_reply`, `modern_timeout`, `modern_error`), ou `null` se não houve fallback.
+     * Só o [io.ecucore.EcuClient] sabe; os demais transportes não têm esse conceito.
+     */
+    fun getHandshakeFallbackReason(): String? = null
+
     fun getTableDefinitions(): TableDefinitions?
 
     fun getEcuPageCatalog(): List<EcuPageDescriptor> = emptyList()

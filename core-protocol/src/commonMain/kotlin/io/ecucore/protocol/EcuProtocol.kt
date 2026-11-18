@@ -122,9 +122,31 @@ class EcuProtocol(
     @Volatile
     private var legacyCommsLockedOut = false
 
+    /**
+     * Por que o handshake caiu para legacy depois de tentar o envelope moderno nesta sessão
+     * (`null` = não caiu). Valores estáveis, usados como parâmetro de Analytics:
+     * `legacy_ascii_reply` (o firmware respondeu o frame com ASCII cru), `modern_timeout`
+     * (silêncio/resposta truncada) e `modern_error` (qualquer outra falha do envelope).
+     */
+    @Volatile
+    private var handshakeFallbackReason: String? = null
+
+    fun getHandshakeFallbackReason(): String? = handshakeFallbackReason
+
+    fun resetHandshakeFallbackReason() {
+        handshakeFallbackReason = null
+    }
+
+    private fun classifyModernHandshakeFailure(error: Throwable): String = when {
+        error is LegacyAsciiModernResponseException -> "legacy_ascii_reply"
+        error.message?.contains("timeout", ignoreCase = true) == true -> "modern_timeout"
+        else -> "modern_error"
+    }
+
     /** Nova sessão (desconexão): não dá pra saber se a ECU foi desligada, então volta ao default. */
     fun resetLegacyCommsLockout() {
         legacyCommsLockedOut = false
+        handshakeFallbackReason = null
     }
 
     fun isLegacyCommsLockedOut(): Boolean = legacyCommsLockedOut
@@ -997,8 +1019,10 @@ class EcuProtocol(
                     return modernValue
                 }
             } else {
+                var modernFailure: String? = null
                 val modernValue = runCatching { queryFirmwareModernCandidate(cmd) }
                     .recoverCatching { error ->
+                        modernFailure = classifyModernHandshakeFailure(error)
                         if (error is LegacyAsciiModernResponseException) {
                             sessionLegacyPreferred = true
                             Logger.w(
@@ -1012,11 +1036,14 @@ class EcuProtocol(
                         throw error
                     }
                     .onFailure {
+                        if (modernFailure == null) modernFailure = classifyModernHandshakeFailure(it)
                         Logger.w("EcuProtocol", "Modern $label cmd=${cmd.toInt().toChar()} failed: ${it.message}")
                         delayAfterLegacyAsciiModernResponse()
                     }
                     .getOrNull()
                 if (!modernValue.isNullOrBlank()) {
+                    // recoverCatching devolve a resposta legacy quando o frame foi respondido em ASCII.
+                    modernFailure?.let { handshakeFallbackReason = it }
                     return modernValue
                 }
 
@@ -1024,6 +1051,8 @@ class EcuProtocol(
                     .onFailure { Logger.w("EcuProtocol", "Legacy $label cmd=${cmd.toInt().toChar()} failed: ${it.message}") }
                     .getOrNull()
                 if (!legacyValue.isNullOrBlank() && !legacyValue.equals("Unknown", ignoreCase = true)) {
+                    // Só conta como fallback se o legacy respondeu depois de o envelope falhar.
+                    modernFailure?.let { handshakeFallbackReason = it }
                     return legacyValue
                 }
             }
