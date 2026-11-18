@@ -394,6 +394,12 @@ class EcuClient(
             // Uma stream de live data de uma conexão anterior pode ainda estar em uma
             // leitura/escrita USB bloqueante (I/O síncrono nativo, ex: usb-serial-for-android)
             // quando o usuário desconecta e reconecta rápido. streamJob?.cancel() sozinho
+            // Uma tentativa nova nunca herda a identidade da sessão anterior. Sem isso, se o
+            // handshake falha (o ramo de erro só fecha o transporte, não passa por disconnect()),
+            // firmwareInfo/definições da última sincronização com sucesso - ex.: uma MS2Extra -
+            // continuam valendo, e um backup salvo depois sai com a família errada.
+            clearEcuIdentity()
+
             // (usado em stopLiveDataStream/disconnect) só marca a coroutine como cancelada -
             // isso não interrompe a chamada bloqueante em andamento, que só "percebe" o
             // cancelamento no próximo ponto de suspensão, e I/O bloqueante não tem um.
@@ -1022,19 +1028,27 @@ class EcuClient(
         firmwareInfo = null
         ecuDefinition = null
         tableDefinitions = null
-        outputChannelFields = null
-        activeIniDefinition = null
+        clearEcuIdentity()
         speeduinoIniCatalog = null
         megaSpeedIniCatalog = null
         msExtraIniCatalog = null
         rusefiIniCatalog = null
+        EcuOutputChannels.clearAllRuntimeDefinitions()
+        MsTemperatureUnits.celsius = false
+    }
+
+    /**
+     * Esquece tudo que identifica a ECU da sessão anterior (família, firmware, definições de
+     * tabela/canais, readbacks pendentes). Chamado no início de [connect] e em [disconnect].
+     */
+    private fun clearEcuIdentity() {
+        outputChannelFields = null
+        activeIniDefinition = null
         pendingRusefiVeTableReadback = null
         pendingRusefiIgnitionTableReadback = null
         pendingSpeeduinoPageReadbacks.clear()
         cachedEngineConstants = null
         pinLayoutInfo = null
-        EcuOutputChannels.clearAllRuntimeDefinitions()
-        MsTemperatureUnits.celsius = false
     }
 
     /**

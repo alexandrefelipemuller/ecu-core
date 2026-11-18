@@ -29,6 +29,13 @@ object FirmwareHandshakeDomain {
         val sanitized = sanitizeSignature(signature)
         if (sanitized.isBlank()) return null
 
+        // Variante de build do Slowduino (ex.: "speeduino 202402(slowduino_hc)" no HC08): o sufixo
+        // entre parênteses identifica o .ini próprio (tabelas/páginas diferentes do Speeduino
+        // real) e por isso sobrevive à normalização. Qualquer outro sufixo continua descartado.
+        Regex("""(?i)^speeduino\s+(\d{6})\((slowduino_[a-z0-9]+)\)$""")
+            .find(sanitized)
+            ?.let { return "speeduino ${it.groupValues[1]}(${it.groupValues[2].lowercase()})" }
+
         Regex("""(?i)^speeduino\s+(\d{6})(?:\.\d+)?$""")
             .find(sanitized)
             ?.let { return "speeduino ${it.groupValues[1]}" }

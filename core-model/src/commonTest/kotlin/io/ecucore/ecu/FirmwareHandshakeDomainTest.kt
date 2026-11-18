@@ -13,6 +13,23 @@ class FirmwareHandshakeDomainTest {
     }
 
     @Test
+    fun `keeps slowduino build variant suffix`() {
+        assertEquals(
+            "speeduino 202402(slowduino_hc)",
+            FirmwareHandshakeDomain.normalizeSignature("speeduino 202402(slowduino_hc)"),
+        )
+        assertEquals(
+            "speeduino 202402(slowduino_hc)",
+            FirmwareHandshakeDomain.normalizeSignature(" Speeduino 202402(Slowduino_HC)\u0000"),
+        )
+    }
+
+    @Test
+    fun `drops unknown parenthesized suffix`() {
+        assertEquals("speeduino 202402", FirmwareHandshakeDomain.normalizeSignature("speeduino 202402(other)"))
+    }
+
+    @Test
     fun `resolves consensus from repeated valid samples`() {
         val consensus = FirmwareHandshakeDomain.resolveConsensus(
             listOf(

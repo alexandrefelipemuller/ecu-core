@@ -22,6 +22,23 @@ class IniCatalogMatcherTest {
     }
 
     @Test
+    fun slowduinoHcSignatureMatchesItsOwnIniNotTheGenericSpeeduinoOne() {
+        val entries = listOf(
+            entry(id = "speeduino_202402", pattern = "speeduino 202402", priority = 100),
+            entry(id = "slowduino_hc_202402", pattern = "speeduino 202402(slowduino_hc)", priority = 100),
+        )
+
+        assertEquals(
+            "slowduino_hc_202402",
+            IniCatalogMatcher.findBestMatchingEntry("speeduino 202402(slowduino_hc)", entries)?.id,
+        )
+        assertEquals(
+            "speeduino_202402",
+            IniCatalogMatcher.findBestMatchingEntry("speeduino 202402", entries)?.id,
+        )
+    }
+
+    @Test
     fun speeduinoFallsBackToNearestOlderDefinitionWhenExactIniIsMissing() {
         val entries = listOf(
             entry(id = "speeduino_202402", pattern = "speeduino 202402", priority = 100),

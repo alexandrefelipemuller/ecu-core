@@ -62,6 +62,8 @@ class EcuProtocol(
 
         const val LIVE_DATA_SIZE = 128
         private const val STREAM_READ_SLICE_MS = 250
+        private const val LEGACY_ASCII_IDLE_MS = 40
+        private const val LEGACY_ASCII_COALESCE_MAX_MS = 400L
 
         // MSnS-Extra hr_10/MS1 real firmware: 'P' selects a page by a raw byte 0-8 (not the
         // ASCII '0'-'9'/'A'-'F' char Speeduino's legacy 'P' expects), and page contents are
@@ -809,6 +811,25 @@ class EcuProtocol(
         }
     }
 
+    /**
+     * `receive()` sem tamanho devolve só o 1º segmento que chegar. Uma ponte serial-TCP lenta (ou o
+     * simulador, que emite um byte por segmento) entrega a assinatura ASCII em pedaços, e o resto
+     * seria descartado pelo `clearInputBuffer` da consulta seguinte (sintoma: `peeduino 202402`).
+     * Junta o que chegar em seguida, até [LEGACY_ASCII_IDLE_MS] de silêncio.
+     */
+    private fun coalesceLegacyAsciiReply(first: ByteArray): ByteArray {
+        if (first.isEmpty()) return first
+        val chunks = mutableListOf(first)
+        val deadline = MonotonicClock.nowMillis() + LEGACY_ASCII_COALESCE_MAX_MS
+        while (MonotonicClock.nowMillis() < deadline) {
+            val more = runCatching { connection.readAvailable(maxBytes = 256, timeoutMs = LEGACY_ASCII_IDLE_MS) }
+                .getOrNull() ?: break
+            if (more.isEmpty()) break
+            chunks += more
+        }
+        return if (chunks.size == 1) first else concatChunks(chunks)
+    }
+
     private fun parseLegacyStringResponse(response: ByteArray, label: String): String {
         val framedString = parseModernFrameString(response, label)
         if (framedString != null) {
@@ -1051,7 +1072,7 @@ class EcuProtocol(
             return null
         }
         clearInputBufferBeforeAsciiQuery()
-        val response = sendLegacyCommand(cmd)
+        val response = coalesceLegacyAsciiReply(sendLegacyCommand(cmd))
         if (response.isEmpty()) {
             Logger.w("EcuProtocol", "Legacy $label returned empty response")
             traceLegacyHandshake(
@@ -1079,7 +1100,7 @@ class EcuProtocol(
             return null
         }
         clearInputBufferBeforeAsciiQuery()
-        val response = sendLegacyCommand(cmd)
+        val response = coalesceLegacyAsciiReply(sendLegacyCommand(cmd))
         if (response.isEmpty()) {
             Logger.w("EcuProtocol", "Legacy $label returned empty response")
             traceLegacyHandshake(

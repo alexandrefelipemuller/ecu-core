@@ -46,6 +46,45 @@ class EcuClientFirmwareHandshakeTest {
     }
 
     @Test
+    fun failedReconnectDoesNotKeepPreviousEcuIdentity() = runBlocking {
+        // Sessão anterior com sucesso (mesmo roteiro do primeiro teste); depois o link cai por
+        // fora do EcuClient (transporte fechado, sem client.disconnect()) e a nova tentativa
+        // falha no handshake. A família/firmware da sessão velha não pode sobreviver: um backup
+        // salvo a partir daqui sairia com a ECU errada (relato: Speeduino salvo como MS2Extra).
+        val connection = FakeConnection(
+            responses = mapOf(
+                'Q'.code.toByte() to arrayDequeOf(
+                    byteArrayOf(0xFF.toByte()),
+                    byteArrayOf(0xFF.toByte()),
+                ),
+                'S'.code.toByte() to arrayDequeOf(
+                    "@@A speeduino 202501\u0000A??".toByteArray(Charsets.US_ASCII),
+                    "speeduino202501_BR1\u0000".toByteArray(Charsets.US_ASCII),
+                    "ByRocha1\u0000".toByteArray(Charsets.US_ASCII),
+                ),
+                'p'.code.toByte() to arrayDequeOf(ByteArray(16)),
+            )
+        )
+        val client = EcuClient(
+            connection = connection,
+            onDataReceived = {},
+            onConnectionStateChanged = {},
+            onError = {},
+        )
+
+        client.connect()
+        assertEquals("speeduino 202501", assertNotNull(client.getFirmwareInfoCached()).signature)
+
+        connection.disconnect() // link caiu; o EcuClient não foi avisado
+
+        assertFailsWith<UnsupportedFirmwareException> { client.connect() }
+
+        assertEquals(io.ecucore.model.EcuFamily.UNKNOWN, client.getEcuFamily())
+        assertEquals(null, client.getFirmwareInfoCached())
+        assertEquals(null, client.getTableDefinitions())
+    }
+
+    @Test
     fun connectRetriesLegacyHandshakeAfterUnreadableCandidate() = runBlocking {
         val connection = FakeConnection(
             responses = mapOf(
@@ -201,6 +240,10 @@ class EcuClientFirmwareHandshakeTest {
             queuedResponses[command] = queue
             return response
         }
+
+        // Transportes reais sobrescrevem readAvailable (leitura parcial, vazio se nada chegou).
+        // O padrão delega para receive() e consumiria a próxima resposta enfileirada.
+        override fun readAvailable(maxBytes: Int, timeoutMs: Int?): ByteArray = pendingChunks.removeFirstOrNull() ?: ByteArray(0)
 
         override fun isConnected(): Boolean = connected
 
