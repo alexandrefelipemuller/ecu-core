@@ -26,6 +26,8 @@ data class ConnectionHealthSnapshot(
     val lastError: String?,
     val lastWriteOperation: String?,
     val msSinceLastWrite: Long?,
+    val swallowedErrors: Int = 0,
+    val lastSwallowed: String? = null,
 ) {
     val recoverableFailures: Int get() = recoverableTimeouts + recoverableDesyncs
 
@@ -53,6 +55,8 @@ internal class ConnectionHealth {
     private var lastError: String? = null
     private var lastWriteOperation: String? = null
     private var lastWriteAtMs: Long? = null
+    private var swallowed = 0
+    private var lastSwallowed: String? = null
 
     @Synchronized
     fun reset() {
@@ -60,6 +64,7 @@ internal class ConnectionHealth {
         frames = 0; timeouts = 0; desyncs = 0; modernLiveFailures = 0; streamRecoveries = 0
         writeRetries = 0; forcedDisconnects = 0; linkLosses = 0
         switches.clear(); lastError = null; lastWriteOperation = null; lastWriteAtMs = null
+        swallowed = 0; lastSwallowed = null
     }
 
     @Synchronized fun recordFrame() { frames++ }
@@ -100,6 +105,13 @@ internal class ConnectionHealth {
         lastWriteAtMs = MonotonicClock.nowMillis()
     }
 
+    /** Erro que o código tratou sem propagar (ver EcuClient.noteSwallowed). Contado para não sumir. */
+    @Synchronized
+    fun recordSwallowed(where: String, message: String?) {
+        swallowed++
+        lastSwallowed = "$where: ${message ?: "sem mensagem"}".take(MAX_ERROR)
+    }
+
     @Synchronized
     fun snapshot(handshakeFallbackReason: String?, legacyLockedOut: Boolean): ConnectionHealthSnapshot {
         val now = MonotonicClock.nowMillis()
@@ -119,6 +131,8 @@ internal class ConnectionHealth {
             lastError = lastError,
             lastWriteOperation = lastWriteOperation,
             msSinceLastWrite = lastWriteAtMs?.let { now - it },
+            swallowedErrors = swallowed,
+            lastSwallowed = lastSwallowed,
         )
     }
 

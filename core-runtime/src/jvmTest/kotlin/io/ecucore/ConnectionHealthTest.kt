@@ -76,4 +76,19 @@ class ConnectionHealthTest {
         assertNull(fresh.lastWriteOperation)
         assertNull(fresh.lastError)
     }
+
+    @Test
+    fun `swallowed errors are counted, kept as last and reset with the session`() {
+        val h = ConnectionHealth()
+        h.recordSwallowed("battery_correction_page_4", "Timeout: expected 16 bytes")
+        h.recordSwallowed("listener_write_integrity", "x".repeat(500))
+
+        val s = h.snapshot(null, false)
+        assertEquals(2, s.swallowedErrors)
+        assertTrue(s.lastSwallowed!!.startsWith("listener_write_integrity:"))
+        assertEquals(120, s.lastSwallowed!!.length)
+
+        h.reset()
+        assertEquals(0, h.snapshot(null, false).swallowedErrors)
+    }
 }

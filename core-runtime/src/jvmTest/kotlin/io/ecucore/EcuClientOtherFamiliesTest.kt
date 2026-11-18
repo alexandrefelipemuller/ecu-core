@@ -103,12 +103,17 @@ class EcuClientOtherFamiliesTest {
     }
 
     @Test
-    fun `ms3 burn that the ecu does not support is ignored`() = runBlocking {
+    fun `ms3 burn that the ecu does not support is ignored but reported as not confirmed`() = runBlocking {
         val (c, ecu) = connect(ClientFakeEcu.Kind.MS3)
         ecu.onFrame = { cmd, _ ->
             if (cmd == 'b') listOf(byteArrayOf(0x00, 0x01), byteArrayOf(0x84.toByte()), ByteArray(4)) else null
         }
-        c.writeRawPage(0x05, ByteArray(16)) // burn 0x84 em MS3 = ignorado
+        val events = mutableListOf<io.ecucore.WriteIntegrityEvent>()
+        c.writeIntegrityListener = { events += it }
+        c.writeRawPage(0x05, ByteArray(16)) // segue (tolerado em MS3), mas NÃO pode passar em silêncio
+        val event = events.single { it.kind == io.ecucore.WriteIntegrityKind.BURN_NOT_CONFIRMED }
+        assertEquals(true, event.kind.critical)
+        assertTrue(event.label.contains("MS3"))
         val (ms2, ms2Ecu) = connect(ClientFakeEcu.Kind.MS2)
         ms2Ecu.onFrame = { cmd, _ ->
             if (cmd == 'b') listOf(byteArrayOf(0x00, 0x01), byteArrayOf(0x84.toByte()), ByteArray(4)) else null

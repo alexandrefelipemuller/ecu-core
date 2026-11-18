@@ -268,6 +268,16 @@ class EcuClient(
     @Volatile
     private var finalHealth: ConnectionHealthSnapshot? = null
 
+    /**
+     * Registro único para erro tratado sem propagar. Antes cada `runCatching` decidia sozinho; agora
+     * todo erro engolido vai para o trace da sessão e para o resumo de saúde (`swallowedErrors`).
+     */
+    private fun noteSwallowed(where: String, e: Throwable) {
+        connectionHealth.recordSwallowed(where, e.message)
+        ConnectionTrace.info("swallowed", "where=$where msg=${e.message ?: e::class.simpleName}")
+        Logger.w(TAG, "$where: ${e.message}")
+    }
+
     private fun buildHealthSnapshot(): ConnectionHealthSnapshot =
         connectionHealth.snapshot(protocol.getHandshakeFallbackReason(), protocol.isLegacyCommsLockedOut())
 
@@ -1612,7 +1622,7 @@ class EcuClient(
         return runCatching {
             constants.withBatteryCorrection(readPage(pageNum = layout.page, offset = 0, length = layout.pageLength), layout)
         }.getOrElse {
-            Logger.w(TAG, "Correção de bateria (página ${layout.page}) indisponível: ${it.message}")
+            noteSwallowed("battery_correction_page_${layout.page}", it)
             constants
         }
     }
@@ -2479,7 +2489,7 @@ class EcuClient(
                 hasPage9 = EngineProtectionMapper.hasPage9Protection(era, activeIniDefinition),
             )
         }.getOrElse {
-            Logger.w(TAG, "Engine protection pages (1/4/9/10) unavailable: ${it.message}")
+            noteSwallowed("engine_protection_pages", it)
             base
         }
     }
@@ -3121,7 +3131,7 @@ class EcuClient(
                 "page_write",
                 "anomaly page=${event.pageId} pass=${event.pass} mismatches=${event.mismatchedOffsets.size} recovered=$recovered"
             )
-            runCatching { pageWriteAnomalyListener?.invoke(event) }
+            runCatching { pageWriteAnomalyListener?.invoke(event) }.onFailure { noteSwallowed("listener_page_write_anomaly", it) }
         }
         for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
             try {
@@ -3313,7 +3323,7 @@ class EcuClient(
         val identity = cacheIdentity() ?: return
         runCatching {
             store.save(identity, BurnRecords.merge(store.load(identity), burned, WallClock.nowEpochMillis()))
-        }.onFailure { Logger.w(TAG, "Não foi possível guardar o registro do burn: ${it.message}") }
+        }.onFailure { noteSwallowed("persist_burn_record", it) }
     }
 
     /**
@@ -3345,7 +3355,7 @@ class EcuClient(
 
     private fun emitWriteIntegrity(event: WriteIntegrityEvent) {
         ConnectionTrace.info("page_write", "integrity kind=${event.kind} page=${event.pageId} off=${event.offset} len=${event.length}")
-        runCatching { writeIntegrityListener?.invoke(event) }
+        runCatching { writeIntegrityListener?.invoke(event) }.onFailure { noteSwallowed("listener_write_integrity", it) }
     }
 
     override suspend fun burnConfigs() = withEcuIo { burnConfigsUnlocked() }
@@ -4025,7 +4035,7 @@ class EcuClient(
                     Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${writeError.message})")
                 }
                 anomalies.forEach { event ->
-                    runCatching { pageWriteAnomalyListener?.invoke(event.copy(recovered = true)) }
+                    runCatching { pageWriteAnomalyListener?.invoke(event.copy(recovered = true)) }.onFailure { noteSwallowed("listener_page_write_anomaly", it) }
                 }
                 delay(300)
                 regions.burnTableIds.sorted().forEach { burn(it) }
@@ -4049,7 +4059,7 @@ class EcuClient(
             Logger.w(TAG, "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass; regravando")
         }
         val rolledBack = originals != null && rollbackRegions(regions, originals, write, label)
-        anomalies.forEach { event -> runCatching { pageWriteAnomalyListener?.invoke(event) } }
+        anomalies.forEach { event -> runCatching { pageWriteAnomalyListener?.invoke(event) }.onFailure { noteSwallowed("listener_page_write_anomaly", it) } }
         throw PageWriteVerificationException(
             pageId = regions.list.first().tableId,
             label = label,
@@ -4888,9 +4898,14 @@ class EcuClient(
                 message.contains("received 0 bytes", ignoreCase = true) ||
                 message.contains("no response", ignoreCase = true)
             if (family == EcuFamily.MS3 && notBurnable) {
-                Logger.w(
-                    TAG,
-                    "Ignorando burn não suportado para tabela ${formatPageId(tableId)} em MS3: $message"
+                // Não é "não suportado": a ECU não confirmou o burn. Segue (tolerado para MS3), mas
+                // vira evento crítico para o usuário saber que essa tabela pode não estar na EEPROM.
+                Logger.w(TAG, "Burn de tabela ${formatPageId(tableId)} não confirmado em MS3: $message")
+                emitWriteIntegrity(
+                    WriteIntegrityEvent(
+                        WriteIntegrityKind.BURN_NOT_CONFIRMED, tableId, 0, 0,
+                        "burn MS3 tabela ${formatPageId(tableId)}", 0L, null, message.take(120),
+                    ),
                 )
                 return
             }

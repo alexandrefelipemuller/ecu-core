@@ -23,6 +23,13 @@ enum class WriteIntegrityKind(val critical: Boolean) {
      * pode ser externa ao app.
      */
     PREVIOUS_BURN_DIVERGED(critical = false),
+
+    /**
+     * O burn foi pedido mas a ECU não confirmou (ex.: MS3 sem resposta ao burn de tabela). Antes desta
+     * correção o erro era engolido e a restauração reportava sucesso com a RAM gravada e a EEPROM
+     * sem garantia. Crítico: o usuário acha que está salvo.
+     */
+    BURN_NOT_CONFIRMED(critical = true),
 }
 
 /**
