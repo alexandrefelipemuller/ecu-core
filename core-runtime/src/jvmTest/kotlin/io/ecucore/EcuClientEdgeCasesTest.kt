@@ -125,7 +125,8 @@ class EcuClientEdgeCasesTest {
     fun `pin layout detection tolerates a short cached page`() = runBlocking<Unit> {
         val cache = object : EcuConfigPageCache {
             val invalidated = mutableListOf<String>()
-            override fun read(identity: String, pageNum: Int, offset: Int, length: Int, nowMs: Long, ttlMs: Long) = ByteArray(4)
+            // só a página do pin layout vem curta; as demais (read-back de gravação) vão à ECU
+            override fun read(identity: String, pageNum: Int, offset: Int, length: Int, nowMs: Long, ttlMs: Long): ByteArray? = if (pageNum == 1) ByteArray(4) else null
             override fun store(identity: String, pageNum: Int, offset: Int, length: Int, data: ByteArray, nowMs: Long) = Unit
             override fun invalidatePage(identity: String, pageNum: Int) { invalidated += "page$pageNum" }
             override fun invalidateIdentity(identity: String) { invalidated += identity }

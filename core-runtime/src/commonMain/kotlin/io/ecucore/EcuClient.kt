@@ -14,6 +14,7 @@ import io.ecucore.definition.IniFieldKind
 import io.ecucore.ecu.FirmwareConsensus
 import io.ecucore.ecu.FirmwareHandshakeDomain
 import io.ecucore.ecu.FirmwareInfo
+import io.ecucore.shared.Crc32Table
 import io.ecucore.shared.Logger
 import io.ecucore.cache.EcuConfigPageCache
 import io.ecucore.cache.NoopEcuConfigPageCache
@@ -191,6 +192,12 @@ class EcuClient(
         // com legacy ainda liberado, bytes 'A'..'z' desse lixo viram comandos 'W' (escrita de 1
         // byte na RAM) - célula corrompida sem nenhum erro visível. Só o read-back pega isso.
         private const val TABLE_WRITE_CHUNK_SIZE = 64
+
+        /** Respiro depois do burn antes de reler (a ECU está gravando a EEPROM e pode não responder). */
+        private const val POST_BURN_SETTLE_MS = 150L
+
+        /** SERIAL_RC_RANGE_ERR do Speeduino: a ECU recusou o valor (fora de faixa / bins fora de ordem). */
+        private const val RANGE_ERR_RESPONSE_CODE = 0x84
         private const val TABLE_WRITE_CHUNK_MAX_ATTEMPTS = 3
         private const val TABLE_WRITE_VERIFY_MAX_PASSES = 2
         private const val CONFIG_CHUNK_READ_RETRY_DELAY_MS = 40L
@@ -246,6 +253,23 @@ class EcuClient(
      */
     @Volatile
     var pageWriteAnomalyListener: ((PageWriteAnomaly) -> Unit)? = null
+
+    /**
+     * Falhas de integridade ao redor do burn (ver [WriteIntegrityKind]). Quem escuta decide o destino
+     * (log da sessão, Crashlytics). Exceções do listener nunca interrompem a gravação.
+     */
+    var writeIntegrityListener: ((WriteIntegrityEvent) -> Unit)? = null
+
+    private val writeLedger = WriteLedger()
+
+    /**
+     * Onde guardar o que cada burn deixou (CRC por região, por ECU). Com ele, a próxima gravação da
+     * mesma região confere o que a ECU realmente tem antes de sobrescrever ([WriteIntegrityKind.PREVIOUS_BURN_DIVERGED]).
+     */
+    var burnRecordStore: BurnRecordStore? = null
+
+    /** Regiões queimadas pelo último burn (para conferir na próxima conexão). Vazio se nenhuma. */
+    fun getLastBurnedRegions(): List<WriteLedgerEntry> = writeLedger.lastBurned()
 
     /**
      * Confirmação opcional de mudanças grandes em VE/Ignição/AFR (Speeduino). Quando definido, antes
@@ -1045,6 +1069,7 @@ class EcuClient(
      */
     private fun clearEcuIdentity() {
         protocol.resetHandshakeFallbackReason()
+        writeLedger.clear()
         firmwareInfo = null
         ecuDefinition = null
         tableDefinitions = null
@@ -1215,6 +1240,7 @@ class EcuClient(
             writeSpeeduinoTableVerified(pageNum.toInt() and 0xFF, offset, data, label)
         } else {
             writeConfigPage(pageNum, offset, data)
+            writeLedger.recordUnverified(pageNum.toInt() and 0xFF, offset, data, label)
         }
     }
 
@@ -1611,7 +1637,7 @@ class EcuClient(
         writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_PRESSURE_OWNED_OFFSETS, "Pressure Calibration")
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
         }
     }
 
@@ -1662,7 +1688,7 @@ class EcuClient(
         writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_TPS_OWNED_OFFSETS, "TPS Calibration")
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
         }
     }
 
@@ -1767,7 +1793,7 @@ class EcuClient(
         )
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
         }
     }
 
@@ -2286,7 +2312,7 @@ class EcuClient(
     private suspend fun writeSpeeduinoAntiTheftBytes(page: Int, offset: Int, data: ByteArray, label: String) {
         writeConfigPageVerified(pageNum = page.toByte(), offset = offset, data = data, label = label)
         invalidateCachedPage(page)
-        protocol.burnConfig()
+        burnConfigGuarded()
     }
 
     /** Grava o campo (bits sem mexer nos vizinhos do mesmo byte); pula se já estiver no valor. */
@@ -2512,7 +2538,7 @@ class EcuClient(
         }
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
             Logger.d(TAG, "Engine Protection gravado e burn executado")
         } else {
             Logger.d(TAG, "Engine Protection gravado (sem burn)")
@@ -2531,7 +2557,7 @@ class EcuClient(
         writeOwnedConfigPage(pageNum, 0, before, updated, owned, "Engine Protection page $pageNum")
         if (burn) {
             delay(200)
-            protocol.burnConfig()
+            burnConfigGuarded()
         }
     }
 
@@ -2569,7 +2595,7 @@ class EcuClient(
         }
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
             Logger.d(TAG, "Closed Loop Corrections gravadas e burn executado")
         } else {
             Logger.d(TAG, "Closed Loop Corrections gravadas (sem burn)")
@@ -2625,7 +2651,7 @@ class EcuClient(
         )
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
             Logger.d(TAG, "Trigger Settings gravados e burn executado")
         } else {
             Logger.d(TAG, "Trigger Settings gravados (sem burn)")
@@ -2656,7 +2682,7 @@ class EcuClient(
 
         if (burn) {
             delay(300)
-            protocol.burnConfig()
+            burnConfigGuarded()
             Logger.d(TAG, "Secondary Serial Config gravado e burn executado")
         } else {
             Logger.d(TAG, "Secondary Serial Config gravado (sem burn)")
@@ -2871,7 +2897,7 @@ class EcuClient(
             }
 
             // Burn to EEPROM
-            protocol.burnConfig()
+            burnConfigGuarded()
             Logger.d(TAG, "Burn executado com sucesso")
         }
         cachedEngineConstants = engineConstants
@@ -2885,17 +2911,17 @@ class EcuClient(
     private suspend fun writeRawPageUnlocked(pageNum: Int, data: ByteArray) {
         ensureWritable("writeRawPage")
         if (ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE) {
-            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            writeRawConfigPage(pageNum, data)
             settleAfterConfigWrite()
-            protocol.burnConfig()
+            burnConfigGuarded()
             Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup e burn executado")
             return
         }
         if (firmwareInfo?.family == EcuFamily.SPEEDUINO && isModernTablePage(pageNum, data.size)) {
-            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            writeRawConfigPage(pageNum, data)
             pendingSpeeduinoPageReadbacks[pageNum] = data.copyOf()
             settleAfterConfigWrite()
-            protocol.burnConfig()
+            burnConfigGuarded()
             delay(150)
             runCatching { connection.clearInputBuffer() }
             Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup e burn executado")
@@ -2914,9 +2940,9 @@ class EcuClient(
             settleAfterConfigWrite()
             burnTableIfSupported(tableId = tableId, family = getEcuFamily())
         } else {
-            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            writeRawConfigPage(pageNum, data)
             settleAfterConfigWrite()
-            protocol.burnConfig()
+            burnConfigGuarded()
         }
         delay(150)
         runCatching { connection.clearInputBuffer() }
@@ -2935,13 +2961,13 @@ class EcuClient(
     private suspend fun writeRawPageWithoutBurnUnlocked(pageNum: Int, data: ByteArray) {
         ensureWritable("writeRawPageWithoutBurn")
         if (ecuDefinition?.runtime?.configReadMode == EcuConfigReadMode.LEGACY_PAGE) {
-            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            writeRawConfigPage(pageNum, data)
             settleAfterConfigWrite()
             Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup (sem burn)")
             return
         }
         if (firmwareInfo?.family == EcuFamily.SPEEDUINO && isModernTablePage(pageNum, data.size)) {
-            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            writeRawConfigPage(pageNum, data)
             settleAfterConfigWrite()
             Logger.d(TAG, "Página ${formatPageId(pageNum)} gravada via backup (sem burn)")
             return
@@ -2957,7 +2983,7 @@ class EcuClient(
             val tableOffset = alias?.offset ?: 0
             writeTableLimited(tableId, tableOffset, data, getEcuFamily())
         } else {
-            writeConfigPage(pageNum = pageNum.toByte(), offset = 0, data = data)
+            writeRawConfigPage(pageNum, data)
         }
         if (firmwareInfo?.family == EcuFamily.SPEEDUINO && isModernTablePage(pageNum, data.size)) {
             pendingSpeeduinoPageReadbacks[pageNum] = data.copyOf()
@@ -2988,7 +3014,7 @@ class EcuClient(
             return
         }
 
-        writePageChunksWithRetry(pageNum, data, chunkSize, startOffset)
+        writeSpeeduinoTableVerified(pageNum, startOffset, data, "restore ${formatPageId(pageNum)}", chunkSize, rethrowRangeRejection = true)
         settleAfterConfigWrite()
         delay(150)
         runCatching { connection.clearInputBuffer() }
@@ -3001,6 +3027,7 @@ class EcuClient(
         data: ByteArray,
         chunkSize: Int,
         startOffset: Int,
+        failFastOnRange: Boolean = false,
     ): List<Exception> {
         val recoveredErrors = mutableListOf<Exception>()
         var offset = startOffset
@@ -3020,6 +3047,9 @@ class EcuClient(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    // RANGE_ERR é a ECU recusando o valor: reenviar não adianta e esconderia do
+                    // chamador (restauração) a rejeição que ele precisa tratar.
+                    if (failFastOnRange && isRangeRejection(e)) throw e
                     if (attempt >= TABLE_WRITE_CHUNK_MAX_ATTEMPTS) throw e
                     recoveredErrors += e
                     Logger.w(TAG, "Chunk #$chunkIndex da pagina ${formatPageId(pageNum)} falhou (tentativa $attempt): ${e.message}; retentando")
@@ -3054,9 +3084,17 @@ class EcuClient(
      * escreveu a partir de lixo do link); persistindo, lança [PageWriteVerificationException]
      * e o chamador NÃO faz burn - a EEPROM continua com a tabela anterior, íntegra.
      */
-    private suspend fun writeSpeeduinoTableVerified(pageNum: Int, offset: Int, data: ByteArray, label: String) {
+    private suspend fun writeSpeeduinoTableVerified(
+        pageNum: Int,
+        offset: Int,
+        data: ByteArray,
+        label: String,
+        chunkSize: Int = TABLE_WRITE_CHUNK_SIZE,
+        rethrowRangeRejection: Boolean = false,
+    ) {
         // Imagem anterior da região, para restaurar a RAM se a gravação não puder ser confirmada.
         val original = captureSpeeduinoRegion(pageNum, offset, data.size)
+        checkPreviousBurn(pageNum, offset, data.size, original)
         var mismatches: List<Int> = emptyList()
         var lastWriteError: Exception? = null
         var retriedWriteError: Exception? = null
@@ -3071,7 +3109,7 @@ class EcuClient(
         }
         for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
             try {
-                val retried = writePageChunksWithRetry(pageNum, data, TABLE_WRITE_CHUNK_SIZE, offset)
+                val retried = writePageChunksWithRetry(pageNum, data, chunkSize, offset, failFastOnRange = rethrowRangeRejection)
                 // Chunk rejeitado e recuperado no retry: o retry pode ter sobrescrito o lixo, mas
                 // 0x82 no link continua sendo sinal que precisa chegar na telemetria.
                 lastWriteError = null
@@ -3079,6 +3117,9 @@ class EcuClient(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // Restauração: RANGE_ERR (0x84) é a ECU recusando o VALOR, não falha de link; o
+                // chamador decide pela mensagem/tipo (ex.: sanitizar a página 6), então propaga intacto.
+                if (rethrowRangeRejection && isRangeRejection(e)) throw e
                 // Mesmo com a escrita falhando, relê: a RAM da ECU pode ter sido alterada pelo
                 // lixo do frame rejeitado e o usuário precisa saber se ela diverge da tela.
                 lastWriteError = e
@@ -3113,12 +3154,14 @@ class EcuClient(
             if (mismatches.isEmpty() && lastWriteError == null) {
                 Logger.d(TAG, "$label: read-back confere (${data.size} bytes, passe $pass)")
                 report(recovered = true)
+                writeLedger.recordVerified(pageNum, offset, data, label)
                 return
             }
             if (mismatches.isEmpty()) {
                 // Bytes certos na RAM apesar do erro (ex.: ACK perdido na volta): pode seguir.
                 Logger.w(TAG, "$label: read-back confere apesar do erro de escrita (${lastWriteError?.message})")
                 report(recovered = true)
+                writeLedger.recordVerified(pageNum, offset, data, label)
                 return
             }
             Logger.w(
@@ -3139,6 +3182,24 @@ class EcuClient(
             cause = lastWriteError,
             rolledBack = rolledBack,
         )
+    }
+
+    private fun isRangeRejection(e: Exception): Boolean =
+        e is EcuProtocol.PageWriteRejectedException && e.responseCode == RANGE_ERR_RESPONSE_CODE
+
+    /**
+     * Gravação de página inteira de backup/restauração. Speeduino: mesma garantia das tabelas
+     * (read-back antes do burn, rollback da RAM), mas num único frame como sempre foi e com RANGE_ERR
+     * propagado intacto. Demais famílias não têm read-back aqui: ficam como `unverified` no livro.
+     */
+    private suspend fun writeRawConfigPage(pageNum: Int, data: ByteArray) {
+        val label = "restore ${formatPageId(pageNum)}"
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) {
+            writeSpeeduinoTableVerified(pageNum, 0, data, label, chunkSize = data.size.coerceAtLeast(1), rethrowRangeRejection = true)
+        } else {
+            writeConfigPage(pageNum.toByte(), 0, data)
+            writeLedger.recordUnverified(pageNum, 0, data, label)
+        }
     }
 
     /** Lê a região atual da ECU antes de sobrescrevê-la; `null` se não foi possível. */
@@ -3186,6 +3247,91 @@ class EcuClient(
     /**
      * Executa burn após gravações em lote.
      */
+    /**
+     * Único ponto de burn de configuração: (1) recusa se houver gravação Speeduino sem read-back
+     * confirmado; (2) queima; (3) relê o que foi queimado e emite [WriteIntegrityEvent] se divergir.
+     * A releitura é da RAM da ECU (ver [WriteIntegrityEvent]) e nunca lança: o burn já aconteceu.
+     */
+    private suspend fun burnConfigGuarded() {
+        val isSpeeduino = firmwareInfo?.family == EcuFamily.SPEEDUINO
+        if (isSpeeduino) {
+            val unverified = writeLedger.pending().filter { !it.verified }
+            if (unverified.isNotEmpty()) {
+                unverified.forEach { emitWriteIntegrity(WriteIntegrityEvent(WriteIntegrityKind.BURN_BLOCKED_UNVERIFIED, it.pageId, it.offset, it.length, it.label, it.crc, null)) }
+                throw UnverifiedBurnBlockedException(unverified)
+            }
+        }
+        protocol.burnConfig()
+        val burned = writeLedger.markBurned()
+        if (isSpeeduino && burned.isNotEmpty()) {
+            persistBurnRecords(burned)
+            verifyAfterBurn(burned)
+        }
+    }
+
+    private suspend fun verifyAfterBurn(entries: List<WriteLedgerEntry>) {
+        delay(POST_BURN_SETTLE_MS)
+        for (entry in entries) {
+            try {
+                runCatching { connection.clearInputBuffer() }
+                invalidateCachedPage(entry.pageId)
+                pendingSpeeduinoPageReadbacks.remove(entry.pageId)
+                val readBack = readPage(entry.pageId, entry.offset, entry.length)
+                invalidateCachedPage(entry.pageId)
+                val actual = Crc32Table.compute(readBack)
+                if (readBack.size != entry.length || actual != entry.crc) {
+                    Logger.w(TAG, "${entry.label}: pós-burn DIVERGE (esperado ${entry.crc.toString(16)}, lido ${actual.toString(16)})")
+                    emitWriteIntegrity(WriteIntegrityEvent(WriteIntegrityKind.POST_BURN_MISMATCH, entry.pageId, entry.offset, entry.length, entry.label, entry.crc, actual, "readBackSize=${readBack.size}"))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Logger.w(TAG, "${entry.label}: pós-burn ilegível: ${e.message}")
+                emitWriteIntegrity(WriteIntegrityEvent(WriteIntegrityKind.POST_BURN_UNREADABLE, entry.pageId, entry.offset, entry.length, entry.label, entry.crc, null, e.message))
+            }
+        }
+    }
+
+    private fun persistBurnRecords(burned: List<WriteLedgerEntry>) {
+        val store = burnRecordStore ?: return
+        val identity = cacheIdentity() ?: return
+        runCatching {
+            store.save(identity, BurnRecords.merge(store.load(identity), burned, WallClock.nowEpochMillis()))
+        }.onFailure { Logger.w(TAG, "Não foi possível guardar o registro do burn: ${it.message}") }
+    }
+
+    /**
+     * Antes de sobrescrever uma região, compara o que a ECU tem ([current], já lido por
+     * [captureSpeeduinoRegion]) com o que o último burn dela deixou. Sem leitura extra.
+     */
+    private fun checkPreviousBurn(pageNum: Int, offset: Int, length: Int, current: ByteArray?) {
+        val store = burnRecordStore ?: return
+        val identity = cacheIdentity() ?: return
+        if (current == null || current.size != length) return
+        runCatching {
+            val records = store.load(identity)
+            val record = records.firstOrNull { it.sameRegion(pageNum, offset, length) } ?: return
+            val actual = Crc32Table.compute(current)
+            if (actual != record.crc) {
+                val elapsed = WallClock.nowEpochMillis() - record.burnedAtEpochMs
+                Logger.w(TAG, "${record.label}: a região difere do último burn (${record.crc.toString(16)} -> ${actual.toString(16)}, há ${elapsed / 1000}s)")
+                emitWriteIntegrity(
+                    WriteIntegrityEvent(
+                        WriteIntegrityKind.PREVIOUS_BURN_DIVERGED, pageNum, offset, length, record.label,
+                        record.crc, actual, "elapsedMs=$elapsed",
+                    ),
+                )
+                // Reportado uma vez: o próximo burn desta região grava o registro novo.
+                store.save(identity, records - record)
+            }
+        }
+    }
+
+    private fun emitWriteIntegrity(event: WriteIntegrityEvent) {
+        ConnectionTrace.info("page_write", "integrity kind=${event.kind} page=${event.pageId} off=${event.offset} len=${event.length}")
+        runCatching { writeIntegrityListener?.invoke(event) }
+    }
+
     override suspend fun burnConfigs() = withEcuIo { burnConfigsUnlocked() }
 
     private suspend fun burnConfigsUnlocked() {
@@ -3198,7 +3344,7 @@ class EcuClient(
         ) {
             throw IllegalStateException("${firmwareInfo?.family} requires page-specific burn; use table-specific write helpers.")
         }
-        protocol.burnConfig()
+        burnConfigGuarded()
         Logger.d(TAG, "Burn executado após restauração em lote")
     }
 
@@ -3214,7 +3360,7 @@ class EcuClient(
         ) {
             throw IllegalStateException("${firmwareInfo?.family} requires table-specific burn.")
         }
-        protocol.burnConfig()
+        burnConfigGuarded()
         Logger.d(TAG, "Burn legacy executado para a última página gravada")
     }
 
@@ -3264,7 +3410,7 @@ class EcuClient(
         Logger.d(TAG, "VE Table $mapIndex gravada e conferida na Page ${metadata.page}")
 
         // Burn to EEPROM (também demora - grava na flash/EEPROM)
-        protocol.burnConfig()
+        burnConfigGuarded()
         Logger.d(TAG, "✅ Burn executado com sucesso!")
     }
 
@@ -3314,7 +3460,7 @@ class EcuClient(
         Logger.d(TAG, "Ignition Table gravada e conferida")
 
         // 5. Burn to EEPROM
-        protocol.burnConfig()
+        burnConfigGuarded()
         Logger.d(TAG, "✅ Burn executado com sucesso!")
     }
 
@@ -3340,7 +3486,7 @@ class EcuClient(
         delay(1000)
         Logger.d(TAG, "Aguardou 1s para processamento do write")
 
-        protocol.burnConfig()
+        burnConfigGuarded()
         Logger.d(TAG, "✅ Burn executado com sucesso!")
     }
 
@@ -3717,7 +3863,7 @@ class EcuClient(
         Logger.d(TAG, "AFR Table gravada e conferida na Page ${metadata.page}")
 
         // Burn to EEPROM
-        protocol.burnConfig()
+        burnConfigGuarded()
         Logger.d(TAG, "✅ Burn executado com sucesso!")
     }
 

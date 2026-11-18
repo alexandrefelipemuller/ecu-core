@@ -224,6 +224,201 @@ class EcuClientVerifiedTableWriteTest {
         assertEquals(1, ecu.burns)
     }
 
+
+    // ---- P0: restauração/backup de páginas e integridade ao redor do burn -------------------------
+
+    private fun restoreImage(fill: Int) = ByteArray(128) { fill.toByte() }
+
+    @Test
+    fun `restauracao limpa grava confere por read-back e so entao queima`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        val events = mutableListOf<WriteIntegrityEvent>()
+        client.writeIntegrityListener = { events += it }
+        client.connect()
+        val image = restoreImage(7)
+
+        client.writeRawPage(4, image)
+
+        assertContentEquals(image, ecu.read(4, 0, 128))
+        assertEquals(1, ecu.burns)
+        assertEquals(emptyList(), events)
+    }
+
+    @Test
+    fun `restauracao com RAM corrompida pelo link lanca excecao e nao queima a EEPROM`() = runBlocking {
+        // Antes desta correção writeRawPage gravava sem read-back e queimava o lixo na EEPROM.
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptEveryWrite = true)
+        val client = newClient(ecu)
+        client.connect()
+
+        val error = assertFailsWith<PageWriteVerificationException> { client.writeRawPage(4, restoreImage(7)) }
+
+        assertEquals(4, error.pageId)
+        assertEquals(0, ecu.burns, "RAM divergente nunca pode ir pra EEPROM")
+    }
+
+    @Test
+    fun `restauracao em lote sem burn tambem confere por read-back`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptEveryWrite = true)
+        val client = newClient(ecu)
+        client.connect()
+
+        assertFailsWith<PageWriteVerificationException> { client.writeRawPageWithoutBurn(4, restoreImage(7)) }
+        assertFailsWith<PageWriteVerificationException> { client.writeRawPageChunkedWithoutBurn(4, restoreImage(7), 32, 0) }
+        assertEquals(0, ecu.burns)
+    }
+
+    @Test
+    fun `restauracao em chunks grava e confere`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+        val image = ByteArray(200) { (it * 3).toByte() }
+
+        client.writeRawPageChunkedWithoutBurn(4, image, 32, 0)
+
+        assertContentEquals(image, ecu.read(4, 0, 200))
+    }
+
+    @Test
+    fun `RAM que diverge depois do burn emite POST_BURN_MISMATCH critico mas nao lanca`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, corruptOnBurn = true)
+        val client = newClient(ecu)
+        val events = mutableListOf<WriteIntegrityEvent>()
+        client.writeIntegrityListener = { events += it }
+        client.connect()
+
+        client.writeRawPage(4, restoreImage(7)) // burn aconteceu: não pode lançar
+
+        assertEquals(1, ecu.burns)
+        val event = events.single()
+        assertEquals(WriteIntegrityKind.POST_BURN_MISMATCH, event.kind)
+        assertTrue(event.kind.critical)
+        assertEquals(4, event.pageId)
+        assertTrue(event.expectedCrc != event.actualCrc)
+    }
+
+    @Test
+    fun `pagina ilegivel depois do burn emite POST_BURN_UNREADABLE nao critico`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, failReadsAfterBurn = true)
+        val client = newClient(ecu)
+        val events = mutableListOf<WriteIntegrityEvent>()
+        client.writeIntegrityListener = { events += it }
+        client.connect()
+
+        client.writeRawPage(4, restoreImage(7))
+
+        val event = events.single()
+        assertEquals(WriteIntegrityKind.POST_BURN_UNREADABLE, event.kind)
+        assertEquals(false, event.kind.critical)
+    }
+
+    @Test
+    fun `burn limpo nao emite evento e registra as regioes queimadas`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        val events = mutableListOf<WriteIntegrityEvent>()
+        client.writeIntegrityListener = { events += it }
+        client.connect()
+        val image = restoreImage(9)
+
+        client.writeRawPage(4, image)
+
+        assertEquals(emptyList(), events)
+        val burned = client.getLastBurnedRegions().single()
+        assertEquals(4, burned.pageId)
+        assertEquals(128, burned.length)
+        assertEquals(io.ecucore.shared.Crc32Table.compute(image), burned.crc)
+        assertTrue(burned.verified)
+    }
+
+    @Test
+    fun `ledger so queima o confirmado e guarda o ultimo burn`() {
+        val ledger = WriteLedger()
+        ledger.recordVerified(2, 0, byteArrayOf(1, 2, 3), "a")
+        ledger.recordUnverified(3, 0, byteArrayOf(4), "b")
+
+        assertEquals(listOf(false), ledger.pending().filter { !it.verified }.map { it.verified })
+        val burned = ledger.markBurned()
+
+        assertEquals(2, burned.size)
+        assertEquals(emptyList(), ledger.pending())
+        assertEquals(burned, ledger.lastBurned())
+        ledger.clear()
+        assertEquals(emptyList(), ledger.lastBurned())
+    }
+
+
+    // ---- conferência do último burn (persistência) --------------------------------------------------
+
+    private class MemoryBurnStore : BurnRecordStore {
+        val data = mutableMapOf<String, List<BurnRecord>>()
+        override fun load(identity: String) = data[identity].orEmpty()
+        override fun save(identity: String, records: List<BurnRecord>) { data[identity] = records }
+    }
+
+    @Test
+    fun `regiao diferente do ultimo burn emite PREVIOUS_BURN_DIVERGED antes de sobrescrever`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        val store = MemoryBurnStore()
+        val events = mutableListOf<WriteIntegrityEvent>()
+        client.burnRecordStore = store
+        client.writeIntegrityListener = { events += it }
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
+
+        client.writeVeTable(veTable(44), 1)
+        assertEquals(1, store.data.values.single().size, "o burn deixa um registro por região")
+        assertEquals(emptyList(), events)
+
+        // "Power cycle": a EEPROM não guardou o valor e a ECU recarregou outro conteúdo.
+        ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(70)).data)
+        client.writeVeTable(veTable(48), 1)
+
+        val event = events.single()
+        assertEquals(WriteIntegrityKind.PREVIOUS_BURN_DIVERGED, event.kind)
+        assertEquals(false, event.kind.critical)
+        assertEquals(metadata.page, event.pageId)
+        assertTrue(event.expectedCrc != event.actualCrc)
+        assertTrue(event.detail!!.startsWith("elapsedMs="))
+        assertEquals(1, ecu.burns - 1, "a gravação nova segue normalmente")
+    }
+
+    @Test
+    fun `regravacao sem mudanca externa nao emite aviso`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        val events = mutableListOf<WriteIntegrityEvent>()
+        client.burnRecordStore = MemoryBurnStore()
+        client.writeIntegrityListener = { events += it }
+        client.connect()
+
+        client.writeVeTable(veTable(44), 1)
+        client.writeVeTable(veTable(48), 1)
+        client.writeVeTable(veTable(52), 1)
+
+        assertEquals(emptyList(), events)
+        assertEquals(3, ecu.burns)
+    }
+
+    @Test
+    fun `burn novo substitui registros sobrepostos da mesma pagina e preserva os demais`() {
+        val old = listOf(
+            BurnRecord(4, 0, 128, 1, 10, "p4"),
+            BurnRecord(2, 0, 288, 2, 10, "ve"),
+        )
+        val burned = listOf(WriteLedgerEntry(4, 11, 6, 99, true, "trigger"))
+
+        val merged = BurnRecords.merge(old, burned, nowMs = 50)
+
+        assertEquals(listOf(2, 4), merged.map { it.pageId }.sorted())
+        assertEquals(99L, merged.first { it.pageId == 4 }.crc, "a página 4 inteira deixou de valer")
+        assertEquals(2L, merged.first { it.pageId == 2 }.crc)
+    }
+
     private fun veTable(value: Int) = VeTable(
         rpmBins = (1..16).map { it * 500 },
         loadBins = (1..16).map { it * 10 },
@@ -245,6 +440,10 @@ class EcuClientVerifiedTableWriteTest {
         private val corruptOffsetOnReject: Int,
         private val corruptEveryWrite: Boolean = false,
         private val corruptFirstWrites: Int = 0,
+        /** Reset/brownout durante o burn: depois dele a RAM não bate mais com o gravado. */
+        private val corruptOnBurn: Boolean = false,
+        /** Depois do burn a ECU não responde mais a leituras de página (rejeita com erro). */
+        private val failReadsAfterBurn: Boolean = false,
     ) : IEcuConnection {
         private val pages = mutableMapOf<Int, ByteArray>()
         private val handshake = mutableMapOf(
@@ -278,7 +477,9 @@ class EcuClientVerifiedTableWriteTest {
             val p = data.copyOfRange(3, data.size - 4) // sem length, cmd e CRC
             fun u16(i: Int) = (p[i].toInt() and 0xFF) or ((p[i + 1].toInt() and 0xFF) shl 8)
             when (command) {
-                'p'.code.toByte() -> pending += ModernEnvelopeFake.framedResponse(read(p[1].toInt() and 0xFF, u16(2), u16(4)))
+                'p'.code.toByte() ->
+                    if (failReadsAfterBurn && burns > 0) pending += rc(0x83)
+                    else pending += ModernEnvelopeFake.framedResponse(read(p[1].toInt() and 0xFF, u16(2), u16(4)))
                 'M'.code.toByte() -> {
                     val pageNum = p[1].toInt() and 0xFF
                     val offset = u16(2)
@@ -296,6 +497,7 @@ class EcuClientVerifiedTableWriteTest {
                 }
                 'B'.code.toByte() -> {
                     burns++
+                    if (corruptOnBurn) pages.values.forEach { it[corruptOffsetOnReject] = 99 }
                     pending += rc(0x04)
                 }
                 else -> pending += ModernEnvelopeFake.framedResponse(nextHandshake(command))

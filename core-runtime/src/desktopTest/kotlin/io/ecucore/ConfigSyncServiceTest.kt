@@ -290,7 +290,9 @@ class ConfigSyncServiceTest {
     fun `a page that keeps failing aborts the restore with every error`() = runBlocking<Unit> {
         val (client, ecu) = connected()
         ecu.onFrame = { cmd, p -> if (cmd == 'M' && pageOf(p) == 1) busyErr else null }
-        val dir = session("falha", 1 to ByteArray(128))
+        // Dados não-zero: com zeros, a RAM vazia "já confere" no read-back e a gravação seria
+        // (corretamente) considerada concluída apesar do erro de escrita.
+        val dir = session("falha", 1 to ByteArray(128) { 9 })
         val error = assertFailsWith<IllegalStateException> {
             service.restoreConfigToEcu(client, dir, skipPages = (2..10).map { it.toByte() }.toSet())
         }
