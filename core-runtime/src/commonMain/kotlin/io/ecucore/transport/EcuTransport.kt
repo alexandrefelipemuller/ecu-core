@@ -80,6 +80,12 @@ interface EcuTransport {
      */
     fun getHandshakeFallbackReason(): String? = null
 
+    /**
+     * Saúde da sessão (falhas recuperáveis, trocas de protocolo, retries de gravação, ...). Só o
+     * [io.ecucore.EcuClient] mede isso; os demais transportes devolvem `null`.
+     */
+    fun getConnectionHealth(): io.ecucore.ConnectionHealthSnapshot? = null
+
     fun getTableDefinitions(): TableDefinitions?
 
     fun getEcuPageCatalog(): List<EcuPageDescriptor> = emptyList()

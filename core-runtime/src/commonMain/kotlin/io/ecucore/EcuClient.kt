@@ -262,6 +262,18 @@ class EcuClient(
 
     private val writeLedger = WriteLedger()
 
+    private val connectionHealth = ConnectionHealth()
+
+    /** Fotografia tirada no início do [disconnect], antes de a identidade/protocolo serem zerados. */
+    @Volatile
+    private var finalHealth: ConnectionHealthSnapshot? = null
+
+    private fun buildHealthSnapshot(): ConnectionHealthSnapshot =
+        connectionHealth.snapshot(protocol.getHandshakeFallbackReason(), protocol.isLegacyCommsLockedOut())
+
+    /** Saúde da sessão atual (ou da última, depois do disconnect). Ver [ConnectionHealthSnapshot]. */
+    override fun getConnectionHealth(): ConnectionHealthSnapshot = finalHealth ?: buildHealthSnapshot()
+
     /**
      * Onde guardar o que cada burn deixou (CRC por região, por ECU). Com ele, a próxima gravação da
      * mesma região confere o que a ECU realmente tem antes de sobrescrever ([WriteIntegrityKind.PREVIOUS_BURN_DIVERGED]).
@@ -423,6 +435,8 @@ class EcuClient(
             // firmwareInfo/definições da última sincronização com sucesso - ex.: uma MS2Extra -
             // continuam valendo, e um backup salvo depois sai com a família errada.
             clearEcuIdentity()
+            connectionHealth.reset()
+            finalHealth = null
 
             // (usado em stopLiveDataStream/disconnect) só marca a coroutine como cancelada -
             // isso não interrompe a chamada bloqueante em andamento, que só "percebe" o
@@ -1035,6 +1049,7 @@ class EcuClient(
      * Desconecta do Speeduino
      */
     override fun disconnect() {
+        if (finalHealth == null) finalHealth = buildHealthSnapshot()
         lastDisconnectWasRusefi = firmwareInfo?.family == EcuFamily.RUSEFI
         lastDisconnectAtMs = MonotonicClock.nowMillis()
         lastGlobalDisconnectWasActive = true
@@ -3052,6 +3067,7 @@ class EcuClient(
                     if (failFastOnRange && isRangeRejection(e)) throw e
                     if (attempt >= TABLE_WRITE_CHUNK_MAX_ATTEMPTS) throw e
                     recoveredErrors += e
+                    connectionHealth.recordWriteRetry()
                     Logger.w(TAG, "Chunk #$chunkIndex da pagina ${formatPageId(pageNum)} falhou (tentativa $attempt): ${e.message}; retentando")
                     runCatching { connection.abortPendingRead() }
                     delay(pageWriteRetryDelayMs(e, attempt))
@@ -4374,6 +4390,7 @@ class EcuClient(
 
                     lastError = e
                     Logger.w(TAG, "Modern Protocol falhou (tentativa $attempt/$maxAttempts): ${e.message}")
+                    connectionHealth.recordModernLiveFailure(e.message)
                     connection.clearInputBuffer()
                     if (attempt < maxAttempts) {
                         delay(liveDataRetryDelayMs(e))
@@ -4387,6 +4404,7 @@ class EcuClient(
                 throw lastError ?: Exception("Modern live data failed after $maxAttempts attempts")
             } else if (modernData == null) {
                 Logger.w(TAG, "Modern Protocol falhou após $maxAttempts tentativas, tentando Legacy: ${lastError?.message}")
+                connectionHealth.recordProtocolSwitch("modern", "legacy", "live_data_modern_failed")
                 // ⚠️ Fallback para Legacy Protocol (versões antigas)
                 protocol.readLiveData(outputSize.takeIf { it > 0 } ?: 128)
             } else {
@@ -4503,11 +4521,13 @@ class EcuClient(
                     recoverableReadTimeouts = 0
                     onDataReceived(liveData)
                     packetCount++
+                    connectionHealth.recordFrame()
 
                     consumePendingLiveDataRecoveryReason()?.let { reason ->
                         restartReason = reason
                         Logger.w(TAG, "Reiniciando stream após amostras inválidas: $reason")
                         ConnectionTrace.info("live_data", "recovering stream after $reason")
+                        connectionHealth.recordStreamRecovery()
                         connection.clearInputBuffer()
                         break
                     }
@@ -4541,6 +4561,7 @@ class EcuClient(
                             (isRecoverableLiveDataTimeout(e) || isLinkDesync)
                     if (isRecoverableLiveTimeout) {
                         recoverableReadTimeouts++
+                        connectionHealth.recordRecoverable(isLinkDesync, e.message)
                         val kind = if (isLinkDesync) "recoverable_desync" else "recoverable_timeout"
                         ConnectionTrace.info(
                             "live_data",
@@ -4586,6 +4607,7 @@ class EcuClient(
 
                         if (!connection.isConnected()) {
                             Logger.w(TAG, "🔴 Conexão perdida detectada durante stream")
+                            connectionHealth.recordLinkLossDuringStream()
                         } else if (
                             (linkDesyncAfterHealthyStream && !liveDataStreamStopRequested) ||
                                 shouldDisconnectAfterStreamFailure(e)
@@ -4594,6 +4616,7 @@ class EcuClient(
                                 TAG,
                                 "🔴 Stream falhou com socket ainda marcado como conectado; forçando disconnect"
                             )
+                            connectionHealth.recordForcedDisconnect(e.message)
                             disconnect()
                         }
                     }
@@ -4932,6 +4955,7 @@ class EcuClient(
     }
 
     private suspend fun ensureWritable(operation: String) {
+        connectionHealth.recordWriteOperation(operation)
         if (readOnlySafeModeEnabled) {
             throw IllegalStateException(
                 "Read-only safe mode enabled ($operation blocked). Disable manual firmware profile to write."

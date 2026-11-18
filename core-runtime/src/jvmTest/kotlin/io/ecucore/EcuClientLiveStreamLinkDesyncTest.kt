@@ -35,6 +35,17 @@ class EcuClientLiveStreamLinkDesyncTest {
 
         assertTrue(harness.errors.isEmpty(), "erros inesperados: ${harness.errors}")
         assertTrue(connection.isConnected())
+
+        // A falha se curou sozinha e o usuário não viu nada, mas ela precisa constar no resumo da
+        // sessão: era exatamente o tipo de problema que nunca chegava a lugar nenhum.
+        val health = harness.client.getConnectionHealth()
+        // 3 respostas ruins = 3 tentativas moderna falhas dentro da leitura; ao menos 1 delas chegou
+        // ao stream como falha recuperável (os retries internos absorvem as demais).
+        assertTrue(health.modernLiveFailures >= 3, health.toString())
+        assertTrue(health.recoverableFailures >= 1, health.toString())
+        assertTrue(health.framesReceived >= 4, health.toString())
+        assertEquals(0, health.forcedDisconnects)
+        assertTrue(health.failuresPer1000Frames > 0.0)
     }
 
     @Test
@@ -57,6 +68,12 @@ class EcuClientLiveStreamLinkDesyncTest {
         // Força disconnect para o app disparar a reconexão automática em vez de ficar
         // "conectado" sem live data.
         assertFalse(connection.isConnected())
+
+        // O resumo sobrevive ao disconnect (foto tirada antes de zerar a identidade) e diz por quê.
+        val health = harness.client.getConnectionHealth()
+        assertEquals(1, health.forcedDisconnects, health.toString())
+        assertTrue(health.recoverableFailures >= 1, health.toString())
+        assertTrue(health.lastError!!.isNotBlank())
     }
 
     @Test

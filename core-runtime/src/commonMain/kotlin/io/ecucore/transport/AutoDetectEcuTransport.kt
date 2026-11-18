@@ -121,6 +121,7 @@ class AutoDetectEcuTransport(
 
     override fun getEcuCapabilities(): EcuCapabilities? = selected().getEcuCapabilities()
     override fun getHandshakeFallbackReason(): String? = selected().getHandshakeFallbackReason()
+    override fun getConnectionHealth(): io.ecucore.ConnectionHealthSnapshot? = selected().getConnectionHealth()
 
     override fun getTableDefinitions(): TableDefinitions? = selected().getTableDefinitions()
 

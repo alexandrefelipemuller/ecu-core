@@ -419,6 +419,28 @@ class EcuClientVerifiedTableWriteTest {
         assertEquals(2L, merged.first { it.pageId == 2 }.crc)
     }
 
+
+    // ---- resumo de saúde da sessão ----------------------------------------------------------------
+
+    @Test
+    fun `retry de chunk e a ultima operacao de gravacao entram no resumo de saude`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = 1, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+
+        client.writeVeTable(veTable(40), 1)
+
+        val health = client.getConnectionHealth()
+        assertTrue(health.writeChunkRetries >= 1, health.toString())
+        assertEquals("writeVeTable", health.lastWriteOperation)
+
+        // Depois do disconnect o resumo continua o mesmo (o app lê no callback de desconexão).
+        client.disconnect()
+        val frozen = client.getConnectionHealth()
+        assertEquals(health.writeChunkRetries, frozen.writeChunkRetries)
+        assertEquals("writeVeTable", frozen.lastWriteOperation)
+    }
+
     private fun veTable(value: Int) = VeTable(
         rpmBins = (1..16).map { it * 500 },
         loadBins = (1..16).map { it * 10 },
