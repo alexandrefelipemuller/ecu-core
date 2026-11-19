@@ -10,6 +10,9 @@ import io.ecucore.model.Ms3GenericSensors
 import io.ecucore.model.Ms3GenericSensorConfig
 import io.ecucore.model.Ms3GenericSensorsSnapshot
 import io.ecucore.definition.IniDefinition
+import io.ecucore.definition.SpeeduinoLayoutExpectations
+import io.ecucore.definition.IniLayoutCheck
+import io.ecucore.definition.FieldExpectation
 import io.ecucore.definition.IniFieldKind
 import io.ecucore.ecu.FirmwareConsensus
 import io.ecucore.ecu.FirmwareHandshakeDomain
@@ -437,9 +440,6 @@ class EcuClient(
                 return
             }
 
-            // Uma stream de live data de uma conexão anterior pode ainda estar em uma
-            // leitura/escrita USB bloqueante (I/O síncrono nativo, ex: usb-serial-for-android)
-            // quando o usuário desconecta e reconecta rápido. streamJob?.cancel() sozinho
             // Uma tentativa nova nunca herda a identidade da sessão anterior. Sem isso, se o
             // handshake falha (o ramo de erro só fecha o transporte, não passa por disconnect()),
             // firmwareInfo/definições da última sincronização com sucesso - ex.: uma MS2Extra -
@@ -448,6 +448,9 @@ class EcuClient(
             connectionHealth.reset()
             finalHealth = null
 
+            // Uma stream de live data de uma conexão anterior pode ainda estar em uma
+            // leitura/escrita USB bloqueante (I/O síncrono nativo, ex: usb-serial-for-android)
+            // quando o usuário desconecta e reconecta rápido. streamJob?.cancel() sozinho
             // (usado em stopLiveDataStream/disconnect) só marca a coroutine como cancelada -
             // isso não interrompe a chamada bloqueante em andamento, que só "percebe" o
             // cancelamento no próximo ponto de suspensão, e I/O bloqueante não tem um.
@@ -897,11 +900,11 @@ class EcuClient(
      */
     override fun getEcuCapabilities(): EcuCapabilities? = firmwareInfo?.capabilities
 
+    override fun getHandshakeFallbackReason(): String? = protocol.getHandshakeFallbackReason()
+
     /**
      * Obtém informações do pin layout detectado (Page 1).
      */
-    override fun getHandshakeFallbackReason(): String? = protocol.getHandshakeFallbackReason()
-
     override fun getPinLayoutInfoCached(): PinLayoutInfo? = pinLayoutInfo
 
     /**
@@ -1076,9 +1079,6 @@ class EcuClient(
         forceLegacyFirmwareHandshakeAfterModernDisconnect = false
         // NÃO cancelar o scope - apenas o job do stream
         // Isso permite reconectar e reiniciar o stream
-        firmwareInfo = null
-        ecuDefinition = null
-        tableDefinitions = null
         clearEcuIdentity()
         speeduinoIniCatalog = null
         megaSpeedIniCatalog = null
@@ -1283,7 +1283,12 @@ class EcuClient(
         after: ByteArray,
         owned: Set<Int>,
         label: String,
+        layout: List<FieldExpectation> = emptyList(),
     ) {
+        // 1) o .ini ATIVO tem de concordar com a página/offset/bits que o código usa; 2) só os bytes do escritor mudam.
+        if (firmwareInfo?.family == EcuFamily.SPEEDUINO) {
+            activeIniDefinition?.let { IniLayoutCheck.require(label, it, layout) }
+        }
         PageWriteGuard.requireOnlyOwned(label, pageNum, before, after, owned, offset)
         writeConfigPageVerified(pageNum.toByte(), offset, after, label)
     }
@@ -1677,7 +1682,7 @@ class EcuClient(
         writeU16(basePage, 65, calibration.baroMax)
         writeS8(basePage, 67, calibration.emapMin)
         writeU16(basePage, 68, calibration.emapMax)
-        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_PRESSURE_OWNED_OFFSETS, "Pressure Calibration")
+        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_PRESSURE_OWNED_OFFSETS, "Pressure Calibration", SpeeduinoLayoutExpectations.SENSOR_CALIBRATION)
         if (burn) {
             delay(300)
             burnConfigGuarded()
@@ -1728,7 +1733,7 @@ class EcuClient(
         val basePage = before.copyOf()
         writeU8(basePage, 44, calibration.tpsMin)
         writeU8(basePage, 45, calibration.tpsMax)
-        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_TPS_OWNED_OFFSETS, "TPS Calibration")
+        writeOwnedConfigPage(1, 0, before, basePage, SPEEDUINO_TPS_OWNED_OFFSETS, "TPS Calibration", SpeeduinoLayoutExpectations.SENSOR_CALIBRATION)
         if (burn) {
             delay(300)
             burnConfigGuarded()
@@ -2633,7 +2638,7 @@ class EcuClient(
         val updatedData = EngineProtectionMapper.applyToPage(basePage, config)
         writeOwnedConfigPage(
             EngineProtectionMapper.PAGE_NUMBER, 0, basePage, updatedData,
-            EngineProtectionMapper.PAGE6_OWNED_OFFSETS, "Engine Protection",
+            EngineProtectionMapper.PAGE6_OWNED_OFFSETS, "Engine Protection", SpeeduinoLayoutExpectations.ENGINE_PROTECTION,
         )
         // Páginas 1/4/9/10 só são tocadas se a config foi lida delas (extendedPagesLoaded): sem isso os
         // campos estariam em valor padrão e a gravação zeraria limites que o app nunca viu.
@@ -2672,7 +2677,7 @@ class EcuClient(
     ) {
         val before = readPage(pageNum = pageNum, offset = 0, length = size)
         val updated = transform(before)
-        writeOwnedConfigPage(pageNum, 0, before, updated, owned, "Engine Protection page $pageNum")
+        writeOwnedConfigPage(pageNum, 0, before, updated, owned, "Engine Protection page $pageNum", SpeeduinoLayoutExpectations.ENGINE_PROTECTION)
         if (burn) {
             delay(200)
             burnConfigGuarded()
@@ -2697,7 +2702,7 @@ class EcuClient(
         val updatedData = ClosedLoopCorrectionMapper.applyToPage(basePage, config, era)
         writeOwnedConfigPage(
             ClosedLoopCorrectionMapper.PAGE_NUMBER, 0, basePage, updatedData,
-            ClosedLoopCorrectionMapper.PAGE6_OWNED_OFFSETS, "Closed Loop Corrections",
+            ClosedLoopCorrectionMapper.PAGE6_OWNED_OFFSETS, "Closed Loop Corrections", SpeeduinoLayoutExpectations.CLOSED_LOOP,
         )
         if (ClosedLoopCorrectionMapper.hasMapWindowPage(era)) {
             val basePage9 = readPage(
@@ -2709,6 +2714,7 @@ class EcuClient(
                 ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER, 0, basePage9,
                 ClosedLoopCorrectionMapper.applyMapWindowToPage9(basePage9, config),
                 ClosedLoopCorrectionMapper.PAGE9_OWNED_OFFSETS, "Closed Loop Corrections MAP window",
+                SpeeduinoLayoutExpectations.CLOSED_LOOP,
             )
         }
         if (burn) {
@@ -2766,6 +2772,7 @@ class EcuClient(
         val updatedData = settings.toPageData(basePage)
         writeOwnedConfigPage(
             TriggerSettings.PAGE_NUMBER, 0, basePage, updatedData, TriggerSettings.PAGE4_OWNED_OFFSETS, "Trigger Settings",
+            SpeeduinoLayoutExpectations.TRIGGER,
         )
         if (burn) {
             delay(300)
@@ -2795,7 +2802,7 @@ class EcuClient(
         writeOwnedConfigPage(
             SecondarySerialConfig.PAGE_NUMBER, SecondarySerialConfig.OFFSET,
             byteArrayOf(original.toByte()), byteArrayOf(updated.toByte()),
-            SecondarySerialConfig.OWNED_OFFSETS, "Secondary Serial",
+            SecondarySerialConfig.OWNED_OFFSETS, "Secondary Serial", SpeeduinoLayoutExpectations.SECONDARY_SERIAL,
         )
 
         if (burn) {
@@ -2998,7 +3005,7 @@ class EcuClient(
             Logger.d(TAG, "Page 1 serializada: ${pageData.size} bytes")
 
             // Write to ECU
-            writeOwnedConfigPage(1, 0, basePage, pageData, EngineConstants.PAGE1_OWNED_OFFSETS, "Engine Constants (Page 1)")
+            writeOwnedConfigPage(1, 0, basePage, pageData, EngineConstants.PAGE1_OWNED_OFFSETS, "Engine Constants (Page 1)", SpeeduinoLayoutExpectations.ENGINE_CONSTANTS)
             Logger.d(TAG, "Page 1 gravada com sucesso")
 
             // Correção de bateria mora na página 6: só vai se veio da ECU (batteryCorrectionLoaded) e só se algum
@@ -3603,7 +3610,7 @@ class EcuClient(
         val pageData = dwellTable.applyToPage(before)
         Logger.d(TAG, "Dwell Table serializada: ${pageData.size} bytes")
 
-        writeOwnedConfigPage(12, 0, before, pageData, DwellTable.PAGE12_OWNED_OFFSETS, "Dwell Table")
+        writeOwnedConfigPage(12, 0, before, pageData, DwellTable.PAGE12_OWNED_OFFSETS, "Dwell Table", SpeeduinoLayoutExpectations.DWELL)
         Logger.d(TAG, "Dwell Table enviada")
 
         delay(1000)

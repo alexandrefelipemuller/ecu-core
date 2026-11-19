@@ -12,6 +12,8 @@ import kotlin.test.Test
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
+private typealias Expect = FieldExpectation
+
 /**
  * Contrato entre as telas do Speeduino com página/offset fixos no código e o .ini (fonte da verdade).
  *
@@ -21,18 +23,14 @@ import kotlin.test.fail
  */
 class SpeeduinoPageContractTest {
 
-    private data class Expect(
-        val field: String,
-        val page: Int,
-        val offset: Int,
-        val bit: IntRange? = null,
-        /** Nome que o mesmo campo tem em firmwares antigos (mesma página/offset). */
-        val alias: String? = null,
-        /** Para arrays: quantidade de elementos (confere com `[N]` do .ini). */
-        val length: Int? = null,
-        /** Primeira versão do firmware cujo .ini tem o campo; antes dela o campo TEM de estar ausente. */
-        val since: Int = 202008,
-    )
+    private val idle = SpeeduinoLayoutExpectations.IDLE
+    private val trigger = SpeeduinoLayoutExpectations.TRIGGER
+    private val closedLoop = SpeeduinoLayoutExpectations.CLOSED_LOOP
+    private val secondarySerial = SpeeduinoLayoutExpectations.SECONDARY_SERIAL
+    private val engineProtection = SpeeduinoLayoutExpectations.ENGINE_PROTECTION
+    private val engineConstants = SpeeduinoLayoutExpectations.ENGINE_CONSTANTS
+    private val sensorCalibration = SpeeduinoLayoutExpectations.SENSOR_CALIBRATION
+    private val dwell = SpeeduinoLayoutExpectations.DWELL
 
     private fun load(id: String): IniDefinition {
         val text = checkNotNull(javaClass.getResourceAsStream("/ini/$id.ini")) { "ini $id ausente" }
@@ -40,69 +38,11 @@ class SpeeduinoPageContractTest {
         return IniParser.parse("$id.ini", text)
     }
 
-    private val idle = listOf(
-        Expect("idleFreq", IdleControlSettings.PAGE_NUMBER, 47),
-        Expect("iacPWMrun", IdleControlSettings.PAGE_NUMBER, 60, 1..1, since = 202201),
-        Expect("iacCLValues", IdleControlSettings.PAGE_NUMBER, 64),
-        Expect("iacBins", IdleControlSettings.PAGE_NUMBER, 94),
-        Expect("iacAlgorithm", IdleControlSettings.PAGE_NUMBER, 116, 0..2),
-        Expect("iacStepTime", IdleControlSettings.PAGE_NUMBER, 116, 3..5),
-        Expect("iacChannels", IdleControlSettings.PAGE_NUMBER, 116, 6..6),
-        Expect("iacPWMdir", IdleControlSettings.PAGE_NUMBER, 116, 7..7),
-        Expect("iacFastTemp", IdleControlSettings.PAGE_NUMBER, 117),
-        Expect("iacStepHome", IdleControlSettings.PAGE_NUMBER, 118),
-        Expect("iacStepHyster", IdleControlSettings.PAGE_NUMBER, 119),
-    )
 
-    private val trigger = listOf(
-        Expect("TrigAng", TriggerSettings.PAGE_NUMBER, 0),
-        Expect("FixAng", TriggerSettings.PAGE_NUMBER, 2),
-        Expect("CrankAng", TriggerSettings.PAGE_NUMBER, 3),
-        Expect("TrigAngMul", TriggerSettings.PAGE_NUMBER, 4),
-        Expect("TrigPattern", TriggerSettings.PAGE_NUMBER, 5, 3..7),
-        Expect("TrigEdge", TriggerSettings.PAGE_NUMBER, 5, 0..0),
-        Expect("trigPatternSec", TriggerSettings.PAGE_NUMBER, 8, 0..6), // 202008 declara [0:7]
-        Expect("SkipCycles", TriggerSettings.PAGE_NUMBER, 11),
-        Expect("numTeeth", TriggerSettings.PAGE_NUMBER, 15),
-        Expect("missingTeeth", TriggerSettings.PAGE_NUMBER, 16),
-    )
 
-    private val closedLoop = listOf(
-        Expect("egoAlgorithm", ClosedLoopCorrectionMapper.PAGE_NUMBER, 0, 0..1),
-        Expect("egoType", ClosedLoopCorrectionMapper.PAGE_NUMBER, 0, 2..3),
-        Expect("egoKP", ClosedLoopCorrectionMapper.PAGE_NUMBER, 1),
-        Expect("egoKI", ClosedLoopCorrectionMapper.PAGE_NUMBER, 2),
-        Expect("egoKD", ClosedLoopCorrectionMapper.PAGE_NUMBER, 3),
-        Expect("egoTemp", ClosedLoopCorrectionMapper.PAGE_NUMBER, 4),
-        Expect("egoCount", ClosedLoopCorrectionMapper.PAGE_NUMBER, 5),
-        Expect("egoLimit", ClosedLoopCorrectionMapper.PAGE_NUMBER, 7),
-        Expect("ego_min_afr", ClosedLoopCorrectionMapper.PAGE_NUMBER, 8, alias = "ego_min"),
-        Expect("ego_max_afr", ClosedLoopCorrectionMapper.PAGE_NUMBER, 9, alias = "ego_max"),
-        Expect("ego_sdelay", ClosedLoopCorrectionMapper.PAGE_NUMBER, 10),
-        Expect("egoRPM", ClosedLoopCorrectionMapper.PAGE_NUMBER, 11),
-        Expect("egoTPSMax", ClosedLoopCorrectionMapper.PAGE_NUMBER, 12),
-        Expect("egoMAPMax", ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER, 112, since = 202402),
-        Expect("egoMAPMin", ClosedLoopCorrectionMapper.MAP_WINDOW_PAGE_NUMBER, 113, since = 202402),
-    )
 
-    private val secondarySerial = listOf(
-        Expect("enable_secondarySerial", SecondarySerialConfig.PAGE_NUMBER, SecondarySerialConfig.OFFSET, 0..0),
-    )
 
     /** Campos que só existem do 202402 em diante (o 202008 não os tem). */
-    private val engineProtection = listOf(
-        Expect("boostCutEnabled", EngineProtectionMapper.PAGE_NUMBER, 6, 7..7),
-        Expect("engineProtectType", EngineProtectionMapper.PAGE_NUMBER, 0, 6..7),
-        Expect("hardCutType", EngineProtectionMapper.CUT_TYPE_PAGE_NUMBER, 26, 3..3),
-        Expect("SoftRevLim", EngineProtectionMapper.RPM_PAGE_NUMBER, 19),
-        Expect("SoftLimRetard", EngineProtectionMapper.RPM_PAGE_NUMBER, 20),
-        Expect("SoftLimMax", EngineProtectionMapper.RPM_PAGE_NUMBER, 21),
-        Expect("hardRevLim", EngineProtectionMapper.RPM_PAGE_NUMBER, 22, alias = "HardRevLim"),
-        Expect("engineProtectMaxRPM", EngineProtectionMapper.RPM_PAGE_NUMBER, 120),
-        Expect("hardRevMode", EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 166, 0..1, since = 202207),
-        Expect("afrProtectEnabled", EngineProtectionMapper.HARD_REV_MODE_PAGE_NUMBER, 185, 0..1, since = 202207),
-        Expect("oilPressureProtEnbl", EngineProtectionMapper.OIL_PAGE_NUMBER, 135, 2..2),
-    )
 
     private fun version(firmware: String) = firmware.substringAfterLast('_').toInt()
 
@@ -110,7 +50,7 @@ class SpeeduinoPageContractTest {
         val ini = load(firmware)
         val problems = mutableListOf<String>()
         for (e in expected) {
-            val candidates = ini.fields.filter { it.name == e.field || it.name == e.alias }
+            val candidates = e.candidates(ini)
             if (version(firmware) < e.since) {
                 // O campo ainda não existe nesta versão: o código só pode usá-lo se bloquear por versão.
                 if (candidates.isNotEmpty()) problems += "$firmware: ${e.field} já existe no .ini; ajuste since=${e.since}"
@@ -120,13 +60,7 @@ class SpeeduinoPageContractTest {
                 problems += "$firmware: campo ${e.field} não existe no .ini (since=${e.since})"
                 continue
             }
-            // 202008/202012 declaram trigPatternSec [0:7]; o código usa [0:6] (o bit 7 nunca é gravado como 1).
-            val ok = candidates.any {
-                it.page == e.page && it.offset == e.offset &&
-                    (e.length == null || it.shape?.totalSize == e.length) &&
-                    (e.bit == null || (it.bitLow == e.bit.first && (it.bitHigh == e.bit.last ||
-                        (e.field == "trigPatternSec" && it.bitHigh == 7))))
-            }
+            val ok = candidates.any(e::matches)
             if (!ok) {
                 val found = candidates.joinToString { "p${it.page}@${it.offset}[${it.bitLow}:${it.bitHigh}]" }
                 problems += "$firmware: ${e.field} o código usa p${e.page}@${e.offset}${e.bit?.let { b -> "[${b.first}:${b.last}]" } ?: ""}, o .ini diz $found"
@@ -142,43 +76,10 @@ class SpeeduinoPageContractTest {
 
 
     /** Página 1: `EngineConstants.fromPage1`/`applyToPage1` (sem constante de página, o código usa 1 direto). */
-    private val engineConstants = listOf(
-        Expect("battVCorMode", 1, 3, 2..2),
-        Expect("reqFuel", 1, 24),
-        Expect("divider", 1, 25),
-        Expect("alternate", 1, 26, 0..0),
-        Expect("ignAlgorithm", 1, 26, 4..6),
-        Expect("injOpen", 1, 27),
-        Expect("injAng", 1, 28, length = 4),
-        Expect("mapSample", 1, 36, 0..1),
-        Expect("twoStroke", 1, 36, 2..2),
-        Expect("injType", 1, 36, 3..3),
-        Expect("nCylinders", 1, 36, 4..7),
-        Expect("algorithm", 1, 37, 0..2),
-        Expect("fixAngEnable", 1, 37, 3..3),
-        Expect("nInjectors", 1, 37, 4..7),
-        Expect("perToothIgn", 1, 38, 6..6),
-        Expect("dutyLim", 1, 40),
-        Expect("stoich", 1, 50),
-        Expect("oddfire2", 1, 51),
-        Expect("oddfire3", 1, 53),
-        Expect("oddfire4", 1, 55),
-    )
 
     /** `EcuClient.readPressureCalibration/writePressureCalibration` e `writeTpsCalibration` (página 1). */
-    private val sensorCalibration = listOf(
-        Expect("tpsMin", 1, 44),
-        Expect("tpsMax", 1, 45),
-        Expect("mapMin", 1, 46),
-        Expect("mapMax", 1, 47),
-        Expect("baroMin", 1, 64),
-        Expect("baroMax", 1, 65),
-        Expect("EMAPMin", 1, 67),
-        Expect("EMAPMax", 1, 68),
-    )
 
     /** `DwellTable` (página 12; o código lê/grava a matriz 4x4 a partir do offset 160). */
-    private val dwell = listOf(Expect("dwellTable", 12, 160, length = 16, since = 202201))
 
     /** `Page6Validator` limita cada um destes bytes da página 6; tem de ser o campo certo e não outro. */
     private val page6Validator = listOf(
