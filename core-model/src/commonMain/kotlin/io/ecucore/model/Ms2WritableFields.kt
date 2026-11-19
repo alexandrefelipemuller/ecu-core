@@ -43,6 +43,10 @@ object Ms2WritableFields {
     const val REV_LIM_SPARK_CUT = "RevLimOption_spkcut"
     const val REV_LIM_FUEL_CUT = "RevLimOption_fuelcut"
     const val REV_LIM_FUEL_PROGRESSIVE = "RevLimOption_fuelprog"
+    // Proteção contra sobrepressão de turbo (diálogo "Overboost Protection" do .ini).
+    const val OVERBOOST_OPTION = "OverBoostOption"
+    const val OVERBOOST_KPA = "OverBoostKpa"
+    const val OVERBOOST_HYST = "OverBoostHyst"
     // Correção por sonda (EGO) - diálogo "EGO Control" do .ini. As portas da sonda (egoport/ego2port) ficam de fora.
     const val EGO_TYPE = "egoType"
     const val EGO_ALGORITHM = "egoAlgorithm"
@@ -91,6 +95,9 @@ object Ms2WritableFields {
         MegaSpeedWritableField(REV_LIM_SPARK_CUT, "Corte de ignição (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
         MegaSpeedWritableField(REV_LIM_FUEL_CUT, "Corte de combustível (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
         MegaSpeedWritableField(REV_LIM_FUEL_PROGRESSIVE, "Corte de combustível progressivo (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
+        MegaSpeedWritableField(OVERBOOST_OPTION, "Overboost (0=Desligado, 1=Corte de combustível, 2=Corte de ignição, 3=Ambos)", "", 0.0, 3.0, 0),
+        MegaSpeedWritableField(OVERBOOST_KPA, "Pressão máxima (MAP)", "kPa", 0.0, 700.0, 1),
+        MegaSpeedWritableField(OVERBOOST_HYST, "Histerese do overboost", "kPa", 0.0, 100.0, 1),
         // 0=Desligado, 1=Banda estreita, 2=Duas estreitas, 3=Banda larga, 4=Duas largas (5..7 são INVALID no .ini).
         MegaSpeedWritableField(EGO_TYPE, "Tipo de sonda (0=Desligada, 1=Estreita, 2=Duas estreitas, 3=Larga, 4=Duas largas)", "", 0.0, 4.0, 0),
         // 0=Simples, 2=PID, 3=Sem correção (1 é INVALID no .ini; a UI só oferece 0, 2 e 3).

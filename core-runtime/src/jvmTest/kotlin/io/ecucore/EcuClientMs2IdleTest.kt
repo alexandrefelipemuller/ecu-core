@@ -59,7 +59,7 @@ class EcuClientMs2IdleTest {
     @Test
     fun `whitelist tem escalares e curvas de lenta`() {
         listOf("IdleCtl", "IdleCtl_alg", "IdleCtl_home", "IACtstep", "IAC_tinitial_step", "IACminstep", "IACStart", "IACcrankxt",
-            "IdleHyst", "iacfullopen", "egoType", "egoAlgorithm", "egoCount", "egoDelta", "egoLimit", "egoTemp", "egoRPM", "TPSOXLimit", "MAPOXLimit", "MAPOXMin", "ego_startdelay", "egoKP", "egoKI", "egoKD", "RevLimNormal2", "RevLimNormal2_hyst", "RevLimOption_retard", "RevLimOption_spkcut", "RevLimOption_fuelcut", "RevLimOption_fuelprog", "RevLimCLTbased", "TpsBypassCLTRevlim", "RevLimMaxRtd", "RevLimRtdAng", "pwmidle_open_steps", "pwmidle_closed_steps").forEach {
+            "IdleHyst", "iacfullopen", "OverBoostOption", "OverBoostKpa", "OverBoostHyst", "egoType", "egoAlgorithm", "egoCount", "egoDelta", "egoLimit", "egoTemp", "egoRPM", "TPSOXLimit", "MAPOXLimit", "MAPOXMin", "ego_startdelay", "egoKP", "egoKI", "egoKD", "RevLimNormal2", "RevLimNormal2_hyst", "RevLimOption_retard", "RevLimOption_spkcut", "RevLimOption_fuelcut", "RevLimOption_fuelprog", "RevLimCLTbased", "TpsBypassCLTRevlim", "RevLimMaxRtd", "RevLimRtdAng", "pwmidle_open_steps", "pwmidle_closed_steps").forEach {
             assertNotNull(Ms2WritableFields.byName(it), it)
         }
         assertEquals("F", Ms2WritableFields.curveByName("pwmidle_clt_temps")?.unitSuffix)
