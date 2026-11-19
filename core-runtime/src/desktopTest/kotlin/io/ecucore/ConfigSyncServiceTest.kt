@@ -248,7 +248,8 @@ class ConfigSyncServiceTest {
         assertEquals(RestoreOutcome(outcome.warnings, emptyList(), true), outcome)
         assertEquals(listOf("Página 0 ignorada no restore (read-only/status)"), outcome.warnings)
         assertEquals((1..15).toSet(), ecu.writes.map { it.id }.toSet())
-        assertEquals(1, ecu.burns.size)
+        // Firmware queima uma página por comando ('b' + página): uma queima por página gravada.
+        assertEquals((1..15).toList(), ecu.burns.sorted())
         assertContentEquals(ByteArray(288) { (2 + it).toByte() }, ecu.mem(2).copyOf(288))
     }
 
@@ -386,7 +387,7 @@ class ConfigSyncServiceTest {
     @Test
     fun `a failing burn is reported after writing`() = runBlocking<Unit> {
         val (client, ecu) = connected()
-        ecu.onFrame = { cmd, _ -> if (cmd == 'B') rangeErr else null }
+        ecu.onFrame = { cmd, _ -> if (cmd == 'b') rangeErr else null }
         val dir = session("burn", 1 to ByteArray(128))
         val error = assertFailsWith<IllegalStateException> {
             service.restoreConfigToEcu(client, dir, skipPages = (2..10).map { it.toByte() }.toSet())

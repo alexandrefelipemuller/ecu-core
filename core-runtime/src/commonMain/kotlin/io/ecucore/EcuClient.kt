@@ -3287,7 +3287,11 @@ class EcuClient(
                 throw UnverifiedBurnBlockedException(unverified)
             }
         }
-        protocol.burnConfig()
+        if (isSpeeduino) {
+            protocol.burnSpeeduinoPages(writeLedger.pending().map { it.pageId })
+        } else {
+            protocol.burnConfig()
+        }
         val burned = writeLedger.markBurned()
         if (isSpeeduino && burned.isNotEmpty()) {
             persistBurnRecords(burned)

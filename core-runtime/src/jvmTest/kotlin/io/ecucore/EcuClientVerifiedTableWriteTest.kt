@@ -50,6 +50,22 @@ class EcuClientVerifiedTableWriteTest {
     }
 
     @Test
+    fun `burn Speeduino queima a pagina escrita com b e nunca manda B sem payload`() = runBlocking {
+        // Regressão: 'B' sem payload responde RANGE_ERR (0x84) no firmware; o app precisa queimar
+        // cada página gravada com 'b' + número da página.
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
+        val client = newClient(ecu)
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+
+        client.writeVeTable(veTable(40), 1)
+
+        assertEquals(0, ecu.bareBurnRejections, "nenhum 'B' sem payload deve ser enviado")
+        assertEquals(listOf(metadata.page), ecu.burnedPages, "a página VE deve ser queimada com 'b'")
+        assertEquals(1, ecu.burns)
+    }
+
+    @Test
     fun `0x82 mascarado pelo retry do chunk ainda chega na telemetria`() = runBlocking {
         // Lixo cai no próprio chunk rejeitado; o retry sobrescreve e o read-back sai limpo.
         val ecu = FakeEcuMemory(rejectWriteNumber = 1, corruptOffsetOnReject = 37)
@@ -484,6 +500,11 @@ class EcuClientVerifiedTableWriteTest {
         private var writes = 0
         var burns = 0
             private set
+        /** Páginas queimadas com 'b', na ordem em que chegaram. */
+        val burnedPages = mutableListOf<Int>()
+        /** Quantas vezes o app mandou 'B' sem payload (o firmware rejeita). */
+        var bareBurnRejections = 0
+            private set
 
         fun load(page: Int, offset: Int, data: ByteArray) = data.copyInto(page(page), offset)
 
@@ -518,7 +539,15 @@ class EcuClientVerifiedTableWriteTest {
                     }
                 }
                 'B'.code.toByte() -> {
+                    // Firmware real: 'B' sem payload de página é RANGE_ERR (0x84).
+                    bareBurnRejections++
+                    pending += rc(0x84)
+                }
+                'b'.code.toByte() -> {
+                    // 'b' + número da página: único burn aceito pelo firmware.
+                    val pageNum = p[1].toInt() and 0xFF
                     burns++
+                    burnedPages += pageNum
                     if (corruptOnBurn) pages.values.forEach { it[corruptOffsetOnReject] = 99 }
                     pending += rc(0x04)
                 }

@@ -34,6 +34,8 @@ class EcuProtocol(
         private const val FORCE_LEGACY_PROTOCOL = false
         private const val VERBOSE_MODERN_FRAME_LOGS = false
         private const val PAGE_READ_CRC_MAX_ATTEMPTS = 3
+        /** Tamanho máximo de um bloco de leitura de página (blockingFactor do INI para AVR). */
+        private const val MAX_PAGE_READ_BLOCK = 251
         private const val PAGE_READ_CRC_RETRY_DELAY_MS = 40L
 
         // Response codes
@@ -436,6 +438,19 @@ class EcuProtocol(
         allowPartial: Boolean = false,
         allowModernTransportFallback: Boolean = false,
     ): ByteArray {
+        // Firmware AVR (buffer serial de 264 bytes) recusa leituras acima de ~263 bytes com
+        // SERIAL_RC_RANGE_ERR (0x84). Páginas maiores (ex.: VE/AFR = 288) são lidas em blocos.
+        if (length > MAX_PAGE_READ_BLOCK) {
+            val out = ByteArray(length)
+            var done = 0
+            while (done < length) {
+                val n = minOf(MAX_PAGE_READ_BLOCK, length - done)
+                val block = readPage(pageNum, offset + done, n, allowPartial, allowModernTransportFallback)
+                block.copyInto(out, done, 0, minOf(block.size, n))
+                done += n
+            }
+            return out
+        }
         val pageLabel = formatPageId(pageNum)
         return try {
             val useModernPath = if (allowModernTransportFallback) {
@@ -1666,6 +1681,21 @@ class EcuProtocol(
                 "Table ${formatPageId(tableId)} burn failed: code=0x${responseCode.toString(16)}"
             )
         }
+    }
+
+    /**
+     * Queima páginas Speeduino individualmente com 'b' + número da página. O comando 'B' sem
+     * payload é rejeitado pelo firmware atual (RANGE_ERR 0x84), então o caminho moderno não o usa.
+     * No transporte legacy cai no [burnConfig] original.
+     */
+    suspend fun burnSpeeduinoPages(pageIds: List<Int>) {
+        val useLegacyBurn = !isModernEnabled() &&
+            !(legacyPageReadUnsupported && connection.supportsModernProtocolFallback())
+        if (useLegacyBurn) {
+            burnConfig()
+            return
+        }
+        pageIds.distinct().forEach { burnTable(it, EcuFamily.SPEEDUINO) }
     }
 
     /**

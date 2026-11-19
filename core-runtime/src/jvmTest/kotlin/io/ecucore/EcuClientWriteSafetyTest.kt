@@ -339,6 +339,10 @@ class EcuClientWriteSafetyTest {
                     pending += rc(0x00)
                 }
                 'B'.code.toByte() -> {
+                    // Firmware real: 'B' sem payload de página é RANGE_ERR (0x84).
+                    pending += rc(0x84)
+                }
+                'b'.code.toByte() -> {
                     burns++
                     pending += rc(0x04)
                 }
