@@ -31,6 +31,7 @@ class EcuClientMs2IdleTest {
         iacstepTable    = array ,  S16,    354,    [   10], "steps",    1.00000,   0.00000,  0.00,  500.00,      0
         IdleCtl         = bits  ,  U08,    547,      [0:1], "None", "On/Off valve", "PWM valve (2 or 3 wire)", "Stepper valve (4 or 6 wire)"
         IACtstep        = scalar,  U08,    548,             "ms",       1,   0.00000,  0.00,   255,      0
+        IAC_tinitial_step = scalar, U08,   549,             "ms",       1,   0.00000,  0.00,   255,      0
         IACStart        = scalar, S16,     552,             "",         1.00000, 0.00000, 0.00, 4000.00,    0
         IdleHyst        = scalar,  S16,    554,             "°C",       0.05555,   0.00000, 0,  20.0,       1
         IdleHyst        = scalar,  S16,    554,             "°F",       0.10000,   0.00000, 0,  36.0,       1
@@ -53,7 +54,7 @@ class EcuClientMs2IdleTest {
 
     @Test
     fun `whitelist tem escalares e curvas de lenta`() {
-        listOf("IdleCtl", "IdleCtl_alg", "IdleCtl_home", "IACtstep", "IACminstep", "IACStart", "IACcrankxt",
+        listOf("IdleCtl", "IdleCtl_alg", "IdleCtl_home", "IACtstep", "IAC_tinitial_step", "IACminstep", "IACStart", "IACcrankxt",
             "IdleHyst", "iacfullopen", "pwmidle_open_steps", "pwmidle_closed_steps").forEach {
             assertNotNull(Ms2WritableFields.byName(it), it)
         }
@@ -70,6 +71,8 @@ class EcuClientMs2IdleTest {
         c.writeMegaSpeedConfigField("IdleCtl", 3.0)
         assertEquals(0x2B, ecu.writes.single().data[0].toInt())
         c.writeMegaSpeedConfigField("IACStart", 500.0)
+        c.writeMegaSpeedConfigField("IAC_tinitial_step", 5.0)
+        assertEquals(5, ecu.writes.last { it.id == 0x04 }.data.last().toInt() and 0xFF)
         c.writeMegaSpeedConfigField("iacfullopen", 300.0)
         c.writeMegaSpeedConfigField("pwmidle_open_steps", 120.0)
         val v = c.readMegaSpeedFieldValues(listOf("IdleCtl", "IACStart", "iacfullopen", "pwmidle_open_steps"))

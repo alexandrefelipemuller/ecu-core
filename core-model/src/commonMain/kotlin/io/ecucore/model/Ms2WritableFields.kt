@@ -25,6 +25,7 @@ object Ms2WritableFields {
     const val IDLE_CTL_ALG = "IdleCtl_alg"
     const val IDLE_CTL_HOME = "IdleCtl_home"
     const val IAC_TSTEP = "IACtstep"
+    const val IAC_TINITIAL_STEP = "IAC_tinitial_step"
     const val IAC_MINSTEP = "IACminstep"
     const val IAC_START = "IACStart"
     const val IAC_CRANK_XT = "IACcrankxt"
@@ -43,6 +44,8 @@ object Ms2WritableFields {
         MegaSpeedWritableField(IDLE_CTL_ALG, "Algoritmo (0=Malha aberta, 1=Malha fechada)", "", 0.0, 1.0, 0),
         MegaSpeedWritableField(IDLE_CTL_HOME, "Direção de retorno (0=Fechado, 1=Aberto)", "", 0.0, 1.0, 0),
         MegaSpeedWritableField(IAC_TSTEP, "Tempo entre passos", "ms", 1.0, 255.0, 0),
+        // Só aparece com IdleCtl == 3 (passo) e o .ini marca requiresPowerCycle: vale após reiniciar a ECU.
+        MegaSpeedWritableField(IAC_TINITIAL_STEP, "Tempo do primeiro passo", "ms", 0.0, 255.0, 0),
         MegaSpeedWritableField(IAC_MINSTEP, "Mínimo de passos para mover", "passos", 1.0, 255.0, 0),
         MegaSpeedWritableField(IAC_START, "Passos de retorno (homing)", "passos", 0.0, 4000.0, 0),
         MegaSpeedWritableField(IAC_CRANK_XT, "Transição partida para funcionamento", "s", 0.0, 600.0, 0),
