@@ -10,12 +10,12 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** Antifurto: `floodClear` (tabela 4, offset 588) negativo trava a partida. */
+/** Antifurto: limitador de giro em 0 RPM com corte de combustível (tabela 4, offsets 636/656) trava a partida. */
 class EcuClientMegaSpeedAntiTheftTest {
 
     private val d = '$'
 
-    private fun ini(floodClearLine: String = """floodClear = scalar, S16, 588, "%", 0.10000, 0.00000, 0.00, 100.00, 1""") = """
+    private fun ini(revLimitLine: String = """RevLimNormal2 = scalar, S16, 656, "RPM", 1, 0, 0, 15000, 0""") = """
         [MegaTune]
         signature = "MS2Extra MegaSpeed "
 
@@ -27,7 +27,12 @@ class EcuClientMegaSpeedAntiTheftTest {
         ochBlockSize = 219
 
         page = 1
-        $floodClearLine
+        RevLimCLTbased = bits, U08, 636, [3:3], "Desligado", "Ligado"
+        RevLimOption_fuelprog = bits, U08, 636, [4:4], "Desligado", "Ligado"
+        RevLimOption_fuelcut = bits, U08, 636, [5:5], "Desligado", "Ligado"
+        $revLimitLine
+        can_poll_id3 = scalar, U08, 720, "", 1, 0, 0, 14, 0
+        hw_latency = scalar, U16, 730, "usec", 0.66667, 0, 0, 500, 0
     """.trimIndent()
 
     private suspend fun connect(rpm: Int = 0, iniText: String = ini()): Pair<EcuClient, ClientFakeEcu> {
@@ -43,71 +48,131 @@ class EcuClientMegaSpeedAntiTheftTest {
         return client to ecu
     }
 
-    private fun ClientFakeEcu.floodClear(raw: Int) = load(0x04, 588, MegaSpeedAntiTheft.encode(raw))
+    private fun ClientFakeEcu.revLimit(rpm: Int) = load(0x04, 656, MegaSpeedAntiTheft.encode(rpm))
 
-    private fun ClientFakeEcu.floodClear() = MegaSpeedAntiTheft.decode(mem(0x04), 588)
+    private fun ClientFakeEcu.revLimit() = MegaSpeedAntiTheft.decode(mem(0x04), 656)
+
+    private fun ClientFakeEcu.options() = mem(0x04)[636].toInt() and 0xFF
+
+    private fun ClientFakeEcu.marker() = mem(0x04)[721].toInt() and 0xFF
+
+    private fun ClientFakeEcu.storedRevLimit() = MegaSpeedAntiTheft.decode(mem(0x04), 722) and 0xFFFF
+
+    /** CLTbased (bit 3) ligado, fuelcut (bit 5) desligado, bits 0 e 2 do usuário. */
+    private val userOptions = 0b0000_1101
+    private val userRevLimit = 7200
+
+    private fun ClientFakeEcu.userConfig() {
+        revLimit(userRevLimit)
+        mem(0x04)[636] = userOptions.toByte()
+    }
 
     @Test
-    fun `travar grava o valor negativo na tabela 4 e queima`() = runBlocking<Unit> {
+    fun `travar zera o limite, forca o corte de combustivel e guarda os originais`() = runBlocking<Unit> {
         val (c, ecu) = connect()
-        ecu.floodClear(700) // 70,0 %
+        ecu.userConfig()
 
-        assertEquals(700, c.lockAntiTheft())
+        val raw = c.lockAntiTheft()
 
-        val w = ecu.writes.single()
-        assertEquals(0x04, w.id)
-        assertEquals(588, w.offset)
-        assertEquals(listOf(0xFD, 0x43), w.data.map { it.toInt() and 0xFF }) // -701
-        assertEquals(listOf(0x04), ecu.burns)
+        assertEquals(MegaSpeedAntiTheft.Original(userRevLimit, cltBased = 1, fuelProg = 0, fuelCut = 0).toRaw(), raw)
+        assertEquals(0, ecu.revLimit())
+        // CLTbased e fuelprog desligados, fuelcut ligado; bits 0 e 2 do usuário preservados.
+        assertEquals(0b0010_0101, ecu.options())
+        assertTrue(MegaSpeedAntiTheft.isLocked(ecu.marker()))
+        assertEquals(userRevLimit, ecu.storedRevLimit())
+        // O limite em 0 é a última gravação: antes dele a ECU ainda não está cortando.
+        assertEquals(listOf(721, 636, 656), ecu.writes.map { it.offset })
+        assertTrue(ecu.burns.isNotEmpty() && ecu.burns.all { it == 0x04 })
         assertTrue(c.readAntiTheftLocked())
-        assertEquals(-701, ecu.floodClear())
     }
 
     @Test
     fun `destravar sem original salvo usa o guardado na trava`() = runBlocking<Unit> {
         val (c, ecu) = connect()
-        ecu.floodClear(-701)
+        ecu.userConfig()
+        c.lockAntiTheft()
 
         c.unlockAntiTheft()
 
-        assertEquals(700, ecu.floodClear())
+        assertEquals(userRevLimit, ecu.revLimit())
+        assertEquals(userOptions, ecu.options())
+        assertEquals(0, ecu.marker())
         assertFalse(c.readAntiTheftLocked())
-        assertEquals(listOf(0x04), ecu.burns)
+        // Assinatura apagada por último: interrompido antes dela, a ECU continua travada.
+        assertEquals(721, ecu.writes.last().offset)
     }
 
     @Test
     fun `destravar com original do celular usa esse valor`() = runBlocking<Unit> {
         val (c, ecu) = connect()
-        ecu.floodClear(-701)
-        c.unlockAntiTheft(originalRaw = 650)
-        assertEquals(650, ecu.floodClear())
+        ecu.userConfig()
+        c.lockAntiTheft()
+
+        c.unlockAntiTheft(originalRaw = MegaSpeedAntiTheft.Original(6500, cltBased = 0, fuelProg = 1, fuelCut = 1).toRaw())
+
+        assertEquals(6500, ecu.revLimit())
+        // CLTbased 0, fuelprog 1, fuelcut 1 (bits 3..5) + bits 0 e 2 do usuário.
+        assertEquals(0b0011_0101, ecu.options())
     }
 
     @Test
     fun `destravar ecu ja destravada nao grava`() = runBlocking<Unit> {
         val (c, ecu) = connect()
-        ecu.floodClear(700)
+        ecu.userConfig()
         c.unlockAntiTheft()
         assertTrue(ecu.writes.isEmpty())
         assertTrue(ecu.burns.isEmpty())
     }
 
     @Test
+    fun `trava gravada pela metade continua travada e destrava`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        ecu.userConfig()
+        c.lockAntiTheft()
+        // Falha depois da assinatura e antes do limite: simula voltando o limite ao original.
+        ecu.revLimit(userRevLimit)
+
+        assertTrue(c.readAntiTheftLocked())
+        c.unlockAntiTheft()
+        assertFalse(c.readAntiTheftLocked())
+        assertEquals(userRevLimit, ecu.revLimit())
+        assertEquals(userOptions, ecu.options())
+    }
+
+    @Test
     fun `motor girando ou ecu ja travada nao trava`() = runBlocking<Unit> {
         val (running, ecuRunning) = connect(rpm = 850)
-        ecuRunning.floodClear(700)
+        ecuRunning.userConfig()
         assertFailsWith<IllegalStateException> { running.lockAntiTheft() }
         assertTrue(ecuRunning.writes.isEmpty())
 
         val (c, ecu) = connect()
-        ecu.floodClear(-701)
+        ecu.userConfig()
+        c.lockAntiTheft()
+        ecu.writes.clear()
         assertFailsWith<IllegalStateException> { c.lockAntiTheft() }
         assertTrue(ecu.writes.isEmpty())
     }
 
     @Test
-    fun `ini com floodClear em outro lugar recusa`() = runBlocking<Unit> {
-        val (c, ecu) = connect(iniText = ini("""floodClear = scalar, S16, 590, "%", 0.10000, 0.00000, 0.00, 100.00, 1"""))
+    fun `limite ja em zero nao trava`() = runBlocking<Unit> {
+        val (c, ecu) = connect()
+        ecu.revLimit(0)
+        assertFailsWith<IllegalArgumentException> { c.lockAntiTheft() }
+        assertTrue(ecu.writes.isEmpty())
+    }
+
+    @Test
+    fun `ini com limite em outro lugar recusa`() = runBlocking<Unit> {
+        val (c, ecu) = connect(iniText = ini("""RevLimNormal2 = scalar, S16, 660, "RPM", 1, 0, 0, 15000, 0"""))
+        assertFailsWith<UnsupportedOperationException> { c.lockAntiTheft() }
+        assertFailsWith<UnsupportedOperationException> { c.readAntiTheftLocked() }
+        assertTrue(ecu.writes.isEmpty())
+    }
+
+    @Test
+    fun `ini sem os vizinhos do espaco livre recusa`() = runBlocking<Unit> {
+        val (c, ecu) = connect(iniText = ini().replace("hw_latency = scalar, U16, 730", "hw_latency = scalar, U16, 725"))
         assertFailsWith<UnsupportedOperationException> { c.lockAntiTheft() }
         assertTrue(ecu.writes.isEmpty())
     }
@@ -115,7 +180,7 @@ class EcuClientMegaSpeedAntiTheftTest {
     @Test
     fun `writeGuard recebe a operacao do antifurto`() = runBlocking<Unit> {
         val (c, ecu) = connect()
-        ecu.floodClear(700)
+        ecu.userConfig()
         val ops = mutableListOf<String>()
         c.writeGuard = { op -> ops += op; op != EcuAntiTheft.OP_LOCK }
         assertFailsWith<WriteNotPermittedException> { c.lockAntiTheft() }

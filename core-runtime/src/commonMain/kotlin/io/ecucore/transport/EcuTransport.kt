@@ -162,6 +162,10 @@ interface EcuTransport {
     suspend fun writeMegaSpeedConfigField(field: String, value: Double): Unit =
         throw UnsupportedOperationException("MegaSpeed field write not supported by this transport")
 
+    /** Partida travada pelo antifurto ([io.ecucore.model.EcuAntiTheft]): MegaSpeed e Speeduino. */
+    suspend fun readAntiTheftLocked(): Boolean =
+        throw UnsupportedOperationException("Anti-theft not supported by this transport")
+
     /**
      * Curva 1D do .ini (família MS2) na unidade do .ini; `tempTable` sempre em °F
      * (use [io.ecucore.model.IniTemperature] para °C). Só nomes de [io.ecucore.model.Ms2WritableFields.curves].
@@ -173,14 +177,7 @@ interface EcuTransport {
     suspend fun writeIniCurve(name: String, values: List<Double>): Unit =
         throw UnsupportedOperationException("INI curve write not supported by this transport")
 
-    /** Partida travada pelo antifurto ([io.ecucore.model.EcuAntiTheft]): MegaSpeed e Speeduino. */
-    suspend fun readAntiTheftLocked(): Boolean =
-        throw UnsupportedOperationException("Anti-theft not supported by this transport")
-
-    /**
-     * Trava a partida (motor parado), confere e dá burn; devolve os valores originais da família, num
-     * Int opaco para guardar e passar de volta ao [unlockAntiTheft].
-     */
+    /** Trava a partida (motor parado), confere e dá burn; devolve o valor original do desafogador. */
     suspend fun lockAntiTheft(): Int =
         throw UnsupportedOperationException("Anti-theft not supported by this transport")
 

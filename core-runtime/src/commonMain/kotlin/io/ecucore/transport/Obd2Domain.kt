@@ -1,5 +1,6 @@
 package io.ecucore.transport
 
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -161,6 +162,12 @@ data class DtcCode(
  * (ex.: "P0133"). byte0 carrega a letra (bits 7-6) e o primeiro dígito (bits 5-4) mais o segundo
  * dígito (bits 3-0); byte1 carrega o terceiro e quarto dígitos (nibble alto/baixo).
  */
+/**
+ * PID 0x0E (SAE J1979): avanço de ignição em graus = A/2 - 64.
+ * (Antes o app usava A - 64, que dava 65° para a resposta real 0x81 = 0,5°.)
+ */
+fun decodeTimingAdvanceDegrees(a: Int): Int = (a / 2.0 - 64.0).roundToInt()
+
 fun decodeDtc(byte0: Int, byte1: Int): String {
     val letter = when ((byte0 shr 6) and 0x3) {
         0 -> 'P'
