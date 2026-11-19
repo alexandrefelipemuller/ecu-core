@@ -32,6 +32,18 @@ object Ms2WritableFields {
     const val IDLE_HYST = "IdleHyst"
     const val IAC_FULL_OPEN = "iacfullopen"
     /** Página 0x05 do .ini. */
+    // Limitador de giros (mesmos nomes do .ini da MegaSpeed; são bits/escalares da página de configuração).
+    const val REV_LIM = "RevLimNormal2"
+    const val REV_LIM_HYST = "RevLimNormal2_hyst"
+    const val REV_LIM_CLT_BASED = "RevLimCLTbased"
+    const val REV_LIM_TPS_BYPASS = "TpsBypassCLTRevlim"
+    const val REV_LIM_RETARD = "RevLimOption_retard"
+    const val REV_LIM_MAX_RETARD = "RevLimMaxRtd"
+    const val REV_LIM_FIXED_ANGLE = "RevLimRtdAng"
+    const val REV_LIM_SPARK_CUT = "RevLimOption_spkcut"
+    const val REV_LIM_FUEL_CUT = "RevLimOption_fuelcut"
+    const val REV_LIM_FUEL_PROGRESSIVE = "RevLimOption_fuelprog"
+    /** Página 0x05 do .ini. */
     const val PWMIDLE_OPEN_STEPS = "pwmidle_open_steps"
     const val PWMIDLE_CLOSED_STEPS = "pwmidle_closed_steps"
     const val IAC_STEP_TABLE = "iacstepTable"
@@ -54,6 +66,16 @@ object Ms2WritableFields {
         MegaSpeedWritableField(IAC_FULL_OPEN, "Passos bem abertos", "passos", 0.0, 4000.0, 0),
         MegaSpeedWritableField(PWMIDLE_OPEN_STEPS, "Passos do atuador aberto (malha fechada)", "passos", 0.0, 255.0, 0),
         MegaSpeedWritableField(PWMIDLE_CLOSED_STEPS, "Passos do atuador fechado (malha fechada)", "passos", 0.0, 255.0, 0),
+        MegaSpeedWritableField(REV_LIM, "Limite de rotação", "RPM", 1000.0, 15000.0, 0),
+        MegaSpeedWritableField(REV_LIM_HYST, "Rotação de corte subtraindo", "RPM", 100.0, 1000.0, 0),
+        MegaSpeedWritableField(REV_LIM_CLT_BASED, "Limite por temperatura (0=Normal, 1=Por CLT)", "", 0.0, 1.0, 0),
+        MegaSpeedWritableField(REV_LIM_TPS_BYPASS, "TPS para ignorar a proteção por temperatura", "%", 0.0, 100.0, 1),
+        MegaSpeedWritableField(REV_LIM_RETARD, "Método de retardo (0=Desligado, 1=Progressivo, 2=Ângulo fixo)", "", 0.0, 2.0, 0),
+        MegaSpeedWritableField(REV_LIM_MAX_RETARD, "Retardo máximo (progressivo)", "°", 0.0, 25.5, 1),
+        MegaSpeedWritableField(REV_LIM_FIXED_ANGLE, "Retardo fixo", "°", -10.0, 25.5, 1),
+        MegaSpeedWritableField(REV_LIM_SPARK_CUT, "Corte de ignição (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
+        MegaSpeedWritableField(REV_LIM_FUEL_CUT, "Corte de combustível (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
+        MegaSpeedWritableField(REV_LIM_FUEL_PROGRESSIVE, "Corte de combustível progressivo (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
     )
 
     val curves: List<IniWritableCurve> = listOf(
