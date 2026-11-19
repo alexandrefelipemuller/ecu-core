@@ -32,6 +32,10 @@ class EcuClientMs2IdleTest {
         IdleCtl         = bits  ,  U08,    547,      [0:1], "None", "On/Off valve", "PWM valve (2 or 3 wire)", "Stepper valve (4 or 6 wire)"
         IACtstep        = scalar,  U08,    548,             "ms",       1,   0.00000,  0.00,   255,      0
         IAC_tinitial_step = scalar, U08,   549,             "ms",       1,   0.00000,  0.00,   255,      0
+        egoType         = bits  ,  U08,    594,      [0:2], "Disabled", "Narrow Band", "Dual Narrow Band", "Single Wide Band", "Dual Wide Band", "INVALID", "INVALID", "INVALID"
+        egoDelta        = scalar,  U08,    596,             "%",        0.10000,   0.00000,  0.00,  25.5,      1
+        egoTemp         = scalar,  S16,    604,             "°C",       0.05555,  -320.000, -40,   150,      1
+        egoTemp         = scalar,  S16,    604,             "°F",       0.10000,   0.00000, -40,   300,      1
         IACStart        = scalar, S16,     552,             "",         1.00000, 0.00000, 0.00, 4000.00,    0
         IdleHyst        = scalar,  S16,    554,             "°C",       0.05555,   0.00000, 0,  20.0,       1
         IdleHyst        = scalar,  S16,    554,             "°F",       0.10000,   0.00000, 0,  36.0,       1
@@ -55,7 +59,7 @@ class EcuClientMs2IdleTest {
     @Test
     fun `whitelist tem escalares e curvas de lenta`() {
         listOf("IdleCtl", "IdleCtl_alg", "IdleCtl_home", "IACtstep", "IAC_tinitial_step", "IACminstep", "IACStart", "IACcrankxt",
-            "IdleHyst", "iacfullopen", "RevLimNormal2", "RevLimNormal2_hyst", "RevLimOption_retard", "RevLimOption_spkcut", "RevLimOption_fuelcut", "RevLimOption_fuelprog", "RevLimCLTbased", "TpsBypassCLTRevlim", "RevLimMaxRtd", "RevLimRtdAng", "pwmidle_open_steps", "pwmidle_closed_steps").forEach {
+            "IdleHyst", "iacfullopen", "egoType", "egoAlgorithm", "egoCount", "egoDelta", "egoLimit", "egoTemp", "egoRPM", "TPSOXLimit", "MAPOXLimit", "MAPOXMin", "ego_startdelay", "egoKP", "egoKI", "egoKD", "RevLimNormal2", "RevLimNormal2_hyst", "RevLimOption_retard", "RevLimOption_spkcut", "RevLimOption_fuelcut", "RevLimOption_fuelprog", "RevLimCLTbased", "TpsBypassCLTRevlim", "RevLimMaxRtd", "RevLimRtdAng", "pwmidle_open_steps", "pwmidle_closed_steps").forEach {
             assertNotNull(Ms2WritableFields.byName(it), it)
         }
         assertEquals("F", Ms2WritableFields.curveByName("pwmidle_clt_temps")?.unitSuffix)
@@ -70,6 +74,11 @@ class EcuClientMs2IdleTest {
         ecu.load(0x04, 547, byteArrayOf(0x28)) // alg=1 (bit3), home=1 (bit5), ctl=0
         c.writeMegaSpeedConfigField("IdleCtl", 3.0)
         assertEquals(0x2B, ecu.writes.single().data[0].toInt())
+        // egoTemp: variante °C (primeira do .ini): 85 °C -> bruto 1850 (= 185,0 °F x 10).
+        ecu.load(0x04, 604, byteArrayOf(0x00, 0x00))
+        c.writeMegaSpeedConfigField("egoTemp", 85.0)
+        assertEquals(1850, ecu.writes.last().data.let { ((it[0].toInt() and 0xFF) shl 8) or (it[1].toInt() and 0xFF) })
+        assertFailsWith<IllegalArgumentException> { c.writeMegaSpeedConfigField("egoType", 5.0) }
         c.writeMegaSpeedConfigField("IACStart", 500.0)
         c.writeMegaSpeedConfigField("IAC_tinitial_step", 5.0)
         assertEquals(5, ecu.writes.last { it.id == 0x04 }.data.last().toInt() and 0xFF)

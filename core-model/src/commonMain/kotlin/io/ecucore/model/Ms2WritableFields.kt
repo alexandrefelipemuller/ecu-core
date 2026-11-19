@@ -43,6 +43,21 @@ object Ms2WritableFields {
     const val REV_LIM_SPARK_CUT = "RevLimOption_spkcut"
     const val REV_LIM_FUEL_CUT = "RevLimOption_fuelcut"
     const val REV_LIM_FUEL_PROGRESSIVE = "RevLimOption_fuelprog"
+    // Correção por sonda (EGO) - diálogo "EGO Control" do .ini. As portas da sonda (egoport/ego2port) ficam de fora.
+    const val EGO_TYPE = "egoType"
+    const val EGO_ALGORITHM = "egoAlgorithm"
+    const val EGO_COUNT = "egoCount"
+    const val EGO_DELTA = "egoDelta"
+    const val EGO_LIMIT = "egoLimit"
+    const val EGO_TEMP = "egoTemp"
+    const val EGO_RPM = "egoRPM"
+    const val EGO_TPS_MAX = "TPSOXLimit"
+    const val EGO_MAP_MAX = "MAPOXLimit"
+    const val EGO_MAP_MIN = "MAPOXMin"
+    const val EGO_START_DELAY = "ego_startdelay"
+    const val EGO_KP = "egoKP"
+    const val EGO_KI = "egoKI"
+    const val EGO_KD = "egoKD"
     /** Página 0x05 do .ini. */
     const val PWMIDLE_OPEN_STEPS = "pwmidle_open_steps"
     const val PWMIDLE_CLOSED_STEPS = "pwmidle_closed_steps"
@@ -76,6 +91,23 @@ object Ms2WritableFields {
         MegaSpeedWritableField(REV_LIM_SPARK_CUT, "Corte de ignição (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
         MegaSpeedWritableField(REV_LIM_FUEL_CUT, "Corte de combustível (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
         MegaSpeedWritableField(REV_LIM_FUEL_PROGRESSIVE, "Corte de combustível progressivo (0=Desligado, 1=Ligado)", "", 0.0, 1.0, 0),
+        // 0=Desligado, 1=Banda estreita, 2=Duas estreitas, 3=Banda larga, 4=Duas largas (5..7 são INVALID no .ini).
+        MegaSpeedWritableField(EGO_TYPE, "Tipo de sonda (0=Desligada, 1=Estreita, 2=Duas estreitas, 3=Larga, 4=Duas largas)", "", 0.0, 4.0, 0),
+        // 0=Simples, 2=PID, 3=Sem correção (1 é INVALID no .ini; a UI só oferece 0, 2 e 3).
+        MegaSpeedWritableField(EGO_ALGORITHM, "Algoritmo (0=Simples, 2=PID, 3=Sem correção)", "", 0.0, 3.0, 0),
+        MegaSpeedWritableField(EGO_COUNT, "Eventos de ignição por passo", "", 0.0, 255.0, 0),
+        MegaSpeedWritableField(EGO_DELTA, "Tamanho do passo", "%", 0.0, 25.5, 1),
+        MegaSpeedWritableField(EGO_LIMIT, "Autoridade da correção (+/-)", "%", 0.0, 100.0, 1),
+        // Sempre a variante °C do .ini (primeira definição): o parser não avalia `#if CELSIUS`.
+        MegaSpeedWritableField(EGO_TEMP, "Ativo acima da temperatura do motor", "°C", -40.0, 150.0, 1),
+        MegaSpeedWritableField(EGO_RPM, "Ativo acima de", "RPM", 0.0, 15000.0, 0),
+        MegaSpeedWritableField(EGO_TPS_MAX, "Ativo abaixo de (TPS)", "%", 0.0, 100.0, 1),
+        MegaSpeedWritableField(EGO_MAP_MAX, "Ativo abaixo de (MAP)", "kPa", 0.0, 300.0, 1),
+        MegaSpeedWritableField(EGO_MAP_MIN, "Ativo acima de (MAP)", "kPa", 0.0, 300.0, 1),
+        MegaSpeedWritableField(EGO_START_DELAY, "Atraso após a partida", "s", 0.0, 120.0, 0),
+        MegaSpeedWritableField(EGO_KP, "Ganho proporcional (PID)", "%", 0.0, 200.0, 0),
+        MegaSpeedWritableField(EGO_KI, "Ganho integral (PID)", "%", 0.0, 200.0, 0),
+        MegaSpeedWritableField(EGO_KD, "Ganho derivativo (PID)", "%", 0.0, 200.0, 0),
     )
 
     val curves: List<IniWritableCurve> = listOf(
