@@ -1567,7 +1567,7 @@ class Obd2Transport(
         diagnosticsSink.log(
             "elm327",
             "llm_explore",
-            "done stop=${record.stopReason} rounds=${record.rounds.size} tokens=${record.totalUsage.total}"
+            "done stop=${record.stopReason} rounds=${record.rounds.size} tokens=${record.totalUsage.total} detail=${record.stopDetail ?: "-"}"
         )
         runCatching { hooks.onLlmExplorationResult(record) }
     }
