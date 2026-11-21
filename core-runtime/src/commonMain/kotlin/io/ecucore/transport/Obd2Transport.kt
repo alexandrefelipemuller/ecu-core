@@ -2,6 +2,12 @@ package io.ecucore.transport
 
 import io.ecucore.shared.Logger
 import io.ecucore.shared.MonotonicClock
+import io.ecucore.transport.llm.ElmProbeCodec
+import io.ecucore.transport.llm.LlmExplorationSession
+import io.ecucore.transport.llm.ProbeRequest
+import io.ecucore.transport.llm.ProbeStatus
+import io.ecucore.transport.llm.ReadService
+import io.ecucore.transport.llm.ReferenceQuantity
 import io.ecucore.shared.formatDecimal
 import io.ecucore.shared.toHex02
 import io.ecucore.EcuLiveData
@@ -1526,6 +1532,53 @@ class Obd2Transport(
             "done responding=${responding.joinToString(",").ifBlank { "-" }} elapsedMs=${result.elapsedMs}"
         )
         runCatching { hooks.onResult(result) }
+        runLlmExplorationIfAllowed(hooks, result)
+    }
+
+    private suspend fun runLlmExplorationIfAllowed(
+        hooks: Obd2FailureExplorationHooks,
+        result: Obd2ExplorationResult,
+    ) {
+        if (!connection.isConnected()) return
+        val request = try {
+            hooks.prepareLlmExploration(result)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            diagnosticsSink.log("elm327", "llm_explore", "prepare_failed=${e.message ?: e::class.simpleName}")
+            null
+        } ?: return
+        if (!connection.isConnected()) return
+
+        val record = ioMutex.withLock {
+            runCatching { connection.clearInputBuffer() }
+            // Parte do primeiro protocolo que respondeu na varredura (se algum respondeu).
+            result.respondingProtocols.firstOrNull()?.let { sp ->
+                runCatching { sendCommand("ATSP$sp", 1_200L) }
+            }
+            LlmExplorationSession(
+                planner = request.planner,
+                send = { command, timeoutMs -> sendCommand(command, timeoutMs) },
+                isConnected = { connection.isConnected() },
+                isEngineRunning = { readEngineRunningForExploration() },
+                budget = request.budget,
+            ).run(request.context.copy(respondingProtocols = result.respondingProtocols))
+        }
+        diagnosticsSink.log(
+            "elm327",
+            "llm_explore",
+            "done stop=${record.stopReason} rounds=${record.rounds.size} tokens=${record.totalUsage.total}"
+        )
+        runCatching { hooks.onLlmExplorationResult(record) }
+    }
+
+    /** true = RPM > 0 (aborta exploração); null = indeterminado (sem resposta ao 010C). */
+    private suspend fun readEngineRunningForExploration(): Boolean? {
+        val request = ProbeRequest(ReadService.OBD_MODE_01, "0C")
+        val response = runCatching { sendCommand("010C", 2_000L) }.getOrNull() ?: return null
+        val decoded = ElmProbeCodec.decode(request, response)
+        if (decoded.status != ProbeStatus.POSITIVE) return null
+        return ReferenceQuantity.RPM.decodeMode01(decoded.data)?.let { it > 0.0 }
     }
 
     private fun compactElmResponse(response: String): String? {
