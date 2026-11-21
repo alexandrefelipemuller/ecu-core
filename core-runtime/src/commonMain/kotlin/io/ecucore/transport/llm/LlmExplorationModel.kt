@@ -159,12 +159,25 @@ data class ProbeOutcome(
 
 data class RejectedProbe(val request: ProbeRequest, val reason: String)
 
+/** De onde veio a rodada: do LLM ou de uma etapa determinística (sem custo de tokens). */
+enum class RoundSource {
+    /** Plano proposto pelo LLM. */
+    LLM,
+    /** Mapa de ECUs: leitura inofensiva (22 F190) em cada endereço candidato. */
+    SURVEY_ECU_MAP,
+    /** Amostragem de faixas de DID (XX00) nas ECUs encontradas. */
+    SURVEY_DID_RANGES,
+    /** Vizinhos (±N) de identificadores que responderam. */
+    NEIGHBORS,
+}
+
 data class ExplorationRound(
     val index: Int,
     val plan: ExplorationPlan,
     val rejected: List<RejectedProbe>,
     val outcomes: List<ProbeOutcome>,
     val usage: TokenUsage,
+    val source: RoundSource = RoundSource.LLM,
 ) {
     val positives: Int get() = outcomes.count { it.status == ProbeStatus.POSITIVE }
 }
@@ -183,6 +196,14 @@ data class ExplorationBudget(
     val maxRoundsWithoutProgress: Int = 2,
     /** Sem resposta seguidas numa rodada antes de abortar a rodada (ECU ausente). */
     val maxConsecutiveNoResponse: Int = 8,
+    /** Etapas determinísticas (mapa de ECUs, faixas de DID, vizinhos) antes/entre as rodadas do LLM. */
+    val surveyEnabled: Boolean = true,
+    /** Orçamento próprio das etapas determinísticas (não consome [maxTotalProbes] do LLM). */
+    val maxDeterministicProbes: Int = 700,
+    /** Quantas ECUs recebem a amostragem de faixas de DID (256 leituras cada). */
+    val surveyMaxEcus: Int = 2,
+    /** Raio da expansão de vizinhos em torno de cada identificador que respondeu. */
+    val neighborRadius: Int = 16,
 )
 
 enum class StopReason {

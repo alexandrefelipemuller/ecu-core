@@ -164,6 +164,7 @@ class LlmExplorationSessionTest {
 
     private var now = 0L
     private val clock = { now.also { now += 10 } }
+    private val noSurvey = ExplorationBudget(surveyEnabled = false)
 
     @Test
     fun runsRoundsValidatesAndVerifiesProfile() = runTest {
@@ -186,7 +187,7 @@ class LlmExplorationSessionTest {
                 PlannerStep.Finish(profile, TokenUsage(1500, 300)),
             )
         )
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, clock = clock)
+        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, budget = noSurvey, clock = clock)
             .run(ExplorationContext(wmi = "9BW"))
 
         assertEquals(StopReason.PLANNER_FINISHED, record.stopReason)
@@ -213,7 +214,7 @@ class LlmExplorationSessionTest {
                 return PlannerStep.Probe(ExplorationPlan(listOf(ProbeRequest(ReadService.UDS_22, "10" + (n++).toString(16).uppercase().padStart(2, '0')))))
             }
         }
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, clock = clock)
+        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, budget = noSurvey, clock = clock)
             .run(ExplorationContext())
         assertEquals(StopReason.NO_PROGRESS, record.stopReason)
         assertEquals(2, record.rounds.size)
@@ -225,7 +226,7 @@ class LlmExplorationSessionTest {
     fun abortsWhenEngineRunning() = runTest {
         val ecu = FakeEcu()
         val planner = ScriptedPlanner(listOf(PlannerStep.Finish(CandidateProfile())))
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { true }, clock = clock)
+        val record = LlmExplorationSession(planner, ecu::send, { true }, { true }, budget = noSurvey, clock = clock)
             .run(ExplorationContext())
         assertEquals(StopReason.ENGINE_RUNNING, record.stopReason)
         assertTrue(planner.contexts.isEmpty())
@@ -243,9 +244,95 @@ class LlmExplorationSessionTest {
         }
         val record = LlmExplorationSession(
             planner, ecu::send, { true }, { false },
-            budget = ExplorationBudget(maxRoundsWithoutProgress = 99), clock = clock,
+            budget = noSurvey.copy(maxRoundsWithoutProgress = 99), clock = clock,
         ).run(ExplorationContext())
         assertEquals(StopReason.MAX_TOKENS, record.stopReason)
         assertEquals(2, record.rounds.size)
+    }
+}
+
+class DeterministicSurveyTest {
+
+    /**
+     * ECU só em 7E0 (CAN 11/500): VIN em F190, part number em F187, bloco proprietário
+     * 1000..1003. Outros DIDs → 7F 22 31; outros headers → NO DATA; $21 → 7F 21 11.
+     */
+    private class OemEcu {
+        val sent = mutableListOf<String>()
+        private var header = ""
+        suspend fun send(cmd: String, @Suppress("UNUSED_PARAMETER") timeout: Long): String {
+            sent += cmd
+            if (cmd.startsWith("ATSH")) header = cmd.removePrefix("ATSH")
+            if (cmd.startsWith("AT")) return "OK"
+            if (header != "7E0") return "NO DATA"
+            return when (cmd) {
+                "22F190" -> "62 F1 90 57 56 57"
+                "22F187" -> "62 F1 87 30 33"
+                "221000", "221001", "221002", "221003" -> "62 ${cmd.substring(2, 4)} ${cmd.substring(4, 6)} 7E"
+                else -> if (cmd.startsWith("21")) "7F 21 11" else "7F 22 31"
+            }
+        }
+    }
+
+    private var now = 0L
+    private val clock = { now.also { now += 10 } }
+
+    @Test
+    fun surveyMapsEcuSamplesBlocksAndExpandsNeighborsWithoutTokens() = runTest {
+        val ecu = OemEcu()
+        val contexts = mutableListOf<List<ExplorationRound>>()
+        val planner = object : LlmExplorationPlanner {
+            override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep {
+                contexts += history
+                return PlannerStep.Finish(CandidateProfile())
+            }
+        }
+        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, clock = clock)
+            .run(ExplorationContext())
+
+        val bySource = record.rounds.groupBy { it.source }
+        assertTrue(RoundSource.SURVEY_ECU_MAP in bySource)
+        assertTrue(RoundSource.SURVEY_DID_RANGES in bySource)
+        assertTrue(RoundSource.NEIGHBORS in bySource)
+        val positives = record.rounds.flatMap { it.outcomes }
+            .filter { it.status == ProbeStatus.POSITIVE }
+            .map { it.request.id }.toSet()
+        // F190 (ping) → F187 (vizinho); 1000 (bloco) → 1001..1003 (vizinhos)
+        assertEquals(setOf("F190", "F187", "1000", "1001", "1002", "1003"), positives)
+        // Só uma faixa de DIDs (só 7E0 existe) e o LLM já recebe tudo no primeiro passo.
+        assertEquals(1, bySource.getValue(RoundSource.SURVEY_DID_RANGES).size)
+        assertEquals(record.rounds.size, contexts.first().size)
+        assertEquals(0, record.totalUsage.total)
+        // Achou ECU no protocolo 6: não tenta a taxa 250k (8) para 11-bit.
+        assertTrue("ATSP8" !in ecu.sent)
+    }
+
+    @Test
+    fun prunesServiceAfterServiceNotSupported() = runTest {
+        val ecu = OemEcu()
+        var step = 0
+        val planner = object : LlmExplorationPlanner {
+            override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep {
+                if (step++ > 0) return PlannerStep.Finish(CandidateProfile())
+                return PlannerStep.Probe(ExplorationPlan((1..5).map { ProbeRequest(ReadService.KWP_21, "0$it", header = "7E0") }))
+            }
+        }
+        val record = LlmExplorationSession(
+            planner, ecu::send, { true }, { false },
+            budget = ExplorationBudget(surveyEnabled = false), clock = clock,
+        ).run(ExplorationContext())
+        val llm = record.rounds.first { it.source == RoundSource.LLM }
+        assertEquals(1, llm.outcomes.size)
+        assertEquals(4, llm.rejected.count { it.reason == "service_unsupported" })
+        assertEquals(1, ecu.sent.count { it.startsWith("21") })
+    }
+
+    @Test
+    fun neighborProbesStayInRangeAndWidth() {
+        val n = DeterministicSurvey.neighborProbes(ProbeRequest(ReadService.UDS_22, "0001", "7E0"), 3)
+        assertEquals(listOf("0000", "0002", "0003", "0004"), n.map { it.id }.sorted())
+        assertTrue(n.all { ExplorationPlanValidator.rejectionReason(it) == null })
+        val k = DeterministicSurvey.neighborProbes(ProbeRequest(ReadService.KWP_21, "FE"), 2)
+        assertEquals(listOf("FC", "FD", "FF"), k.map { it.id }.sorted())
     }
 }

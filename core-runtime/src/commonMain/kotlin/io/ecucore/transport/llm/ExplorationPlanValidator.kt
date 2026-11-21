@@ -83,4 +83,7 @@ object ExplorationPlanValidator {
     )
 
     private fun ProbeRequest.key() = "${service.name}|$id|${header.orEmpty()}|${protocol.orEmpty()}"
+
+    /** Chave de deduplicação (serviço|id|header|protocolo normalizados, sem a hipótese). */
+    fun probeKey(probe: ProbeRequest): String = probe.normalized().key()
 }
