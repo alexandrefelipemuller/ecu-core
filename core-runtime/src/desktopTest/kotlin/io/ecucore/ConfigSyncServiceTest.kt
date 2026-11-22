@@ -283,7 +283,8 @@ class ConfigSyncServiceTest {
         val dir = session("retry", 1 to ByteArray(128) { 5 })
         val outcome = service.restoreConfigToEcu(client, dir, skipPages = (2..10).map { it.toByte() }.toSet())
         assertTrue(outcome.completed)
-        assertEquals(3, failures)
+        // 2 frames recusados + a página (128 bytes) regravada em 2 blocos de 64 = 4 'M'.
+        assertEquals(4, failures)
         assertEquals(5, ecu.mem(1)[0].toInt())
     }
 

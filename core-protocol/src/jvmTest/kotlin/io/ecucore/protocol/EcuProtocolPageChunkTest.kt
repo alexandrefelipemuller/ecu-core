@@ -1,9 +1,11 @@
 package io.ecucore.protocol
 
+import io.ecucore.model.EcuFamily
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 /** Leitura de página maior que o buffer do firmware AVR é dividida em blocos (ex.: VE = 288 bytes). */
 class EcuProtocolPageChunkTest {
@@ -35,5 +37,22 @@ class EcuProtocolPageChunkTest {
         val c = firmwareConn(page)
         assertContentEquals(page, newProtocol(c).readPage(3, 0, 251))
         assertEquals(1, c.sent.size)
+    }
+
+    @Test
+    fun `modern write larger than the AVR buffer is split into frames that fit in 264 bytes`() = runBlocking {
+        val c = ScriptedConnection(modern = true).apply { onSend = { listOf(okFrame()) } }
+        val page = ByteArray(288) { (it * 5 + 1).toByte() }
+
+        newProtocol(c, env = true, family = EcuFamily.SPEEDUINO).writePage(5, 0, page)
+
+        val writes = c.sent.filter { isFrame(it) && cmdOf(it) == 'M' }
+        assertEquals(2, writes.size)
+        writes.forEach { assertTrue(it.size <= 264, "frame de ${it.size} bytes estoura o buffer do AVR") }
+        fun u16(f: ByteArray, i: Int) = (f[i].toInt() and 0xFF) or ((f[i + 1].toInt() and 0xFF) shl 8)
+        assertEquals(listOf(0, 240), writes.map { u16(it, 5) })
+        assertEquals(listOf(240, 48), writes.map { u16(it, 7) })
+        val rebuilt = writes.flatMap { it.copyOfRange(9, it.size - 4).toList() }.toByteArray()
+        assertContentEquals(page, rebuilt)
     }
 }

@@ -286,6 +286,35 @@ class EcuClientVerifiedTableWriteTest {
     }
 
     @Test
+    fun `restauracao da AFR de 288 bytes cabe no buffer do AVR e confere`() = runBlocking {
+        // Campo 2026-11 (v1.7.0, Bluetooth, 202501): a página 5 ia num único 'M' de ~300 bytes,
+        // o AVR ignorava e o read-back dava 288/288 bytes divergentes nas 3 tentativas.
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 0, maxFrameBytes = 264)
+        ecu.load(5, 0, ByteArray(288) { 100 })
+        val client = newClient(ecu)
+        client.connect()
+        val image = ByteArray(288) { 147.toByte() }
+
+        client.writeRawPageWithoutBurn(5, image)
+
+        assertContentEquals(image, ecu.read(5, 0, 288))
+        assertTrue(ecu.maxWriteFrame <= 264, "frame de ${ecu.maxWriteFrame} bytes")
+    }
+
+    @Test
+    fun `passe ignorado inteiro pela ECU repete com blocos menores`() = runBlocking {
+        // ECU que só aceita frames de até 32 bytes de dados (32 + 6 + envelope 7 = 45).
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 0, maxFrameBytes = 45)
+        val client = newClient(ecu)
+        client.connect()
+        val image = ByteArray(128) { (it + 1).toByte() }
+
+        client.writeRawPageWithoutBurn(4, image)
+
+        assertContentEquals(image, ecu.read(4, 0, 128))
+    }
+
+    @Test
     fun `restauracao em chunks grava e confere`() = runBlocking {
         val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
         val client = newClient(ecu)
@@ -482,6 +511,8 @@ class EcuClientVerifiedTableWriteTest {
         private val corruptOnBurn: Boolean = false,
         /** Depois do burn a ECU não responde mais a leituras de página (rejeita com erro). */
         private val failReadsAfterBurn: Boolean = false,
+        /** Buffer serial do AVR: frame 'M' maior que isso é ignorado inteiro (mas ainda responde OK). */
+        private val maxFrameBytes: Int? = null,
     ) : IEcuConnection {
         private val pages = mutableMapOf<Int, ByteArray>()
         private val handshake = mutableMapOf(
@@ -499,6 +530,9 @@ class EcuClientVerifiedTableWriteTest {
         private var connected = false
         private var writes = 0
         var burns = 0
+            private set
+        /** Maior frame 'M' recebido (bytes, com envelope). */
+        var maxWriteFrame = 0
             private set
         /** Páginas queimadas com 'b', na ordem em que chegaram. */
         val burnedPages = mutableListOf<Int>()
@@ -524,6 +558,11 @@ class EcuClientVerifiedTableWriteTest {
                     if (failReadsAfterBurn && burns > 0) pending += rc(0x83)
                     else pending += ModernEnvelopeFake.framedResponse(read(p[1].toInt() and 0xFF, u16(2), u16(4)))
                 'M'.code.toByte() -> {
+                    maxWriteFrame = maxOf(maxWriteFrame, data.size)
+                    if (maxFrameBytes != null && data.size > maxFrameBytes) {
+                        pending += rc(0x00)
+                        return
+                    }
                     val pageNum = p[1].toInt() and 0xFF
                     val offset = u16(2)
                     val length = u16(4)

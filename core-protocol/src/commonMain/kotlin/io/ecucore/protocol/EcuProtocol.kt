@@ -36,6 +36,9 @@ class EcuProtocol(
         private const val PAGE_READ_CRC_MAX_ATTEMPTS = 3
         /** Tamanho máximo de um bloco de leitura de página (blockingFactor do INI para AVR). */
         private const val MAX_PAGE_READ_BLOCK = 251
+        // Mesmo limite na escrita: 'M' + 6 bytes de cabeçalho + dados + envelope (2 + 4) tem que
+        // caber no buffer serial de 264 bytes do AVR, senão o firmware ignora o frame inteiro.
+        private const val MAX_PAGE_WRITE_BLOCK = 240
         private const val PAGE_READ_CRC_RETRY_DELAY_MS = 40L
 
         // Response codes
@@ -1533,6 +1536,15 @@ class EcuProtocol(
 
         val ecuFamily = sessionEcuFamily
         val useTableEnvelope = ecuFamily == EcuFamily.MS2 || ecuFamily == EcuFamily.MEGASPEED || ecuFamily == EcuFamily.MS3
+        if (!useTableEnvelope && data.size > MAX_PAGE_WRITE_BLOCK) {
+            var done = 0
+            while (done < data.size) {
+                val n = minOf(MAX_PAGE_WRITE_BLOCK, data.size - done)
+                writePage(pageNum, offset + done, data.copyOfRange(done, done + n))
+                done += n
+            }
+            return
+        }
 
         // Criar payload (M + pageId(2 bytes) + offset + length + data)
         val extraPayload = ByteArray(6 + data.size)

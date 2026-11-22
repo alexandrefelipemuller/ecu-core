@@ -195,6 +195,8 @@ class EcuClient(
         // com legacy ainda liberado, bytes 'A'..'z' desse lixo viram comandos 'W' (escrita de 1
         // byte na RAM) - célula corrompida sem nenhum erro visível. Só o read-back pega isso.
         private const val TABLE_WRITE_CHUNK_SIZE = 64
+        /** Menor bloco usado quando um passe inteiro foi ignorado pela ECU. */
+        private const val TABLE_WRITE_MIN_CHUNK_SIZE = 16
 
         /** Respiro depois do burn antes de reler (a ECU está gravando a EEPROM e pode não responder). */
         private const val POST_BURN_SETTLE_MS = 150L
@@ -3233,9 +3235,10 @@ class EcuClient(
             )
             runCatching { pageWriteAnomalyListener?.invoke(event) }.onFailure { noteSwallowed("listener_page_write_anomaly", it) }
         }
+        var passChunkSize = chunkSize
         for (pass in 1..TABLE_WRITE_VERIFY_MAX_PASSES) {
             try {
-                val retried = writePageChunksWithRetry(pageNum, data, chunkSize, offset, failFastOnRange = rethrowRangeRejection)
+                val retried = writePageChunksWithRetry(pageNum, data, passChunkSize, offset, failFastOnRange = rethrowRangeRejection)
                 // Chunk rejeitado e recuperado no retry: o retry pode ter sobrescrito o lixo, mas
                 // 0x82 no link continua sendo sinal que precisa chegar na telemetria.
                 lastWriteError = null
@@ -3290,6 +3293,11 @@ class EcuClient(
                 writeLedger.recordVerified(pageNum, offset, data, label)
                 return
             }
+            // Todos os bytes divergentes = a ECU ignorou a escrita (frame grande demais pro buffer),
+            // não ruído no link: repetir o mesmo envio não adianta, então o próximo passe usa blocos menores.
+            if (mismatches.size == data.size && data.size > 1) {
+                passChunkSize = (passChunkSize / 2).coerceAtLeast(TABLE_WRITE_MIN_CHUNK_SIZE)
+            }
             Logger.w(
                 TAG,
                 "$label: read-back divergiu em ${mismatches.size} bytes no passe $pass " +
@@ -3315,13 +3323,16 @@ class EcuClient(
 
     /**
      * Gravação de página inteira de backup/restauração. Speeduino: mesma garantia das tabelas
-     * (read-back antes do burn, rollback da RAM), mas num único frame como sempre foi e com RANGE_ERR
+     * (read-back antes do burn, rollback da RAM), em blocos de [TABLE_WRITE_CHUNK_SIZE] e com RANGE_ERR
      * propagado intacto. Demais famílias não têm read-back aqui: ficam como `unverified` no livro.
      */
     private suspend fun writeRawConfigPage(pageNum: Int, data: ByteArray) {
         val label = "restore ${formatPageId(pageNum)}"
         if (firmwareInfo?.family == EcuFamily.SPEEDUINO) {
-            writeSpeeduinoTableVerified(pageNum, 0, data, label, chunkSize = data.size.coerceAtLeast(1), rethrowRangeRejection = true)
+            // Em blocos, como a gravação de tabelas: a página inteira num só 'M' (288 + envelope ≈ 300
+            // bytes) estoura o buffer serial de 264 bytes do AVR e a ECU ignora a escrita inteira
+            // (campo 2026-11, restauração da AFR: 288/288 bytes divergentes no read-back).
+            writeSpeeduinoTableVerified(pageNum, 0, data, label, chunkSize = TABLE_WRITE_CHUNK_SIZE, rethrowRangeRejection = true)
         } else {
             writeConfigPage(pageNum.toByte(), 0, data)
             writeLedger.recordUnverified(pageNum, 0, data, label)
