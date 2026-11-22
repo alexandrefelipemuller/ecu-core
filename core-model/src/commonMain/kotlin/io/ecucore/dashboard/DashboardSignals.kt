@@ -32,6 +32,9 @@ val SIGNAL_UNIT_OVERRIDES = mapOf(
     "candidateThrottleAngleDeg" to "deg"
 )
 
+/** `EcuLiveData.o2` guarda o AFR ×10 (ex.: 147 = 14.7) em todos os parsers. */
+private const val AFR_X10_SCALE = 10.0
+
 fun resolveSignalSourceValue(
     liveData: EcuLiveData?,
     fieldName: String,
@@ -45,7 +48,7 @@ fun resolveSignalSourceValue(
         PETROL_CENTER_SIGNAL_BOOST_PSI -> return (liveData.mapPressure - 100).toDouble() * 0.1450377377 to "psi"
         "lambda", "lam", "λ" -> {
             val ratio = stoichRatio.takeIf { it > 0.0 } ?: 14.7
-            return (liveData.o2.toDouble() / ratio) to ""
+            return (liveData.o2.toDouble() / AFR_X10_SCALE / ratio) to ""
         }
         "candidateSpeedKph" -> return liveData.candidateSpeedKph?.toDouble()?.let { it to "km/h" }
         "gpsSpeedKph" -> return liveData.gpsSpeedKph?.let { it to "km/h" }
@@ -86,14 +89,14 @@ fun resolveSignalSourceValue(
         "lam",
         "λ" -> {
             val ratio = stoichRatio.takeIf { it > 0.0 } ?: 14.7
-            liveData.o2.toDouble() / ratio to ""
+            liveData.o2.toDouble() / AFR_X10_SCALE / ratio to ""
         }
         "rpm" -> liveData.rpm.toDouble() to "rpm"
         "map" -> liveData.mapPressure.toDouble() to "kPa"
         "tps" -> liveData.tps.toDouble() to "%"
         "batteryVoltage" -> liveData.batteryVoltage to "V"
         "advance" -> liveData.advance.toDouble() to "deg"
-        "afr" -> liveData.o2.toDouble() to "AFR"
+        "afr" -> liveData.o2.toDouble() / AFR_X10_SCALE to "AFR"
         else -> null
     }
 }
@@ -106,6 +109,6 @@ private fun canonicalLiveSignal(liveData: EcuLiveData, fieldName: String): Pair<
     "tps" -> liveData.tps.toDouble() to "%"
     "batteryVoltage" -> liveData.batteryVoltage to "V"
     "advance" -> liveData.advance.toDouble() to "deg"
-    "afr" -> liveData.o2.toDouble() to "AFR"
+    "afr" -> liveData.o2.toDouble() / AFR_X10_SCALE to "AFR"
     else -> null
 }

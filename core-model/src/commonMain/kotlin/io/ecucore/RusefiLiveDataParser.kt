@@ -21,9 +21,9 @@ object RusefiLiveDataParser {
         val batteryVoltage = fieldDouble(data, "batteryVoltage", "VBatt")
         val lambda = fieldDouble(data, "lambdaValue")
         val o2 = if (lambda > 0.0) {
-            (lambda * 14.7).roundToInt()
+            (lambda * 147.0).roundToInt() // o2 é AFR ×10
         } else {
-            fieldDouble(data, "afr", "AFRValue").roundToInt()
+            (fieldDouble(data, "afr", "AFRValue") * 10.0).roundToInt()
         }
         val engineStatus = if (rpm > 0) 0x01 else 0x00
         val sparkStatus = if (rpm > 0) 0x01 else 0x00

@@ -19,7 +19,7 @@ object Ms3LiveDataParser {
             val coolantTemp = tempRawToC(s16be(data, 22))
             val tps = s16be(data, 24) / 10
             val batteryVoltage = s16be(data, 26) / 10.0
-            val o2 = s16be(data, 28) / 10
+            val o2 = s16be(data, 28) // afr1 já vem ×10 (AFR 14.7 = 147), mesma escala do Speeduino
 
             return EcuLiveData(
                 secl = secl,
