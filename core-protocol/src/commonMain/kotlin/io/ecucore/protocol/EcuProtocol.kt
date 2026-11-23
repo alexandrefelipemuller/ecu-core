@@ -419,13 +419,29 @@ class EcuProtocol(
             }
         }
 
-        val response = sendModernCommand('d'.code.toByte(), byteArrayOf(pageNum))
+        // Firmware lê o número da página em serialPayload[2] ("d%2i" no .ini: 'd' + 0x00 + página).
+        // Mandar só 'd' + página fazia a ECU calcular o CRC de outra página.
+        val response = sendModernCommand('d'.code.toByte(), byteArrayOf(0x00, pageNum))
 
         return if (response.size >= 5 && response[0] == SERIAL_RC_OK) {
             readU32BE(response, 1)
         } else {
             0L
         }
+    }
+
+    /**
+     * CRC32 de uma tabela MS2/MS3/MegaSpeed (comando 'k'): `'k' + canId + tableId + 00 00 00 04`
+     * ("k%2i\x00\x00\x00\x04" no .ini). A ECU devolve status + CRC32 (BE) do bloco de 1 KiB da
+     * tabela em RAM (ms3/serial.c). Retorna `null` se a ECU não confirmar.
+     */
+    suspend fun getMsTableCrc(tableId: Int, canId: Int = 0): Long? {
+        val response = sendModernCommand(
+            'k'.code.toByte(),
+            byteArrayOf((canId and 0x0F).toByte(), (tableId and 0xFF).toByte(), 0x00, 0x00, 0x00, 0x04),
+            bypassTransportGate = true,
+        )
+        return if (response.size >= 5 && response[0] == SERIAL_RC_OK) readU32BE(response, 1) else null
     }
 
     /**

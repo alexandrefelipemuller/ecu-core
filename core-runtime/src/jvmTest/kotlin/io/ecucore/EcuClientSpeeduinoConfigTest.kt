@@ -61,13 +61,14 @@ class EcuClientSpeeduinoConfigTest {
 
     @Test
     fun `protocol commands are forwarded`() = runBlocking {
-        val (c, _) = connected()
+        val (c, ecu) = connected()
         assertTrue(c.getFirmwareInfo().contains("202501"))
         assertTrue(c.getProductString().contains("202501"))
         val cap = c.getSerialCapability()
         assertEquals(2, cap.protocolVersion)
-        assertEquals(0x11223344L, c.getPageCRC(2))
-        assertEquals(0x11223344L, c.getPageCRC(2.toByte()))
+        val expected = java.util.zip.CRC32().apply { update(ecu.mem(2)) }.value
+        assertEquals(expected, c.getPageCRC(2))
+        assertEquals(expected, c.getPageCRC(2.toByte()))
         assertFailsWithIae { c.getPageCRC(0x1FF) }
     }
 

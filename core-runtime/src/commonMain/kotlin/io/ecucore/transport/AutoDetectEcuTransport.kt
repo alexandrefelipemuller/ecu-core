@@ -140,6 +140,9 @@ class AutoDetectEcuTransport(
 
     override fun invalidateConfigPageCache() = selected().invalidateConfigPageCache()
 
+    override suspend fun validateConfigPageCache(adoptSessionReads: Boolean) =
+        selected().validateConfigPageCache(adoptSessionReads)
+
     override fun isReadOnlySafeMode(): Boolean = selected().isReadOnlySafeMode()
 
     override fun applyIniDefinition(definition: IniDefinition): Boolean = selected().applyIniDefinition(definition)

@@ -38,6 +38,25 @@ interface EcuConfigPageCache {
      * Timestamp (epoch ms) da entrada mais recente dessa identidade, ou `null` se não houver cache.
      */
     fun lastSyncMs(identity: String): Long?
+
+    // --- Validação por CRC (ver EcuClient.validateConfigPageCache) ---
+    // Implementações com default para não quebrar caches de outros apps; sem elas a validação
+    // simplesmente não encontra páginas e nada é descartado nem renovado.
+
+    /** Páginas que têm ao menos uma entrada em cache nessa identidade. */
+    fun cachedPages(identity: String): Set<Int> = emptySet()
+
+    /**
+     * CRC32 que a ECU informou para a página quando as entradas atuais foram aceitas, ou `null`.
+     * [invalidatePage]/[invalidateIdentity] devem apagá-lo junto com as entradas.
+     */
+    fun pageCrc(identity: String, pageNum: Int): Long? = null
+
+    /** Registra o CRC32 informado pela ECU para a página. */
+    fun storePageCrc(identity: String, pageNum: Int, crc: Long) {}
+
+    /** Renova o timestamp de todas as entradas da página (página confirmada pela ECU via CRC). */
+    fun touchPage(identity: String, pageNum: Int, nowMs: Long) {}
 }
 
 /**

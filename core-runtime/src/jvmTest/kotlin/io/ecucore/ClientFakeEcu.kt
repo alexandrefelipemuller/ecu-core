@@ -139,7 +139,9 @@ internal class ClientFakeEcu(
             'Q' -> ok((signature + "\u0000").toByteArray(Charsets.US_ASCII))
             'S' -> ok(product.toByteArray(Charsets.US_ASCII))
             'f' -> ok(byteArrayOf(2, 0x01, 0x00, 0x01, 0x00))
-            'd' -> ok(byteArrayOf(0x11, 0x22, 0x33, 0x44))
+            // Como o firmware: 'd' + 0x00 + página (serialPayload[2]); 'k' + canId + tabela + 00 00 00 04.
+            'd' -> if (p.size < 2) code(0x84) else ok(crcBytes(mem(p[1].toInt() and 0xFF)))
+            'k' -> if (speeduino || p.size != 6) code(0x83) else ok(crcBytes(mem(p[1].toInt() and 0xFF)))
             'p' -> {
                 val page = p[1].toInt() and 0xFF
                 val off = u16le(p, 2)
@@ -245,4 +247,9 @@ internal class ClientFakeEcu(
 
     private fun u16le(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
     private fun u16be(b: ByteArray, i: Int) = ((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)
+
+    private fun crcBytes(data: ByteArray): ByteArray {
+        val v = java.util.zip.CRC32().apply { update(data) }.value
+        return byteArrayOf((v shr 24).toByte(), (v shr 16).toByte(), (v shr 8).toByte(), v.toByte())
+    }
 }

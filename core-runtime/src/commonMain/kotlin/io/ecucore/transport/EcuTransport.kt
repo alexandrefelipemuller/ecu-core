@@ -106,6 +106,16 @@ interface EcuTransport {
      */
     fun invalidateConfigPageCache() {}
 
+    /**
+     * Confere o cache persistente de páginas contra o CRC32 que a ECU informa ('d' no Speeduino,
+     * 'k' no MS2/MegaSpeed). Página com CRC igual ao registrado tem a validade renovada; diferente
+     * é descartada (outro tuner/aparelho mexeu na ECU). Com [adoptSessionReads], páginas lidas da
+     * ECU nesta conexão e ainda sem CRC registrado passam a ter o CRC atual (chamar depois do sync).
+     * ECU que não responde ao CRC mantém o comportamento antigo (só TTL).
+     */
+    suspend fun validateConfigPageCache(adoptSessionReads: Boolean = false): ConfigPageCacheValidation =
+        ConfigPageCacheValidation.NONE
+
     fun isReadOnlySafeMode(): Boolean = false
 
     fun getConnectionInfo(): String = ""
@@ -291,4 +301,20 @@ interface EcuTransport {
 
     suspend fun writeEngineConstants(engineConstants: EngineConstants): Unit =
         throw UnsupportedOperationException("Engine constants write not supported by this transport")
+}
+
+/** Resultado de [EcuTransport.validateConfigPageCache]. */
+data class ConfigPageCacheValidation(
+    /** CRC igual ao registrado: cache mantido e renovado. */
+    val confirmed: List<Int> = emptyList(),
+    /** CRC diferente (ou sem CRC registrado de sessão anterior): cache descartado. */
+    val invalidated: List<Int> = emptyList(),
+    /** Lidas nesta conexão: CRC atual registrado. */
+    val adopted: List<Int> = emptyList(),
+    /** ECU não informou CRC: cache mantido só pelo TTL. */
+    val unverified: List<Int> = emptyList(),
+) {
+    companion object {
+        val NONE = ConfigPageCacheValidation()
+    }
 }

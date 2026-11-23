@@ -118,6 +118,7 @@ import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import io.ecucore.shared.MonotonicClock
 import io.ecucore.shared.WallClock
+import io.ecucore.transport.ConfigPageCacheValidation
 import io.ecucore.shared.formatDecimal
 import io.ecucore.shared.toHex02
 
@@ -926,6 +927,69 @@ class EcuClient(
     }
 
     /**
+     * Páginas gravadas no cache com bytes lidos da ECU nesta conexão (candidatas a adotar o CRC).
+     * Conjunto imutável reatribuído (commonMain não tem synchronized); perder uma entrada numa
+     * corrida só faz a página ser relida na próxima conexão.
+     */
+    private var pagesCachedThisSession: Set<Int> = emptySet()
+
+    override suspend fun validateConfigPageCache(adoptSessionReads: Boolean): ConfigPageCacheValidation = withEcuIo {
+        val identity = cacheIdentity() ?: return@withEcuIo ConfigPageCacheValidation.NONE
+        val family = firmwareInfo?.family ?: return@withEcuIo ConfigPageCacheValidation.NONE
+        // Primeira validação da conexão: o que estava no cache veio de sessões anteriores.
+        if (!adoptSessionReads) pagesCachedThisSession = emptySet()
+        val sessionPages = pagesCachedThisSession
+        val confirmed = mutableListOf<Int>()
+        val invalidated = mutableListOf<Int>()
+        val adopted = mutableListOf<Int>()
+        val unverified = mutableListOf<Int>()
+        val now = WallClock.nowEpochMillis()
+        for (page in pageCache.cachedPages(identity).sorted()) {
+            val ecuCrc = try {
+                readEcuPageCrc(page, family)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Logger.w(TAG, "CRC da página ${formatPageId(page)} indisponível: ${e.message}")
+                null
+            }
+            val storedCrc = pageCache.pageCrc(identity, page)
+            when {
+                ecuCrc == null -> unverified += page
+                storedCrc == ecuCrc -> {
+                    pageCache.touchPage(identity, page, now)
+                    confirmed += page
+                }
+                storedCrc == null && adoptSessionReads && page in sessionPages -> {
+                    pageCache.storePageCrc(identity, page, ecuCrc)
+                    adopted += page
+                }
+                else -> {
+                    pageCache.invalidatePage(identity, page)
+                    // Próximas leituras desta conexão refletem este CRC.
+                    pageCache.storePageCrc(identity, page, ecuCrc)
+                    pagesCachedThisSession = pagesCachedThisSession - page
+                    invalidated += page
+                }
+            }
+        }
+        val result = ConfigPageCacheValidation(confirmed, invalidated, adopted, unverified)
+        Logger.d(TAG, "Validação CRC do cache: $result")
+        result
+    }
+
+    private suspend fun readEcuPageCrc(page: Int, family: EcuFamily): Long? = when {
+        family == EcuFamily.SPEEDUINO -> protocol.getPageCRC(page.toByte()).takeIf { it != 0L }
+        isMs2Cacheable(family) -> protocol.getMsTableCrc(page)
+        else -> null
+    }
+
+    private fun storeInPageCache(identity: String, page: Int, offset: Int, length: Int, data: ByteArray) {
+        pageCache.store(identity, page, offset, length, data, WallClock.nowEpochMillis())
+        pagesCachedThisSession = pagesCachedThisSession + page
+    }
+
+    /**
      * Obtém table definitions carregadas
      * @return TableDefinitions ou null se não conectado
      */
@@ -1225,7 +1289,7 @@ class EcuClient(
         }
 
         if (cacheIdentity != null && result.size == length) {
-            pageCache.store(cacheIdentity, pageNum, offset, length, result, WallClock.nowEpochMillis())
+            storeInPageCache(cacheIdentity, pageNum, offset, length, result)
         }
         return result
     }
@@ -1312,7 +1376,7 @@ class EcuClient(
         }
         val result = readTableLimited(pageId, offset, length, EcuFamily.MS2)
         if (identity != null && result.size == length) {
-            pageCache.store(identity, pageId, offset, length, result, WallClock.nowEpochMillis())
+            storeInPageCache(identity, pageId, offset, length, result)
         }
         return result
     }
