@@ -1,11 +1,11 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 /**
- * Geração determinística de testes (sem LLM, sem tokens). Tudo aqui produz [ProbeRequest]
+ * Geração determinística de testes (sem planner, sem tokens). Tudo aqui produz [ProbeRequest]
  * comuns, que ainda passam pelo [ExplorationPlanValidator] antes de ir ao barramento.
  *
  * Ideia: o código faz a força bruta barata (onde há ECU, quais blocos de DID existem,
- * vizinhança de cada acerto) e o LLM fica com o que exige conhecimento — interpretar e
+ * vizinhança de cada acerto) e o planner fica com o que exige conhecimento — interpretar e
  * escolher onde aprofundar.
  */
 object DeterministicSurvey {
@@ -34,7 +34,7 @@ object DeterministicSurvey {
         val can29 = respondingProtocols.filter { it in CAN_29BIT_PROTOCOLS }.ifEmpty { CAN_29BIT_PROTOCOLS }
         val onlyNonCan = respondingProtocols.isNotEmpty() &&
             respondingProtocols.none { it in CAN_11BIT_PROTOCOLS || it in CAN_29BIT_PROTOCOLS }
-        if (onlyNonCan) return emptyList() // KWP/J1850 puros: fica com o LLM.
+        if (onlyNonCan) return emptyList() // KWP/J1850 puros: fica com o planner.
         return can11.flatMap { sp -> CAN_11BIT_HEADERS.map { ping(it, sp) } } +
             can29.flatMap { sp -> CAN_29BIT_HEADERS.map { ping(it, sp) } }
     }
@@ -87,6 +87,13 @@ object DeterministicSurvey {
      */
     val PRUNE_NRCS = setOf(0x11, 0x7F)
     const val NRC_OUT_OF_RANGE = 0x31
+
+    /** Identificação (VIN, part number, versão...): texto constante, não vale reler nem ajustar fórmula. */
+    fun isIdentification(probe: ProbeRequest) = when (probe.service) {
+        ReadService.KWP_1A, ReadService.OBD_MODE_09 -> true
+        ReadService.UDS_22 -> probe.id.uppercase().startsWith("F1")
+        else -> false
+    }
 
     fun pruneKey(probe: ProbeRequest) = "${probe.header.orEmpty()}|${probe.service.name}"
 

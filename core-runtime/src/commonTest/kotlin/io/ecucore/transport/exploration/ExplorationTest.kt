@@ -1,4 +1,4 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -136,7 +136,7 @@ class PlausibilityCheckerTest {
     }
 }
 
-class LlmExplorationSessionTest {
+class ExplorationSessionTest {
 
     /** ECU fake: responde ao DID F405 (ECT OEM) e ao 0105 padrão; o resto 7F 22 31. */
     private class FakeEcu {
@@ -153,7 +153,7 @@ class LlmExplorationSessionTest {
         }
     }
 
-    private class ScriptedPlanner(private val steps: List<PlannerStep>) : LlmExplorationPlanner {
+    private class ScriptedPlanner(private val steps: List<PlannerStep>) : ExplorationPlanner {
         val contexts = mutableListOf<ExplorationContext>()
         private var i = 0
         override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep {
@@ -187,7 +187,7 @@ class LlmExplorationSessionTest {
                 PlannerStep.Finish(profile, TokenUsage(1500, 300)),
             )
         )
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, budget = noSurvey, clock = clock)
+        val record = ExplorationSession(planner, ecu::send, { true }, { false }, budget = noSurvey, clock = clock)
             .run(ExplorationContext(wmi = "9BW"))
 
         assertEquals(StopReason.PLANNER_FINISHED, record.stopReason)
@@ -204,7 +204,7 @@ class LlmExplorationSessionTest {
     fun stopsWithoutProgressAndAsksFinalProfile() = runTest {
         val ecu = FakeEcu()
         var n = 0
-        val planner = object : LlmExplorationPlanner {
+        val planner = object : ExplorationPlanner {
             var finalAsked = false
             override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep {
                 if (context.mustFinish) {
@@ -214,7 +214,7 @@ class LlmExplorationSessionTest {
                 return PlannerStep.Probe(ExplorationPlan(listOf(ProbeRequest(ReadService.UDS_22, "10" + (n++).toString(16).uppercase().padStart(2, '0')))))
             }
         }
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, budget = noSurvey, clock = clock)
+        val record = ExplorationSession(planner, ecu::send, { true }, { false }, budget = noSurvey, clock = clock)
             .run(ExplorationContext())
         assertEquals(StopReason.NO_PROGRESS, record.stopReason)
         assertEquals(2, record.rounds.size)
@@ -226,7 +226,7 @@ class LlmExplorationSessionTest {
     fun abortsWhenEngineRunning() = runTest {
         val ecu = FakeEcu()
         val planner = ScriptedPlanner(listOf(PlannerStep.Finish(CandidateProfile())))
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { true }, budget = noSurvey, clock = clock)
+        val record = ExplorationSession(planner, ecu::send, { true }, { true }, budget = noSurvey, clock = clock)
             .run(ExplorationContext())
         assertEquals(StopReason.ENGINE_RUNNING, record.stopReason)
         assertTrue(planner.contexts.isEmpty())
@@ -237,12 +237,12 @@ class LlmExplorationSessionTest {
     fun respectsTokenBudget() = runTest {
         val ecu = FakeEcu()
         var n = 0
-        val planner = object : LlmExplorationPlanner {
+        val planner = object : ExplorationPlanner {
             override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep =
                 if (context.mustFinish) PlannerStep.Finish(CandidateProfile())
                 else PlannerStep.Probe(ExplorationPlan(listOf(ProbeRequest(ReadService.UDS_22, "F4" + (n++).toString(16).uppercase().padStart(2, '0')))), TokenUsage(60_000, 0))
         }
-        val record = LlmExplorationSession(
+        val record = ExplorationSession(
             planner, ecu::send, { true }, { false },
             budget = noSurvey.copy(maxRoundsWithoutProgress = 99), clock = clock,
         ).run(ExplorationContext())
@@ -281,13 +281,13 @@ class DeterministicSurveyTest {
     fun surveyMapsEcuSamplesBlocksAndExpandsNeighborsWithoutTokens() = runTest {
         val ecu = OemEcu()
         val contexts = mutableListOf<List<ExplorationRound>>()
-        val planner = object : LlmExplorationPlanner {
+        val planner = object : ExplorationPlanner {
             override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep {
                 contexts += history
                 return PlannerStep.Finish(CandidateProfile())
             }
         }
-        val record = LlmExplorationSession(planner, ecu::send, { true }, { false }, clock = clock)
+        val record = ExplorationSession(planner, ecu::send, { true }, { false }, clock = clock)
             .run(ExplorationContext())
 
         val bySource = record.rounds.groupBy { it.source }
@@ -311,17 +311,17 @@ class DeterministicSurveyTest {
     fun prunesServiceAfterServiceNotSupported() = runTest {
         val ecu = OemEcu()
         var step = 0
-        val planner = object : LlmExplorationPlanner {
+        val planner = object : ExplorationPlanner {
             override suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep {
                 if (step++ > 0) return PlannerStep.Finish(CandidateProfile())
                 return PlannerStep.Probe(ExplorationPlan((1..5).map { ProbeRequest(ReadService.KWP_21, "0$it", header = "7E0") }))
             }
         }
-        val record = LlmExplorationSession(
+        val record = ExplorationSession(
             planner, ecu::send, { true }, { false },
             budget = ExplorationBudget(surveyEnabled = false), clock = clock,
         ).run(ExplorationContext())
-        val llm = record.rounds.first { it.source == RoundSource.LLM }
+        val llm = record.rounds.first { it.source == RoundSource.PLANNER }
         assertEquals(1, llm.outcomes.size)
         assertEquals(4, llm.rejected.count { it.reason == "service_unsupported" })
         assertEquals(1, ecu.sent.count { it.startsWith("21") })

@@ -1,4 +1,4 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 /**
  * Tradução [ProbeRequest] → comandos ELM327 e resposta ELM → [ProbeStatus]/bytes.

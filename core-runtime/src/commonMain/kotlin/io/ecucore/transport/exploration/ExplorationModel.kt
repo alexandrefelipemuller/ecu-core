@@ -1,19 +1,20 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 /**
- * Exploração OBD2 assistida por LLM.
+ * Exploração OBD2 guiada por um [ExplorationPlanner] (local — [LocalExplorationPlanner] —
+ * ou remoto, ex. LLM).
  *
- * Regra de segurança central: o LLM **nunca** produz bytes crus. Ele só escolhe itens de
+ * Regra de segurança central: o planner **nunca** produz bytes crus. Ele só escolhe itens de
  * um vocabulário fechado ([ReadService] + header + id), que o [ExplorationPlanValidator]
- * confere e o [LlmExplorationSession] traduz para comandos ELM327. Serviços de escrita,
+ * confere e o [ExplorationSession] traduz para comandos ELM327. Serviços de escrita,
  * reset, sessão, segurança, atuadores ou rotinas não existem neste vocabulário.
  *
- * Este pacote não depende de rede nem de JSON: a implementação do [LlmExplorationPlanner]
+ * Este pacote não depende de rede nem de JSON: a implementação do [ExplorationPlanner]
  * (Gemini via Firebase AI Logic, etc.) vive no app e converte a resposta do modelo para
  * estes tipos.
  */
 
-/** Serviços de diagnóstico SOMENTE LEITURA que o LLM pode pedir. Lista fechada. */
+/** Serviços de diagnóstico SOMENTE LEITURA que o planner pode pedir. Lista fechada. */
 enum class ReadService(
     /** Byte do serviço na requisição. */
     val serviceByte: Int,
@@ -42,7 +43,7 @@ enum class ReadService(
 }
 
 /**
- * Um teste pedido pelo LLM.
+ * Um teste pedido pelo planner.
  * @param header endereço de requisição: 11-bit CAN ("7E0"), 29-bit CAN ("18DA10F1") ou
  *   header KWP/J1850 de 3 bytes ("8110F1"). null = manter o header atual/padrão.
  * @param protocol protocolo ELM (ATSP): "0".."9", "A".."C". null = manter o atual.
@@ -137,7 +138,7 @@ data class ExplorationContext(
     val probesLeft: Int = 0,
 )
 
-interface LlmExplorationPlanner {
+interface ExplorationPlanner {
     suspend fun nextStep(context: ExplorationContext, history: List<ExplorationRound>): PlannerStep
 }
 
@@ -159,16 +160,18 @@ data class ProbeOutcome(
 
 data class RejectedProbe(val request: ProbeRequest, val reason: String)
 
-/** De onde veio a rodada: do LLM ou de uma etapa determinística (sem custo de tokens). */
+/** De onde veio a rodada: do planner ou de uma etapa determinística (sem custo de tokens). */
 enum class RoundSource {
-    /** Plano proposto pelo LLM. */
-    LLM,
+    /** Plano proposto pelo planner (local ou remoto). */
+    PLANNER,
     /** Mapa de ECUs: leitura inofensiva (22 F190) em cada endereço candidato. */
     SURVEY_ECU_MAP,
     /** Amostragem de faixas de DID (XX00) nas ECUs encontradas. */
     SURVEY_DID_RANGES,
     /** Vizinhos (±N) de identificadores que responderam. */
     NEIGHBORS,
+    /** Releituras de identificadores positivos intercaladas com referências do modo 01 (para o [SignalFitter]). */
+    RESAMPLE,
 }
 
 data class ExplorationRound(
@@ -177,7 +180,7 @@ data class ExplorationRound(
     val rejected: List<RejectedProbe>,
     val outcomes: List<ProbeOutcome>,
     val usage: TokenUsage,
-    val source: RoundSource = RoundSource.LLM,
+    val source: RoundSource = RoundSource.PLANNER,
 ) {
     val positives: Int get() = outcomes.count { it.status == ProbeStatus.POSITIVE }
 }
@@ -196,14 +199,23 @@ data class ExplorationBudget(
     val maxRoundsWithoutProgress: Int = 2,
     /** Sem resposta seguidas numa rodada antes de abortar a rodada (ECU ausente). */
     val maxConsecutiveNoResponse: Int = 8,
-    /** Etapas determinísticas (mapa de ECUs, faixas de DID, vizinhos) antes/entre as rodadas do LLM. */
+    /** Etapas determinísticas (mapa de ECUs, faixas de DID, vizinhos) antes/entre as rodadas do planner. */
     val surveyEnabled: Boolean = true,
-    /** Orçamento próprio das etapas determinísticas (não consome [maxTotalProbes] do LLM). */
+    /** Orçamento próprio das etapas determinísticas (não consome [maxTotalProbes] do planner). */
     val maxDeterministicProbes: Int = 700,
     /** Quantas ECUs recebem a amostragem de faixas de DID (256 leituras cada). */
     val surveyMaxEcus: Int = 2,
     /** Raio da expansão de vizinhos em torno de cada identificador que respondeu. */
     val neighborRadius: Int = 16,
+    /**
+     * Quantas vezes cada identificador positivo é relido (intercalado com as referências
+     * do modo 01) para o [SignalFitter] ajustar fórmulas. 0 = desligado.
+     */
+    val resampleCount: Int = 0,
+    /** Máximo de identificadores positivos distintos que entram no resampling. */
+    val maxResampleTargets: Int = 24,
+    /** Orçamento próprio do resampling (não consome [maxTotalProbes] nem [maxDeterministicProbes]). */
+    val maxResampleProbes: Int = 400,
 )
 
 enum class StopReason {
@@ -213,7 +225,7 @@ enum class StopReason {
 
 data class SignalVerification(
     val signal: CandidateSignal,
-    /** Valor do sinal OEM decodificado com a fórmula do LLM. */
+    /** Valor do sinal OEM decodificado com a fórmula do planner. */
     val oemValue: Double?,
     /** Valor de referência do modo 01 (null se não houver/sem resposta). */
     val referenceValue: Double?,
@@ -223,7 +235,7 @@ data class SignalVerification(
 }
 
 /** Registro completo da sessão — é isto que o app envia ao Firestore para análise. */
-data class LlmExplorationRecord(
+data class ExplorationRecord(
     val context: ExplorationContext,
     val rounds: List<ExplorationRound>,
     val profile: CandidateProfile?,

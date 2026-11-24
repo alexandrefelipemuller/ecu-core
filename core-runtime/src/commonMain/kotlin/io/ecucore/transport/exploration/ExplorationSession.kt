@@ -1,4 +1,4 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 import io.ecucore.shared.MonotonicClock
 import kotlinx.coroutines.CancellationException
@@ -17,8 +17,8 @@ import kotlinx.coroutines.delay
  * @param isEngineRunning checado antes de cada rodada; true aborta (exploração só com
  *   motor desligado). null = não foi possível determinar, segue. Obrigatório de propósito.
  */
-class LlmExplorationSession(
-    private val planner: LlmExplorationPlanner,
+class ExplorationSession(
+    private val planner: ExplorationPlanner,
     private val send: suspend (command: String, timeoutMs: Long) -> String,
     private val isConnected: () -> Boolean,
     private val isEngineRunning: suspend () -> Boolean?,
@@ -29,7 +29,7 @@ class LlmExplorationSession(
     private var currentProtocol: String? = null
     private var lastSendAt: Long? = null
 
-    suspend fun run(baseContext: ExplorationContext): LlmExplorationRecord {
+    suspend fun run(baseContext: ExplorationContext): ExplorationRecord {
         val startedAt = clock()
         val rounds = mutableListOf<ExplorationRound>()
         val triedKeys = mutableSetOf<String>()
@@ -41,6 +41,10 @@ class LlmExplorationSession(
         var totalProbes = 0
         var deterministicProbes = 0
         var roundsWithoutProgress = 0
+        var resampleProbes = 0
+        val resampledKeys = mutableSetOf<String>()
+        /** Referências do modo 01 que não responderam (header|pid): não insiste nelas. */
+        val deadReferences = mutableSetOf<String>()
         var profile: CandidateProfile? = null
         var stopDetail: String? = null
 
@@ -48,11 +52,11 @@ class LlmExplorationSession(
 
         fun probesLeft() = (budget.maxTotalProbes - totalProbes).coerceAtLeast(0)
         fun deterministicLeft() = (budget.maxDeterministicProbes - deterministicProbes).coerceAtLeast(0)
-        fun llmRounds() = rounds.count { it.source == RoundSource.LLM }
+        fun plannerRounds() = rounds.count { it.source == RoundSource.PLANNER }
         fun outOfTime() = clock() - startedAt >= budget.maxDurationMs
         fun context(mustFinish: Boolean) = baseContext.copy(
             mustFinish = mustFinish,
-            roundsLeft = (budget.maxRounds - llmRounds()).coerceAtLeast(0),
+            roundsLeft = (budget.maxRounds - plannerRounds()).coerceAtLeast(0),
             probesLeft = probesLeft(),
         )
 
@@ -74,6 +78,52 @@ class LlmExplorationSession(
             return newPositives
         }
 
+        /**
+         * Relê os positivos de [from] [ExplorationBudget.resampleCount] vezes, intercalando as
+         * referências do modo 01 no header funcional, para o [SignalFitter] parear amostras.
+         */
+        suspend fun resample(from: ExplorationRound) {
+            if (budget.resampleCount <= 0 || !isConnected() || outOfTime()) return
+            val targets = from.outcomes
+                .filter { it.status == ProbeStatus.POSITIVE && it.data.isNotEmpty() }
+                .map { it.request }
+                .filter { it.service.idHexLength > 0 && it.service != ReadService.OBD_MODE_01 }
+                .filterNot { DeterministicSurvey.isIdentification(it) }
+                .filter { resampledKeys.size < budget.maxResampleTargets && resampledKeys.add(ExplorationPlanValidator.probeKey(it)) }
+            if (targets.isEmpty()) return
+            val groups = targets.groupBy { functionalHeaderFor(it.header) to it.protocol }
+            val planned = mutableListOf<ProbeRequest>()
+            repeat(budget.resampleCount) {
+                for ((group, members) in groups) {
+                    ReferenceQuantity.entries.forEach { q ->
+                        planned += ProbeRequest(ReadService.OBD_MODE_01, q.mode01Pid, group.first, group.second, "resample:reference")
+                    }
+                    planned += members.map { it.copy(hypothesis = "resample") }
+                }
+            }
+            val outcomes = mutableListOf<ProbeOutcome>()
+            for (probe in planned) {
+                if (!isConnected() || outOfTime() || resampleProbes >= budget.maxResampleProbes) break
+                val isReference = probe.hypothesis == "resample:reference"
+                val refKey = "${probe.header.orEmpty()}|${probe.id}"
+                if (isReference && refKey in deadReferences) continue
+                if (ExplorationPlanValidator.rejectionReason(probe) != null) continue
+                val outcome = runProbe(probe)
+                resampleProbes++
+                outcomes += outcome
+                if (isReference && outcome.status != ProbeStatus.POSITIVE) deadReferences += refKey
+            }
+            if (outcomes.isEmpty()) return
+            rounds += ExplorationRound(
+                index = rounds.size,
+                plan = ExplorationPlan(planned, "resample x${budget.resampleCount} of ${targets.size} ids"),
+                rejected = emptyList(),
+                outcomes = outcomes,
+                usage = TokenUsage(),
+                source = RoundSource.RESAMPLE,
+            )
+        }
+
         /** Executa uma etapa determinística (com orçamento próprio). Null se nada a fazer. */
         suspend fun deterministic(
             source: RoundSource,
@@ -91,7 +141,9 @@ class LlmExplorationSession(
             val result = execute(fresh, pruned, abortOnSilence)
             deterministicProbes += result.outcomes.size
             record(source, ExplorationPlan(fresh, rationale), emptyList(), result, TokenUsage())
-            return rounds.last()
+            val round = rounds.last()
+            resample(round)
+            return round
         }
 
         /** Vizinhos (±radius) de tudo que respondeu de forma interessante e ainda não foi expandido. */
@@ -145,14 +197,14 @@ class LlmExplorationSession(
             rounds.filter { it.source == RoundSource.SURVEY_ECU_MAP }.toList().forEach { expandNeighbors(it) }
         }
 
-        // 2) Loop do LLM, com expansão de vizinhos após cada rodada.
+        // 2) Loop do planner, com expansão de vizinhos após cada rodada.
         loop@ while (true) {
             when {
                 engineRunningAtStart -> { stopReason = StopReason.ENGINE_RUNNING; break@loop }
                 !isConnected() -> { stopReason = StopReason.DISCONNECTED; break@loop }
                 outOfTime() -> { stopReason = StopReason.TIMEOUT; break@loop }
                 usage.total >= budget.maxTotalTokens -> { stopReason = StopReason.MAX_TOKENS; break@loop }
-                llmRounds() >= budget.maxRounds -> { stopReason = StopReason.MAX_ROUNDS; break@loop }
+                plannerRounds() >= budget.maxRounds -> { stopReason = StopReason.MAX_ROUNDS; break@loop }
                 probesLeft() == 0 -> { stopReason = StopReason.MAX_PROBES; break@loop }
                 roundsWithoutProgress >= budget.maxRoundsWithoutProgress -> { stopReason = StopReason.NO_PROGRESS; break@loop }
             }
@@ -185,15 +237,16 @@ class LlmExplorationSession(
                     )
                     val result = execute(validation.accepted, pruned, abortOnSilence = true)
                     totalProbes += result.outcomes.size
-                    var newPositives = record(RoundSource.LLM, step.plan, validation.rejected, result, step.usage)
-                    newPositives += expandNeighbors(rounds.last { it.source == RoundSource.LLM })
+                    var newPositives = record(RoundSource.PLANNER, step.plan, validation.rejected, result, step.usage)
+                    resample(rounds.last())
+                    newPositives += expandNeighbors(rounds.last { it.source == RoundSource.PLANNER })
                     roundsWithoutProgress = if (newPositives > 0) 0 else roundsWithoutProgress + 1
                 }
             }
         }
 
         // Budget estourou sem o planner encerrar: uma última chamada pedindo o perfil.
-        val canAskFinal = profile == null && llmRounds() > 0 && stopReason !in setOf(
+        val canAskFinal = profile == null && plannerRounds() > 0 && stopReason !in setOf(
             StopReason.PLANNER_ERROR, StopReason.ENGINE_RUNNING, StopReason.DISCONNECTED,
         )
         if (canAskFinal) {
@@ -211,7 +264,7 @@ class LlmExplorationSession(
         val canVerify = stopReason != StopReason.DISCONNECTED && stopReason != StopReason.ENGINE_RUNNING
         val verifications = profile?.takeIf { canVerify }?.let { verify(it) }.orEmpty()
 
-        return LlmExplorationRecord(
+        return ExplorationRecord(
             context = baseContext,
             rounds = rounds,
             profile = profile,
@@ -304,7 +357,7 @@ class LlmExplorationSession(
         }
     }
 
-    /** Lê cada sinal (revalidado — o perfil também vem do LLM) e a referência do modo 01. */
+    /** Lê cada sinal (revalidado — o perfil também vem do planner) e a referência do modo 01. */
     private suspend fun verify(profile: CandidateProfile): List<SignalVerification> {
         return profile.signals.take(MAX_VERIFIED_SIGNALS).map { signal ->
             val oemProbe = ProbeRequest(service = signal.service, id = signal.id.trim().uppercase(), header = signal.header?.trim()?.uppercase())

@@ -1,9 +1,9 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 import kotlin.math.abs
 
 /**
- * Valida um sinal OEM proposto pelo LLM comparando o valor decodificado com a fórmula
+ * Valida um sinal OEM proposto pelo planner comparando o valor decodificado com a fórmula
  * dele contra a grandeza equivalente do modo 01, lida no mesmo instante.
  */
 object PlausibilityChecker {

@@ -1,7 +1,7 @@
-package io.ecucore.transport.llm
+package io.ecucore.transport.exploration
 
 /**
- * Barreira determinística entre o LLM e o barramento do carro.
+ * Barreira determinística entre o planner e o barramento do carro.
  *
  * Tudo que o planner devolve passa por aqui. Não há caminho para comandos crus: o
  * serviço é um enum fechado de leitura, e header/id/protocolo são conferidos por regex

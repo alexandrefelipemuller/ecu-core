@@ -1,9 +1,9 @@
 package io.ecucore.transport
 
-import io.ecucore.transport.llm.ExplorationBudget
-import io.ecucore.transport.llm.ExplorationContext
-import io.ecucore.transport.llm.LlmExplorationPlanner
-import io.ecucore.transport.llm.LlmExplorationRecord
+import io.ecucore.transport.exploration.ExplorationBudget
+import io.ecucore.transport.exploration.ExplorationContext
+import io.ecucore.transport.exploration.ExplorationPlanner
+import io.ecucore.transport.exploration.ExplorationRecord
 
 /**
  * Exploração rodada quando o preflight OBD2 falha de vez (o carro não conectou com
@@ -23,17 +23,17 @@ interface Obd2FailureExplorationHooks {
 
     /**
      * Depois da varredura determinística, com o socket ainda aberto: devolve a configuração
-     * da exploração assistida por LLM, ou null para pular (sem planner, sem cota, usuário
+     * da exploração guiada (planner local ou remoto), ou null para pular (sem planner, sem cota, usuário
      * recusou...). Pode suspender para pedir consentimento.
      */
-    suspend fun prepareLlmExploration(result: Obd2ExplorationResult): LlmExplorationRequest? = null
+    suspend fun prepareExploration(result: Obd2ExplorationResult): ExplorationRequest? = null
 
-    /** Registro completo da sessão LLM (inclusive quando abortada). */
-    fun onLlmExplorationResult(record: LlmExplorationRecord) {}
+    /** Registro completo da sessão de exploração (inclusive quando abortada). */
+    fun onExplorationResult(record: ExplorationRecord) {}
 }
 
-data class LlmExplorationRequest(
-    val planner: LlmExplorationPlanner,
+data class ExplorationRequest(
+    val planner: ExplorationPlanner,
     val context: ExplorationContext,
     val budget: ExplorationBudget = ExplorationBudget(),
 )

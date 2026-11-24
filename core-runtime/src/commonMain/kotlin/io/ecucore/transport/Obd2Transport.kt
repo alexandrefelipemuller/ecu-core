@@ -2,12 +2,12 @@ package io.ecucore.transport
 
 import io.ecucore.shared.Logger
 import io.ecucore.shared.MonotonicClock
-import io.ecucore.transport.llm.ElmProbeCodec
-import io.ecucore.transport.llm.LlmExplorationSession
-import io.ecucore.transport.llm.ProbeRequest
-import io.ecucore.transport.llm.ProbeStatus
-import io.ecucore.transport.llm.ReadService
-import io.ecucore.transport.llm.ReferenceQuantity
+import io.ecucore.transport.exploration.ElmProbeCodec
+import io.ecucore.transport.exploration.ExplorationSession
+import io.ecucore.transport.exploration.ProbeRequest
+import io.ecucore.transport.exploration.ProbeStatus
+import io.ecucore.transport.exploration.ReadService
+import io.ecucore.transport.exploration.ReferenceQuantity
 import io.ecucore.shared.formatDecimal
 import io.ecucore.shared.toHex02
 import io.ecucore.EcuLiveData
@@ -1532,20 +1532,20 @@ class Obd2Transport(
             "done responding=${responding.joinToString(",").ifBlank { "-" }} elapsedMs=${result.elapsedMs}"
         )
         runCatching { hooks.onResult(result) }
-        runLlmExplorationIfAllowed(hooks, result)
+        runExplorationIfAllowed(hooks, result)
     }
 
-    private suspend fun runLlmExplorationIfAllowed(
+    private suspend fun runExplorationIfAllowed(
         hooks: Obd2FailureExplorationHooks,
         result: Obd2ExplorationResult,
     ) {
         if (!connection.isConnected()) return
         val request = try {
-            hooks.prepareLlmExploration(result)
+            hooks.prepareExploration(result)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            diagnosticsSink.log("elm327", "llm_explore", "prepare_failed=${e.message ?: e::class.simpleName}")
+            diagnosticsSink.log("elm327", "explore", "prepare_failed=${e.message ?: e::class.simpleName}")
             null
         } ?: return
         if (!connection.isConnected()) return
@@ -1556,7 +1556,7 @@ class Obd2Transport(
             result.respondingProtocols.firstOrNull()?.let { sp ->
                 runCatching { sendCommand("ATSP$sp", 1_200L) }
             }
-            LlmExplorationSession(
+            ExplorationSession(
                 planner = request.planner,
                 send = { command, timeoutMs -> sendCommand(command, timeoutMs) },
                 isConnected = { connection.isConnected() },
@@ -1566,10 +1566,10 @@ class Obd2Transport(
         }
         diagnosticsSink.log(
             "elm327",
-            "llm_explore",
+            "explore",
             "done stop=${record.stopReason} rounds=${record.rounds.size} tokens=${record.totalUsage.total} detail=${record.stopDetail ?: "-"}"
         )
-        runCatching { hooks.onLlmExplorationResult(record) }
+        runCatching { hooks.onExplorationResult(record) }
     }
 
     /** true = RPM > 0 (aborta exploração); null = indeterminado (sem resposta ao 010C). */
