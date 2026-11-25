@@ -4,8 +4,8 @@ import kotlin.math.abs
 
 /**
  * Descobre fórmulas de sinais OEM sem ML: para cada identificador relido nas rodadas
- * [RoundSource.RESAMPLE], pareia cada leitura com a última referência do modo 01 lida
- * antes dela e testa todo (offset × fórmula conhecida). Um candidato só vale se bater
+ * [RoundSource.RESAMPLE], pareia cada leitura com a última referência lida antes dela
+ * (modo 01, ou o espelho UDS F4xx quando a ECU não fala modo 01) e testa todo (offset × fórmula conhecida). Um candidato só vale se bater
  * com a referência em **todas** as amostras, dentro de uma tolerância apertada.
  *
  * Cada grandeza de referência recebe no máximo um sinal e cada (id, offset) é usado uma
@@ -123,10 +123,9 @@ object SignalFitter {
             for (outcome in round.outcomes) {
                 if (outcome.status != ProbeStatus.POSITIVE) continue
                 val request = outcome.request
-                if (request.service == ReadService.OBD_MODE_01) {
-                    ReferenceQuantity.entries
-                        .firstOrNull { it.mode01Pid == request.id.uppercase() }
-                        ?.let { q -> q.decodeMode01(outcome.data)?.let { current[q] = it } }
+                val reference = ReferenceQuantity.forRequest(request)
+                if (reference != null || request.service == ReadService.OBD_MODE_01 || ReferenceQuantity.isMirrorDid(request)) {
+                    reference?.decodeMode01(outcome.data)?.let { current[reference] = it }
                     continue
                 }
                 if (outcome.data.isEmpty()) continue

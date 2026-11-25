@@ -114,6 +114,21 @@ enum class ReferenceQuantity(val mode01Pid: String, val tolerance: Double, val a
     MODULE_VOLTAGE("42", 0.05, 0.3),
     ;
 
+    companion object {
+        /** Requisição de referência: modo 01 do PID ou UDS 22 do espelho F4xx. */
+        fun forRequest(request: ProbeRequest): ReferenceQuantity? = entries.firstOrNull { q ->
+            (request.service == ReadService.OBD_MODE_01 && request.id.uppercase() == q.mode01Pid) ||
+                (request.service == ReadService.UDS_22 && request.id.uppercase() == q.mirrorDid)
+        }
+
+        /** UDS 22 F4xx (espelho de qualquer PID do modo 01, não só os de referência). */
+        fun isMirrorDid(request: ProbeRequest) =
+            request.service == ReadService.UDS_22 && request.id.uppercase().startsWith("F4")
+    }
+
+    /** DID UDS que espelha o PID do modo 01 (ISO 27145 / WWH-OBD): mesmo payload. */
+    val mirrorDid: String get() = "F4$mode01Pid"
+
     /** Decodifica a resposta padrão do modo 01 (payload após 41 PID). */
     fun decodeMode01(data: List<Int>): Double? = when (this) {
         RPM -> if (data.size >= 2) ((data[0] * 256) + data[1]) / 4.0 else null

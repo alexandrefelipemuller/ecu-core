@@ -89,29 +89,45 @@ class ExplorationSession(
                 .map { it.request }
                 .filter { it.service.idHexLength > 0 && it.service != ReadService.OBD_MODE_01 }
                 .filterNot { DeterministicSurvey.isIdentification(it) }
+                // Espelho F4xx dos PIDs do modo 01: decodificação já conhecida, vira referência.
+                .filterNot { ReferenceQuantity.isMirrorDid(it) }
                 .filter { resampledKeys.size < budget.maxResampleTargets && resampledKeys.add(ExplorationPlanValidator.probeKey(it)) }
             if (targets.isEmpty()) return
-            val groups = targets.groupBy { functionalHeaderFor(it.header) to it.protocol }
+            val groups = targets.groupBy { it.header to it.protocol }
             val planned = mutableListOf<ProbeRequest>()
-            repeat(budget.resampleCount) {
-                for ((group, members) in groups) {
-                    ReferenceQuantity.entries.forEach { q ->
-                        planned += ProbeRequest(ReadService.OBD_MODE_01, q.mode01Pid, group.first, group.second, "resample:reference")
-                    }
-                    planned += members.map { it.copy(hypothesis = "resample") }
+            val outcomes = mutableListOf<ProbeOutcome>()
+            fun refKey(probe: ProbeRequest) = "${probe.header.orEmpty()}|${probe.service.name}|${probe.id}"
+            /** Lê uma referência: modo 01 no header funcional; se não responder, o espelho F4xx na própria ECU. */
+            suspend fun readReference(q: ReferenceQuantity, header: String?, protocol: String?) {
+                val candidates = listOf(
+                    ProbeRequest(ReadService.OBD_MODE_01, q.mode01Pid, functionalHeaderFor(header), protocol, "resample:reference"),
+                    ProbeRequest(ReadService.UDS_22, q.mirrorDid, header, protocol, "resample:reference"),
+                )
+                for (ref in candidates) {
+                    if (refKey(ref) in deadReferences || ExplorationPlanValidator.rejectionReason(ref) != null) continue
+                    if (resampleProbes >= budget.maxResampleProbes) return
+                    planned += ref
+                    val outcome = runProbe(ref)
+                    resampleProbes++
+                    outcomes += outcome
+                    if (outcome.status == ProbeStatus.POSITIVE) return
+                    deadReferences += refKey(ref)
                 }
             }
-            val outcomes = mutableListOf<ProbeOutcome>()
-            for (probe in planned) {
-                if (!isConnected() || outOfTime() || resampleProbes >= budget.maxResampleProbes) break
-                val isReference = probe.hypothesis == "resample:reference"
-                val refKey = "${probe.header.orEmpty()}|${probe.id}"
-                if (isReference && refKey in deadReferences) continue
-                if (ExplorationPlanValidator.rejectionReason(probe) != null) continue
-                val outcome = runProbe(probe)
-                resampleProbes++
-                outcomes += outcome
-                if (isReference && outcome.status != ProbeStatus.POSITIVE) deadReferences += refKey
+            loop@ for (cycle in 0 until budget.resampleCount) {
+                for ((group, members) in groups) {
+                    for (q in ReferenceQuantity.entries) {
+                        if (!isConnected() || outOfTime()) break@loop
+                        readReference(q, group.first, group.second)
+                    }
+                    for (member in members) {
+                        if (!isConnected() || outOfTime() || resampleProbes >= budget.maxResampleProbes) break@loop
+                        val probe = member.copy(hypothesis = "resample")
+                        planned += probe
+                        outcomes += runProbe(probe)
+                        resampleProbes++
+                    }
+                }
             }
             if (outcomes.isEmpty()) return
             rounds += ExplorationRound(
@@ -374,7 +390,9 @@ class ExplorationSession(
             }
             // Referência pelo header funcional do protocolo atual (modo 01 padrão).
             val refProbe = ProbeRequest(service = ReadService.OBD_MODE_01, id = reference.mode01Pid, header = functionalHeaderFor(oemProbe.header))
-            val ref = runProbe(refProbe)
+            // Sem modo 01 (ECU só UDS): o espelho F4xx na própria ECU.
+            val ref = runProbe(refProbe).takeIf { it.status == ProbeStatus.POSITIVE }
+                ?: runProbe(ProbeRequest(ReadService.UDS_22, reference.mirrorDid, oemProbe.header))
             val referenceValue = ref.takeIf { it.status == ProbeStatus.POSITIVE }?.let { reference.decodeMode01(it.data) }
             SignalVerification(signal, oemValue, referenceValue, PlausibilityChecker.verdict(reference, oemValue, referenceValue))
         }

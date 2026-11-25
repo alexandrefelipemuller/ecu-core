@@ -46,6 +46,34 @@ private class DriftingEcu {
     private fun hex(v: Int) = v.toString(16).uppercase().padStart(2, '0')
 }
 
+/**
+ * Espelha o perfil `llm_explore_test` do simulador: nada de modo 01 (BUS INIT ERROR), só UDS
+ * em 7E0, com espelhos F4xx dos PIDs e bloco proprietário 1000..1005 (valores fixos).
+ */
+private class UdsOnlyEcu {
+    private var header = ""
+    suspend fun send(cmd: String, @Suppress("UNUSED_PARAMETER") timeout: Long): String {
+        if (cmd.startsWith("ATSH")) header = cmd.removePrefix("ATSH")
+        if (cmd.startsWith("AT")) return "OK"
+        if (!cmd.startsWith("22") && !cmd.startsWith("19")) return "BUS INIT: ...ERROR"
+        if (header != "7E0") return "NO DATA"
+        return when (cmd) {
+            "1902FF" -> "59 02 FF 01 71 00 08"
+            "22F190" -> "62 F1 90 57 56 57"
+            "22F40C" -> "62 F4 0C 00 00"
+            "22F405" -> "62 F4 05 82"
+            "22F40D" -> "62 F4 0D 00"
+            "22F442" -> "62 F4 42 31 2C"
+            "221000" -> "62 10 00 01 02"
+            "221001" -> "62 10 01 7E"
+            "221002" -> "62 10 02 82"
+            "221003" -> "62 10 03 00 00"
+            "221005" -> "7F 22 33"
+            else -> "7F 22 31"
+        }
+    }
+}
+
 class LocalExplorationPlannerTest {
 
     private var now = 0L
@@ -85,6 +113,29 @@ class LocalExplorationPlannerTest {
         // Nada fora da whitelist de leitura chegou ao barramento.
         val forbidden = listOf("10", "11", "14", "27", "28", "2E", "2F", "31", "34", "3B", "04")
         assertTrue(ecu.sent.filterNot { it.startsWith("AT") }.none { cmd -> forbidden.any { cmd.startsWith(it) } })
+    }
+
+    @Test
+    fun usesF4MirrorAsReferenceWhenEcuSpeaksOnlyUds() = runTest {
+        val record = ExplorationSession(
+            planner = LocalExplorationPlanner(random = Random(3)),
+            send = UdsOnlyEcu()::send,
+            isConnected = { true },
+            isEngineRunning = { null },
+            budget = ExplorationBudget(resampleCount = 3),
+            clock = clock,
+        ).run(ExplorationContext())
+
+        val profile = assertNotNull(record.profile, "stop=${record.stopReason} ${record.stopDetail}")
+        val ect = profile.signals.single { it.reference == ReferenceQuantity.COOLANT_TEMP }
+        assertEquals("1002", ect.id)
+        assertEquals(-40.0, ect.offset)
+        val volts = profile.signals.single { it.reference == ReferenceQuantity.MODULE_VOLTAGE }
+        assertEquals("1001", volts.id)
+        assertEquals(0.1, volts.scale)
+        // Os espelhos F4xx são referência, não "descoberta".
+        assertTrue(profile.signals.none { it.id.startsWith("F4") }, "${profile.signals}")
+        assertTrue(record.verifications.all { it.verdict == SignalVerification.Verdict.VERIFIED }, "${record.verifications}")
     }
 
     @Test
