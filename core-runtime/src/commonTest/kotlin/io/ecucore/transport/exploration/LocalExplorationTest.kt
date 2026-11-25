@@ -136,6 +136,19 @@ class LocalExplorationPlannerTest {
         // Os espelhos F4xx são referência, não "descoberta".
         assertTrue(profile.signals.none { it.id.startsWith("F4") }, "${profile.signals}")
         assertTrue(record.verifications.all { it.verdict == SignalVerification.Verdict.VERIFIED }, "${record.verifications}")
+        assertTrue("dtc=7E0:+" in profile.notes.orEmpty(), profile.notes)
+    }
+
+    @Test
+    fun readsDtcsForEverySeed() = runTest {
+        repeat(20) { seed ->
+            val record = ExplorationSession(
+                planner = LocalExplorationPlanner(random = Random(seed)),
+                send = UdsOnlyEcu()::send, isConnected = { true }, isEngineRunning = { null },
+                budget = ExplorationBudget(resampleCount = 2), clock = clock,
+            ).run(ExplorationContext())
+            assertTrue("dtc=7E0:+" in record.profile?.notes.orEmpty(), "seed=$seed ${record.profile?.notes}")
+        }
     }
 
     @Test
@@ -162,6 +175,8 @@ class LocalExplorationPlannerTest {
         assertTrue(probes.none { it.service == ReadService.UDS_22 && it.id == "F190" && it.header == "7E0" })
         assertTrue(probes.none { it.service == ReadService.KWP_21 && it.header == "7E0" })
         assertTrue(probes.all { ExplorationPlanValidator.rejectionReason(it) == null })
+        // Leitura de DTC da ECU encontrada sempre entra, independente do sorteio.
+        assertEquals(ReadService.UDS_19_DTC_BY_STATUS, probes.first().service)
         // Identificação F1xx tem prior alto e já teve acerto: deve dominar o lote.
         assertTrue(probes.count { it.id.startsWith("F1") } > probes.size / 2, "$probes")
     }

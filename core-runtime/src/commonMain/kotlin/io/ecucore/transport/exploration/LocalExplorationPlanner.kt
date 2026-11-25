@@ -41,10 +41,10 @@ class LocalExplorationPlanner(
             }
             .toList()
 
-        // Parada pelo valor esperado (não pela amostra), para não ficar preso no ruído.
-        val chosen = scored
-            .filter { it.expected >= minScore }
-            .sortedByDescending { it.score }
+        // DTCs são objetivo principal, não aposta: a leitura de cada ECU entra sempre na frente.
+        // Depois, parada pelo valor esperado (não pela amostra), para não ficar preso no ruído.
+        val (mandatory, optional) = scored.partition { it.probe.service in MANDATORY_SERVICES }
+        val chosen = (mandatory + optional.filter { it.expected >= minScore }.sortedByDescending { it.score })
             .take(minOf(batchSize, context.probesLeft))
         if (chosen.isEmpty()) return finish(history)
 
@@ -66,6 +66,10 @@ class LocalExplorationPlanner(
             evidence.dtcSummary().takeIf { it.isNotEmpty() }?.let { "dtc=$it" },
         ).joinToString("; ")
         return PlannerStep.Finish(fitted.copy(notes = notes))
+    }
+
+    private companion object {
+        val MANDATORY_SERVICES = setOf(ReadService.UDS_19_DTC_BY_STATUS)
     }
 
     private data class Scored(val probe: ProbeRequest, val score: Double, val expected: Double)
