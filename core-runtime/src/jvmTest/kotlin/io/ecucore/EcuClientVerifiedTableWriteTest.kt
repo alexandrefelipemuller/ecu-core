@@ -84,6 +84,29 @@ class EcuClientVerifiedTableWriteTest {
     }
 
     @Test
+    fun `read-back desalinhado e relido e nao desfaz a gravacao`() = runBlocking {
+        val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37, shiftedReadsAfterWrite = 1)
+        val client = newClient(ecu)
+        val anomalies = mutableListOf<PageWriteAnomaly>()
+        client.pageWriteAnomalyListener = { anomalies += it }
+        client.connect()
+        val metadata = client.getTableDefinitions()!!.veTable
+        ecu.load(metadata.page, metadata.offset, TableDomainFacade.prepareVeWrite(metadata, veTable(40)).data)
+
+        // Valores variados: com tabela constante o deslocamento não aparece no read-back.
+        val edited = veTable(40).let { t -> t.copy(values = t.values.mapIndexed { r, row -> row.mapIndexed { c, _ -> 20 + r * 4 + c } }) }
+        client.writeVeTable(edited, 1)
+
+        val expected = TableDomainFacade.prepareVeWrite(metadata, edited).data
+        assertContentEquals(expected, ecu.read(metadata.page, metadata.offset, expected.size))
+        assertEquals(1, ecu.burns, "releitura confirmou: segue para o burn")
+        val anomaly = anomalies.single()
+        assertTrue(anomaly.recovered)
+        assertEquals(1, anomaly.pass, "sem regravar: a releitura resolveu no mesmo passe")
+        assertEquals(5, anomaly.shiftHint)
+    }
+
+    @Test
     fun `gravacao limpa nao emite anomalia`() = runBlocking {
         val ecu = FakeEcuMemory(rejectWriteNumber = null, corruptOffsetOnReject = 37)
         val client = newClient(ecu)
@@ -513,6 +536,8 @@ class EcuClientVerifiedTableWriteTest {
         private val failReadsAfterBurn: Boolean = false,
         /** Buffer serial do AVR: frame 'M' maior que isso é ignorado inteiro (mas ainda responde OK). */
         private val maxFrameBytes: Int? = null,
+        /** Leituras 'p' desalinhadas (5 bytes de lixo antes do quadro) logo após a 1ª gravação. */
+        private var shiftedReadsAfterWrite: Int = 0,
     ) : IEcuConnection {
         private val pages = mutableMapOf<Int, ByteArray>()
         private val handshake = mutableMapOf(
@@ -556,7 +581,14 @@ class EcuClientVerifiedTableWriteTest {
             when (command) {
                 'p'.code.toByte() ->
                     if (failReadsAfterBurn && burns > 0) pending += rc(0x83)
-                    else pending += ModernEnvelopeFake.framedResponse(read(p[1].toInt() and 0xFF, u16(2), u16(4)))
+                    else {
+                        val bytes = read(p[1].toInt() and 0xFF, u16(2), u16(4))
+                        val served = if (shiftedReadsAfterWrite > 0 && writes > 0 && bytes.size > 16) {
+                            shiftedReadsAfterWrite--
+                            (ByteArray(5) { 0x55 } + bytes).copyOf(bytes.size)
+                        } else bytes
+                        pending += ModernEnvelopeFake.framedResponse(served)
+                    }
                 'M'.code.toByte() -> {
                     maxWriteFrame = maxOf(maxWriteFrame, data.size)
                     if (maxFrameBytes != null && data.size > maxFrameBytes) {

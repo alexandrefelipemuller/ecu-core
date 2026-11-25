@@ -3347,9 +3347,40 @@ class EcuClient(
             runCatching { connection.clearInputBuffer() }
             invalidateCachedPage(pageNum)
             pendingSpeeduinoPageReadbacks.remove(pageNum)
-            val readBack = readPage(pageNum, offset, data.size)
+            var readBack = readPage(pageNum, offset, data.size)
             invalidateCachedPage(pageNum)
             mismatches = data.indices.filter { i -> i >= readBack.size || readBack[i] != data[i] }
+            // Read-back desalinhado (lixo no buffer antes do quadro, comum em ponte Wi-Fi/TCP): o
+            // conteúdo pode estar certo. Relê uma vez antes de concluir que a gravação falhou, senão
+            // a restauração desfaz a RAM e regrava sem fim (campo 2026-11, 202501 via Wi-Fi, shift=-8).
+            val firstShift = if (mismatches.isNotEmpty()) PageWriteDiagnostics.detectShift(data, readBack) else null
+            if (firstShift != null) {
+                Logger.w(TAG, "$label: read-back desalinhado (shift=$firstShift); relendo antes de concluir")
+                delay(LIVE_DATA_DESYNC_RESYNC_DELAY_MS * 2)
+                runCatching { connection.clearInputBuffer() }
+                invalidateCachedPage(pageNum)
+                val reread = readPage(pageNum, offset, data.size)
+                invalidateCachedPage(pageNum)
+                val rereadMismatches = data.indices.filter { i -> i >= reread.size || reread[i] != data[i] }
+                if (rereadMismatches.size < mismatches.size) {
+                    anomalies += PageWriteAnomaly(
+                        pageId = pageNum,
+                        label = label,
+                        pass = pass,
+                        mismatchedOffsets = mismatches,
+                        expected = mismatches.take(16).map { data[it].toInt() and 0xFF },
+                        actual = mismatches.take(16).map { readBack.getOrNull(it)?.toInt()?.and(0xFF) ?: -1 },
+                        writeErrorMessage = null,
+                        writeResponseCode = null,
+                        recovered = false,
+                        readBackSize = readBack.size,
+                        shiftHint = firstShift,
+                        ioLockState = ioLockState(),
+                    )
+                    readBack = reread
+                    mismatches = rereadMismatches
+                }
+            }
             val passError = lastWriteError ?: retriedWriteError
             if (mismatches.isNotEmpty() || passError != null) {
                 val shown = mismatches.take(16)
