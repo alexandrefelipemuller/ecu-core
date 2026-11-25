@@ -120,7 +120,8 @@ cmdtest17on = "w\${'$'}tsCanId\x07\x02\x08\x00\x03\x30\x39\x9f"
             MegaSpeedTestCommand.FUEL_PUMP_ON, MegaSpeedTestCommand.SPARK_PULSE, MegaSpeedTestCommand.INJECTOR_PULSE,
             MegaSpeedTestCommand.IDLE_HOME, MegaSpeedTestCommand.IDLE_ON,
         ) + MegaSpeedAuxPort.entries.map { MegaSpeedTestCommand.auxOn(it) }
-        ons.forEach { assertTrue(it.autoOffMs in 1..30_000, it.label) }
+        // Lenta tem prazo maior (uso com motor ligado), mas ainda limitado a 1 minuto.
+        ons.forEach { assertTrue(it.autoOffMs in 1..60_000, it.label) }
         MegaSpeedTestCommand.STOP_ALL.forEach { assertEquals(0L, it.autoOffMs) }
     }
 
@@ -208,5 +209,23 @@ cmdtest17on = "w\${'$'}tsCanId\x07\x02\x08\x00\x03\x30\x39\x9f"
         assertEquals(false, MegaSpeedTestStatus.fromOutputChannels(0, d)!!.testModeActive)
         assertEquals(null, MegaSpeedTestStatus.fromOutputChannels(0, ByteArray(80)))
         assertEquals(null, MegaSpeedTestStatus.fromOutputChannels(0, null))
+    }
+
+    @Test
+    fun `parametros do teste de lenta usam os offsets 382 e 384 do ini em big endian`() {
+        val p = MegaSpeedIdleTestParams(position = 0x0123, homeSteps = 0x0258)
+        assertEquals(listOf(0x01, 0x23, 0x02, 0x58), p.toBytes().map { it.toInt() and 0xFF })
+        assertEquals(p, MegaSpeedIdleTestParams.fromBytes(p.toBytes()))
+        assertEquals(382, MegaSpeedIdleTestParams.OFFSET)
+    }
+
+    @Test
+    fun `posicao do teste de lenta respeita os limites do ini`() {
+        assertEquals(null, MegaSpeedIdleTestParams(512, 600).validate())
+        assertTrue(MegaSpeedIdleTestParams(513, 600).validate() != null)
+        assertTrue(MegaSpeedIdleTestParams(-1, 600).validate() != null)
+        // PWM: iacpostest vira duty % (0..100)
+        assertEquals(null, MegaSpeedIdleTestParams(100, 0).validate(pwm = true))
+        assertTrue(MegaSpeedIdleTestParams(150, 0).validate(pwm = true) != null)
     }
 }

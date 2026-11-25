@@ -83,6 +83,7 @@ import io.ecucore.model.MegaSpeedLiveChannels
 import io.ecucore.model.MegaSpeedLoggerKind
 import io.ecucore.model.MegaSpeedOutputTest
 import io.ecucore.model.MegaSpeedOutputTestGuard
+import io.ecucore.model.MegaSpeedIdleTestParams
 import io.ecucore.model.MegaSpeedTestCommand
 import io.ecucore.model.MegaSpeedTestDecision
 import io.ecucore.model.MegaSpeedTestKind
@@ -1964,9 +1965,12 @@ class EcuClient(
     /** Só para teste: substitui o prazo do watchdog para não depender de segundos reais. */
     internal var megaSpeedTestWatchdogOverrideMs: Long? = null
 
+    // MS2/Extra 3.4.x usa os mesmos comandos (cmdtest*), a mesma página 4 (testop_*, iacpostest) e o
+    // mesmo status3 @80 do MegaSpeed: conferido entre microsquirt.ini 3.4.4 e Atual_MegaSpeedMS2-X.ini.
     private fun requireMegaSpeedTest() {
-        if (firmwareInfo?.family != EcuFamily.MEGASPEED) {
-            throw UnsupportedOperationException("Output test is available only for MegaSpeed")
+        val family = firmwareInfo?.family
+        if (family != EcuFamily.MEGASPEED && family != EcuFamily.MS2) {
+            throw UnsupportedOperationException("Output test is available only for MegaSpeed and MS2/Extra")
         }
     }
 
@@ -1993,6 +1997,26 @@ class EcuClient(
         val region = updated.copyOfRange(MegaSpeedTestParams.OFFSET_OP, MegaSpeedTestParams.PARAMS_END)
         withEcuIo {
             protocol.writeTable(MegaSpeedOutputTest.PARAMS_PAGE, MegaSpeedTestParams.OFFSET_OP, region, EcuFamily.MS2)
+        }
+        invalidateConfigPageCache()
+    }
+
+    override suspend fun readMegaSpeedIdleTestParams(): MegaSpeedIdleTestParams {
+        requireMegaSpeedTest()
+        invalidateConfigPageCache()
+        val bytes = readConfigChunk(MegaSpeedOutputTest.PARAMS_PAGE, MegaSpeedIdleTestParams.OFFSET,
+            MegaSpeedIdleTestParams.LENGTH)
+        return MegaSpeedIdleTestParams.fromBytes(bytes)
+    }
+
+    override suspend fun writeMegaSpeedIdleTestParams(params: MegaSpeedIdleTestParams, pwm: Boolean) {
+        requireMegaSpeedTest()
+        params.validate(pwm)?.let { throw MegaSpeedTestRefusedException(it) }
+        ensureWritable("writeMegaSpeedIdleTestParams")
+        invalidateConfigPageCache()
+        withEcuIo {
+            protocol.writeTable(MegaSpeedOutputTest.PARAMS_PAGE, MegaSpeedIdleTestParams.OFFSET, params.toBytes(),
+                EcuFamily.MS2)
         }
         invalidateConfigPageCache()
     }

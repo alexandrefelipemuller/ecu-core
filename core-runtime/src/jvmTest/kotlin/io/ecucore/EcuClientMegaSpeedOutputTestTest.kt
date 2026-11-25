@@ -1,6 +1,7 @@
 package io.ecucore
 
 import io.ecucore.model.MegaSpeedAuxPort
+import io.ecucore.model.MegaSpeedIdleTestParams
 import io.ecucore.model.MegaSpeedOutputTest
 import io.ecucore.model.MegaSpeedTestCommand
 import io.ecucore.model.MegaSpeedTestParams
@@ -173,7 +174,7 @@ class EcuClientMegaSpeedOutputTestTest {
 
     @Test
     fun `outras familias nao suportam o teste`() = runBlocking<Unit> {
-        for (kind in listOf(ClientFakeEcu.Kind.MS2, ClientFakeEcu.Kind.MS3, ClientFakeEcu.Kind.SPEEDUINO_2025)) {
+        for (kind in listOf(ClientFakeEcu.Kind.MS3, ClientFakeEcu.Kind.SPEEDUINO_2025)) {
             val (c, ecu) = connect(kind)
             assertFailsWith<UnsupportedOperationException>(kind.name) {
                 c.executeMegaSpeedTestCommand(MegaSpeedTestCommand.FUEL_PUMP_OFF)
@@ -181,5 +182,41 @@ class EcuClientMegaSpeedOutputTestTest {
             assertFailsWith<UnsupportedOperationException>(kind.name) { c.emergencyStopMegaSpeedTest() }
             assertTrue(ecu.commandWrites().isEmpty(), kind.name)
         }
+    }
+
+    @Test
+    fun `MS2 Extra aceita o teste de saidas com o mesmo frame do ini`() = runBlocking<Unit> {
+        val (c, ecu) = connect(ClientFakeEcu.Kind.MS2, rpm = 850, testMode = false)
+        // Lenta funciona com motor ligado e sem modo de teste, como no microsquirt.ini 3.4.4.
+        c.executeMegaSpeedTestCommand(MegaSpeedTestCommand.IDLE_ON)
+        assertEquals(listOf(0x30, 0x39, 0x0A), ecu.commandWrites().single().data.map { it.toInt() and 0xFF })
+        c.emergencyStopMegaSpeedTest()
+        assertEquals(MegaSpeedTestCommand.STOP_ALL.map { it.code }, codes(ecu).drop(1))
+    }
+
+    @Test
+    fun `posicao do teste de lenta vai para RAM nos offsets 382 e 384 sem burn`() = runBlocking<Unit> {
+        val (c, ecu) = connect(ClientFakeEcu.Kind.MS2)
+        ecu.load(MegaSpeedOutputTest.PARAMS_PAGE, 380, byteArrayOf(0x11, 0x22))
+        c.writeMegaSpeedIdleTestParams(MegaSpeedIdleTestParams(position = 150, homeSteps = 600))
+
+        val w = ecu.writes.single { it.id == MegaSpeedOutputTest.PARAMS_PAGE }
+        assertEquals(382, w.offset)
+        assertEquals(listOf(0x00, 150, 0x02, 0x58), w.data.map { it.toInt() and 0xFF })
+        assertEquals(0x22, ecu.mem(MegaSpeedOutputTest.PARAMS_PAGE)[381].toInt())
+        assertTrue(ecu.burns.isEmpty())
+        assertEquals(MegaSpeedIdleTestParams(150, 600), c.readMegaSpeedIdleTestParams())
+    }
+
+    @Test
+    fun `posicao fora do limite e recusada antes de ir para a ECU`() = runBlocking<Unit> {
+        val (c, ecu) = connect(ClientFakeEcu.Kind.MS2)
+        assertFailsWith<MegaSpeedTestRefusedException> {
+            c.writeMegaSpeedIdleTestParams(MegaSpeedIdleTestParams(position = 600, homeSteps = 600))
+        }
+        assertFailsWith<MegaSpeedTestRefusedException> {
+            c.writeMegaSpeedIdleTestParams(MegaSpeedIdleTestParams(position = 150, homeSteps = 0), pwm = true)
+        }
+        assertTrue(ecu.writes.none { it.id == MegaSpeedOutputTest.PARAMS_PAGE })
     }
 }

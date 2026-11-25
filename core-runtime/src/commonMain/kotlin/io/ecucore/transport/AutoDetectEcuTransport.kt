@@ -18,6 +18,7 @@ import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
 import io.ecucore.model.MegaSpeedLogCapture
 import io.ecucore.model.MegaSpeedLoggerKind
+import io.ecucore.model.MegaSpeedIdleTestParams
 import io.ecucore.model.MegaSpeedTestCommand
 import io.ecucore.model.MegaSpeedTestParams
 import io.ecucore.model.MegaSpeedTestStatus
@@ -186,6 +187,11 @@ class AutoDetectEcuTransport(
 
     override suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams) =
         selected().writeMegaSpeedTestParams(params)
+
+    override suspend fun readMegaSpeedIdleTestParams() = selected().readMegaSpeedIdleTestParams()
+
+    override suspend fun writeMegaSpeedIdleTestParams(params: MegaSpeedIdleTestParams, pwm: Boolean) =
+        selected().writeMegaSpeedIdleTestParams(params, pwm)
 
     override suspend fun executeMegaSpeedTestCommand(command: MegaSpeedTestCommand) =
         selected().executeMegaSpeedTestCommand(command)

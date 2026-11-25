@@ -68,8 +68,10 @@ data class MegaSpeedTestCommand(
         val INJECTOR_SPARK_OFF = MegaSpeedTestCommand(0x07, "Desligar bobinas e injetores", MegaSpeedTestKind.INJECTOR, true)
 
         val IDLE_OFF = MegaSpeedTestCommand(0x08, "Parar teste do atuador de lenta", MegaSpeedTestKind.IDLE_ACTUATOR, true)
-        val IDLE_HOME = MegaSpeedTestCommand(0x09, "Atuador de lenta: posição inicial", MegaSpeedTestKind.IDLE_ACTUATOR, false, 15_000L)
-        val IDLE_ON = MegaSpeedTestCommand(0x0A, "Atuador de lenta: posição alvo", MegaSpeedTestKind.IDLE_ACTUATOR, false, 15_000L)
+        // Prazo maior que o das outras saídas: o teste da lenta é usado com o motor ligado para ver a rotação
+        // estabilizar em cada posição. Expirar só devolve a válvula ao controle normal da ECU.
+        val IDLE_HOME = MegaSpeedTestCommand(0x09, "Atuador de lenta: posição inicial", MegaSpeedTestKind.IDLE_ACTUATOR, false, 60_000L)
+        val IDLE_ON = MegaSpeedTestCommand(0x0A, "Atuador de lenta: posição alvo", MegaSpeedTestKind.IDLE_ACTUATOR, false, 60_000L)
 
         fun auxOn(port: MegaSpeedAuxPort) =
             MegaSpeedTestCommand(port.onCode, "${port.label} ligada", MegaSpeedTestKind.AUX_PORT, false, 5_000L)
@@ -198,6 +200,45 @@ data class MegaSpeedTestParams(
             val v = value.coerceIn(0, 0xFFFF)
             d[offset] = (v shr 8).toByte()
             d[offset + 1] = v.toByte()
+        }
+    }
+}
+
+/**
+ * Parâmetros do teste do atuador de lenta na página 0x08 (page 4 do .ini), iguais no MegaSpeed e no
+ * MS2/Extra 3.4.x: `iacpostest` (U16 @382, passos 0..512 ou duty % 0..100 no PWM) e `iachometest`
+ * (U16 @384, passos do homing). Gravados só em RAM, como o TunerStudio faz.
+ */
+data class MegaSpeedIdleTestParams(
+    val position: Int,
+    val homeSteps: Int,
+) {
+    /** Motivo da recusa ou null. [pwm] = válvula PWM (`IdleCtl == 2`), em que a posição é duty %. */
+    fun validate(pwm: Boolean = false): String? {
+        val maxPosition = if (pwm) MAX_PWM_DUTY else MAX_POSITION
+        return when {
+            position !in 0..maxPosition -> "Posição fora de 0 a $maxPosition"
+            homeSteps !in 0..MAX_HOME_STEPS -> "Passos de homing fora de 0 a $MAX_HOME_STEPS"
+            else -> null
+        }
+    }
+
+    fun toBytes(): ByteArray = byteArrayOf(
+        (position shr 8).toByte(), position.toByte(),
+        (homeSteps shr 8).toByte(), homeSteps.toByte(),
+    )
+
+    companion object {
+        const val OFFSET = 382
+        const val LENGTH = 4
+        const val MAX_POSITION = 512
+        const val MAX_PWM_DUTY = 100
+        const val MAX_HOME_STEPS = 0xFFFF
+
+        fun fromBytes(bytes: ByteArray): MegaSpeedIdleTestParams {
+            require(bytes.size >= LENGTH) { "Parâmetros do teste de lenta curtos demais: ${bytes.size}" }
+            fun u16(i: Int) = ((bytes[i].toInt() and 0xFF) shl 8) or (bytes[i + 1].toInt() and 0xFF)
+            return MegaSpeedIdleTestParams(position = u16(0), homeSteps = u16(2))
         }
     }
 }

@@ -21,6 +21,7 @@ import io.ecucore.model.IniConfigView
 import io.ecucore.model.MegaSpeedConfigView
 import io.ecucore.model.MegaSpeedLogCapture
 import io.ecucore.model.MegaSpeedLoggerKind
+import io.ecucore.model.MegaSpeedIdleTestParams
 import io.ecucore.model.MegaSpeedTestCommand
 import io.ecucore.model.MegaSpeedTestParams
 import io.ecucore.model.MegaSpeedTestStatus
@@ -202,6 +203,13 @@ interface EcuTransport {
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
 
     suspend fun writeMegaSpeedTestParams(params: MegaSpeedTestParams): Unit =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    suspend fun readMegaSpeedIdleTestParams(): MegaSpeedIdleTestParams =
+        throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
+
+    /** Grava posição/homing do teste da lenta em RAM (sem burn). [pwm] limita a posição a 0..100 %. */
+    suspend fun writeMegaSpeedIdleTestParams(params: MegaSpeedIdleTestParams, pwm: Boolean = false): Unit =
         throw UnsupportedOperationException("MegaSpeed output test not supported by this transport")
 
     suspend fun executeMegaSpeedTestCommand(command: MegaSpeedTestCommand): Unit =
